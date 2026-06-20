@@ -1616,6 +1616,21 @@ impl GeminiToResponsesConverter {
             }
         };
 
+        // [MOC-263 P3] exec_command 类工具用 shell 直接改文件(sed -i / cat> / python write /
+        // `apply_patch <<EOF` 等)绕过结构化 apply_patch(既不过 preflight 兜底、也不进 apply_patch 埋点)
+        // → emit `shell_edit` 诊断。**与 chat 路径(converter.rs::close_tool_call)对称** —— Antigravity /
+        // gemini_native 会话用 exec_command 写盘也要被看见(chatgpt-codex-connector review;纯观测,gate 关时零开销)。
+        if crate::core::apply_patch_trace::is_shell_exec_tool(name) {
+            crate::core::apply_patch_trace::emit_shell_edit(
+                "gemini_native",
+                &self.model,
+                &call_id,
+                &item_id,
+                name,
+                &args_json_str,
+            );
+        }
+
         // [MOC-75] apply_patch:Codex freeform custom tool,Codex CLI router 硬要求
         // `custom_tool_call` wire(ToolPayload::Custom{input}),收 function_call 的
         // Function payload 直接 abort。请求侧已把它降级成带 `input` 的 function,

@@ -136,6 +136,7 @@
     if (t.trace_kind === "cat_webfetch") return "cat_webfetch";
     if (t.trace_kind === "chatgpt_backend") return "chatgpt_backend";
     if (t.trace_kind === "apply_patch") return "apply_patch";
+    if (t.trace_kind === "shell_edit") return "apply_patch"; // shell 绕过 apply_patch 的写盘 → 同页(MOC-263 P3)
     if (t.trace_kind === "codex_response") return "codex_response";
     return "mcp";
   }
@@ -151,6 +152,10 @@
       return `${esc(t.tool || "")} ${esc(r.url || r.query || "")}`;
     }
     if (k === "apply_patch") {
+      if (t.trace_kind === "shell_edit") {
+        // shell 绕过 apply_patch 直接写盘:<model> · <tool> · <write_kinds>
+        return `⚠ shell写盘 ${esc(t.model || "?")} · ${esc(t.tool || "")} · ${esc((t.write_kinds || []).join(","))}`;
+      }
       if ((t.phase || "call") === "result") {
         const o = t.output || {};
         return `↩ result ${esc((t.call_id || "").slice(-8))} ${t.is_error ? "ERROR" : "ok"} ${o.len || 0}B`;
@@ -169,6 +174,7 @@
     const k = kindOf(t);
     if (k === "codex_response") return t.status || "";
     if (k === "apply_patch") {
+      if (t.trace_kind === "shell_edit") return "shell";
       if ((t.phase || "call") === "result") return t.is_error ? "error" : "ok";
       return t.decision || "";
     }
@@ -538,6 +544,20 @@
   }
 
   function renderApplyPatch(t) {
+    // ── shell_edit:模型用 exec_command(shell)绕过结构化 apply_patch 直接写盘(MOC-263 P3,观测态)──
+    if (t.trace_kind === "shell_edit") {
+      const c = t.cmd || {};
+      const cTrunc = c.truncated_bytes > 0 ? `<div class="trunc">⚠ 截断:原 ${c.len} 字节,丢 ${c.truncated_bytes}</div>` : "";
+      detailEl.innerHTML = `<div class="meta">shell 写盘(绕过 apply_patch) · ${esc(t.source || "")} · seq ${esc(t.seq)} · ${esc(t.captured_at || "")}</div>`
+        + `<div class="usage"><span class="vchip err">⚠ 绕过 apply_patch</span> <span class="vchip">${esc((t.write_kinds || []).join(" / ") || "?")}</span></div>`
+        + `<table class="hdr">`
+        + `<tr><td class="k">model</td><td class="v">${esc(t.model || "?")}</td></tr>`
+        + `<tr><td class="k">tool</td><td class="v">${esc(t.tool || "")}</td></tr>`
+        + `<tr><td class="k">call_id</td><td class="v">${esc(t.call_id || "")}</td></tr></table>`
+        + `<div class="meta">命令(${c.len || 0} 字节):</div>`
+        + `<pre class="payload">${esc(c.text || "")}</pre>${cTrunc}`;
+      return;
+    }
     const phase = t.phase || "call";
 
     // ── phase = result:Codex apply 后回灌给模型的结果(成功/错误);失败正是触发模型重试的原因 ──
