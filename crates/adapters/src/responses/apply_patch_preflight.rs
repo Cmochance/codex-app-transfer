@@ -832,6 +832,19 @@ fn longest_unique_block(anchors: &[&str], file: &[&str], floor: usize) -> Option
     if anchors.is_empty() || floor >= file.len() {
         return None;
     }
+    // [MOC-263 P1] 段首锚点必须在 `file[floor..]` **全局唯一**,否则该段起点歧义 —— 同一行在别处也出现时,
+    // 贪心最长块会靠更长块的"唯一性"选中**无关的更早区域**(file 有旧 `A/B/C` 块 + 真实 `A/B…gap…C/D`
+    // 区,body `A/-B/ C/-D` 被切成旧块的 hunk → 从错块删 B),而不切分时本会安全失败。起点不唯一 = 切分
+    // 非唯一确定 → bail,原样透过交模型自纠(chatgpt-codex-connector review;不猜不丢)。
+    let first = anchors[0].trim_end();
+    if file[floor..]
+        .iter()
+        .filter(|l| l.trim_end() == first)
+        .count()
+        != 1
+    {
+        return None;
+    }
     let max_len = anchors.len().min(file.len() - floor);
     for len in (1..=max_len).rev() {
         let block = &anchors[..len];
@@ -1863,6 +1876,25 @@ mod tests {
             format!("*** Begin Patch\n*** Update File: {name}\n-x\n+X\n-y\n+Y\n*** End Patch\n");
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
         assert!(!out.contains("\n@@\n"), "歧义不应切:\n{out}");
+    }
+
+    #[test]
+    fn greedy_split_bails_when_first_anchor_not_globally_unique() {
+        // MOC-263 P1(chatgpt-codex-connector review):**块唯一但段首非唯一**的隐蔽歧义 —— file 有旧
+        // ALPHA/BETA/GAMMA 块 + 真实 ALPHA/BETA…gap…GAMMA/DELTA 区。body ` ALPHA/-BETA/ GAMMA/-DELTA`
+        // 的 [ALPHA,BETA,GAMMA] 作为连续块只在旧块唯一出现,贪心会选中旧块、从**错块**删 BETA;而段首
+        // ALPHA 在文件里出现 2 次 = 起点歧义。修复后段首非全局唯一即 bail,不切分、原样透过(不猜不丢)。
+        let content = "ALPHA\nBETA\nGAMMA\nmid_x\nmid_y\nALPHA\nBETA\nsep_gap\nGAMMA\nDELTA\n";
+        let (dir, name) = tmp_file("greedy_moc263.txt", content);
+        let cwd = dir.path().to_str().unwrap();
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n ALPHA\n-BETA\n GAMMA\n-DELTA\n*** End Patch\n"
+        );
+        let (out, _reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(
+            !out.contains("\n@@\n"),
+            "段首锚点非全局唯一(起点歧义)时应 bail 不切分,避免从错块删行:\n{out}"
+        );
     }
 
     #[test]
