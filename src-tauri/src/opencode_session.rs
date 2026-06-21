@@ -17,7 +17,7 @@ const LOGIN_SPEC: SessionLoginSpec = SessionLoginSpec {
     win_title: "登录 OpenCode 账号 · 获取 Go 套餐用量",
     inner_size: (520.0, 780.0),
     cookie_domain: "opencode.ai",
-    signal: CaptureSignal::UrlContains("/workspace"),
+    signal: CaptureSignal::UrlContains("/workspace/"),
     want_cookies: &[],
     ignore_cookie_prefixes: &[],
     pre_capture_eval: None,

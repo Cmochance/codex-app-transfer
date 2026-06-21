@@ -91,6 +91,8 @@ pub async fn fetch_opencode_go_quota(
         .await
         .map_err(|e| QuotaError::Transient(e.to_string()))?;
     let status = resp.status();
+    // 跟完重定向后的最终 URL(判定 session 是否被跳去登录页)。
+    let final_url = resp.url().to_string();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(QuotaError::Auth);
     }
@@ -103,9 +105,11 @@ pub async fn fetch_opencode_go_quota(
         .map_err(|e| QuotaError::Transient(e.to_string()))?;
 
     let now = chrono::Utc::now();
-    // resetInSec(重置倒计时)→ 绝对 RFC3339(≤0 / 缺 → None,不显刷新时间)。
+    // resetInSec(重置倒计时)→ 绝对 RFC3339。**上限 366 天**:过滤掉异常超大值,避免
+    // `now + Duration::seconds(超大)` 在 chrono 溢出 panic 拖垮整个 quota daemon;≤0/缺 → None。
+    const MAX_RESET_SEC: i64 = 366 * 24 * 3600;
     let reset_at = |sec: Option<i64>| {
-        sec.filter(|s| *s > 0)
+        sec.filter(|s| *s > 0 && *s <= MAX_RESET_SEC)
             .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339())
     };
     // usagePercent=已用% → 剩余=100-已用(builder 自动 clamp);无该窗口则不填该槽(自动不显)。
@@ -120,8 +124,14 @@ pub async fn fetch_opencode_go_quota(
         rolling = rolling.monthly(100.0 - used, reset_at(reset));
     }
     if rolling.is_empty() {
-        // 一个窗口都没解析到:多半 session 失效跳了登录页(或页面结构变)。按 Auth 让前端提示重登。
-        return Err(QuotaError::Auth);
+        // 一个窗口都没解析到。区分两种成因,避免误删有效 session:
+        // - 重定向**离开** /workspace(跳了登录页)→ session 真失效 → Auth(清 cookie 提示重登)。
+        // - 仍在 /workspace 页但没解析到 → 多半 OpenCode 改了 SSR 字段/布局(session 有效)→
+        //   返空(不显额度行),**不清 cookie**(否则每 45s TTL 误删有效 cookie、逼用户反复重登)。
+        if !final_url.contains("/workspace") {
+            return Err(QuotaError::Auth);
+        }
+        return Ok(ProviderQuota::default());
     }
     Ok(ProviderQuota {
         rolling,

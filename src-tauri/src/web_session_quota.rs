@@ -113,9 +113,12 @@ fn build_cookie_header(cookies: &[CookieInfo], spec: &SessionLoginSpec) -> Strin
         spec.want_cookies
             .iter()
             .filter_map(|want| {
+                // 同名 cookie(可能跨域)取**最后一个**:对齐旧 mimo_session 的 HashMap 后插入覆盖语义,
+                // 避免重构改成首个匹配后 MiMo 选错 token 值(该路径无法活体回归测,保行为不变)。
                 cookies
                     .iter()
-                    .find(|c| c.name == *want && !c.value.is_empty())
+                    .filter(|c| c.name == *want && !c.value.is_empty())
+                    .next_back()
                     .map(|c| format!("{want}={}", c.value))
             })
             .collect::<Vec<_>>()
@@ -242,6 +245,11 @@ pub async fn login_and_capture(spec: &SessionLoginSpec) -> Result<Option<Capture
             .extract_workspace_from_url
             .then(|| extract_workspace_id(&cur_url))
             .flatten();
+        // 声明了要 workspace id(OpenCode 查用量必需)但 URL 还没到 `/workspace/<id>` → 不捕获、等下轮。
+        // 否则会落一个有 cookie 无 workspace id 的残缺 session:UI 显「已登录」但额度永远查不到。
+        if spec.extract_workspace_from_url && workspace_id.is_none() {
+            continue;
+        }
         tracing::info!(win = spec.win_label, workspace_id = ?workspace_id, url = %cur_url, "[WebSession] 已捕获 session cookie,关闭登录窗");
         close_win(&app, spec.win_label);
         return Ok(Some(CapturedSession {
