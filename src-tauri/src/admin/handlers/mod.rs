@@ -21,7 +21,6 @@ pub mod feedback;
 pub mod gemini_oauth;
 pub mod marketplace_connectors;
 pub mod mcp;
-pub mod mcp_toml;
 pub mod memories_md;
 pub mod plugin_unlock;
 pub mod plugin_unlock_mode;
