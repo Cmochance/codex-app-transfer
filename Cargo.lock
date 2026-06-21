@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-transfer"
-version = "2.3.4"
+version = "2.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
