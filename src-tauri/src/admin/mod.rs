@@ -32,8 +32,8 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::common::instance_show_window),
         )
         // [MOC-261 二-5] 旧综合状态聚合 /api/status 已删(死代码,见 common.rs 注释)
-        // Chrome 探测/按需下载 (MOC-144 headless 抓取后端)
-        .route("/api/chrome/detect", get(handlers::chrome::detect))
+        // Chrome 就绪检查/按需下载 (MOC-144 headless 抓取后端)
+        // [MOC-261 二-6] 旧 /api/chrome/detect 已删(冗余死端点,见 chrome.rs 注释)
         .route("/api/chrome/ready", get(handlers::chrome::ready))
         .route("/api/chrome/ensure", post(handlers::chrome::ensure))
         // 连接器市场(多源,phase2):官方源(私有 storage 仓库)+ 自加源聚合 + 图标代理
