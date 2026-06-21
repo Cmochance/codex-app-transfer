@@ -38,6 +38,13 @@ const showRestart = ref(false)
 // [MOC-272] 正在编辑调色盘的主题(null = 未开);预制(非 custom)供「复用调色盘」选取。
 const paletteTarget = ref<ThemeEntry | null>(null)
 const presets = computed(() => themes.value.filter((th) => th.id !== 'custom'))
+// 当前编辑主题已持久化的 raw override(传给编辑器做 merge,保留未触碰的既有覆盖)。
+const paletteOverride = computed<PaletteOverride | undefined>(() => {
+  const id = paletteTarget.value?.id
+  const m = store.settings.themePaletteOverrides
+  if (!id || !m || typeof m !== 'object') return undefined
+  return ((m as Record<string, unknown>)[id] as PaletteOverride) || undefined
+})
 
 // 背景全图 on-demand 下载:正在下载的主题 id + 进度(0-100),给缩略图渲染白蒙版 + 进度环。
 const downloadingId = ref<string | null>(null)
@@ -357,44 +364,43 @@ function currentOverrides(): Record<string, unknown> {
   const cur = store.settings.themePaletteOverrides
   return cur && typeof cur === 'object' ? { ...(cur as Record<string, unknown>) } : {}
 }
+// palette 改动只需重刷 CSS,bg 已缓存 → 走 themeApply(不必 applyWithProgress 的下载进度轮询)。
 async function reinjectIfActive(themeId: string) {
   if (enabledModel.value && selectedId.value === themeId) {
     try {
-      await applyWithProgress(themeId)
+      await themeApply(themeId)
     } catch {
       await promptRestart()
     }
   }
 }
-async function onPaletteSave(override: PaletteOverride) {
-  const target = paletteTarget.value
-  if (!target) return
+// save / reset 共用:改 overrides map → 落盘 → 重拉列表 → 该主题正注入则重注入。
+async function persistOverrides(
+  themeId: string,
+  mutate: (map: Record<string, unknown>) => void,
+  okMsg: string,
+) {
   paletteTarget.value = null
   try {
     const map = currentOverrides()
-    map[target.id] = override
+    mutate(map)
     await store.save({ themePaletteOverrides: map })
     await loadThemes()
-    await reinjectIfActive(target.id)
-    toast(t('theme.paletteSaved'))
+    await reinjectIfActive(themeId)
+    toast(okMsg)
   } catch (e) {
     toast(`${t('theme.saveFailed')}: ${errMsg(e)}`, 'error')
   }
 }
+async function onPaletteSave(override: PaletteOverride) {
+  const target = paletteTarget.value
+  if (!target) return
+  await persistOverrides(target.id, (map) => (map[target.id] = override), t('theme.paletteSaved'))
+}
 async function onPaletteReset() {
   const target = paletteTarget.value
   if (!target) return
-  paletteTarget.value = null
-  try {
-    const map = currentOverrides()
-    delete map[target.id]
-    await store.save({ themePaletteOverrides: map })
-    await loadThemes()
-    await reinjectIfActive(target.id)
-    toast(t('theme.paletteResetDone'))
-  } catch (e) {
-    toast(`${t('theme.saveFailed')}: ${errMsg(e)}`, 'error')
-  }
+  await persistOverrides(target.id, (map) => delete map[target.id], t('theme.paletteResetDone'))
 }
 
 async function onRestoreHidden() {
@@ -536,6 +542,7 @@ async function onRestartChoice(choice: 'now' | 'later') {
       v-if="paletteTarget"
       :entry="paletteTarget"
       :presets="presets"
+      :override="paletteOverride"
       @save="onPaletteSave"
       @reset="onPaletteReset"
       @close="paletteTarget = null"

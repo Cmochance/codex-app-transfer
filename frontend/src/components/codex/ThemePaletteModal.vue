@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // [MOC-272] 调色盘编辑器 — 改某主题的精选关键色(accent / ink / baseColor / surface + scrim 蒙版深浅)。
-// 「复用预制主题调色盘」一键填入某预制的配色;「还原默认」清除该主题的全部覆盖。保存 emit override,
-// 父组件落盘(settings.themePaletteOverrides)+ 重注入。颜色用 <input type=color>(恒 #rrggbb)。
+// 「复用预制主题调色盘」一键填入某预制配色;「还原默认」清除该主题全部覆盖。
+// 关键:**只持久化用户真正改过的字段**(diff vs 初始 + 合并已有 override),避免「开+保存」就把未动的
+// 玻璃层/accent 层次冻结、覆盖掉基底(/code-review #1/#2/#3)。颜色用 <input type=color>(恒 #rrggbb)。
 import { ref } from 'vue'
 import { i18nState, t } from '@/i18n'
 import type { PaletteOverride, ThemeEntry } from '@/api/desktop'
@@ -9,28 +10,39 @@ import AppModal from '@/components/ui/AppModal.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 
-const props = defineProps<{ entry: ThemeEntry; presets: ThemeEntry[] }>()
+const props = defineProps<{
+  entry: ThemeEntry
+  presets: ThemeEntry[]
+  /** 该主题已持久化的 raw override(用于 merge,保留用户未触碰的既有覆盖)。 */
+  override?: PaletteOverride
+}>()
 const emit = defineEmits<{ save: [override: PaletteOverride]; reset: []; close: [] }>()
 
 const p = props.entry.palette
-// accent "" = 跟随原生蓝 → 默认不启用;启用时给个起始色。
-const accentEnabled = ref(!!p.accent)
-const accent = ref(p.accent || '#0a84ff')
+// 初始快照(= 有效值;diff 基准)。accent "" / scrim null = 「不覆盖」语义。
+const initAccentOn = !!p.accent
+const initAccent = p.accent || '#0a84ff'
+const initScrimOn = p.scrim !== null && p.scrim !== undefined
+const initScrim = p.scrim ?? 50
+
+const accentEnabled = ref(initAccentOn)
+const accent = ref(initAccent)
 const ink = ref(p.ink || '#f1ece4')
 const baseColor = ref(p.baseColor || '#0e0e10')
 const surface = ref(p.surface || '#141418')
-// scrim null = 跟随基底 → 默认不启用;启用时给默认起点。
-const scrimEnabled = ref(p.scrim !== null && p.scrim !== undefined)
-const scrim = ref(p.scrim ?? 50)
+const scrimEnabled = ref(initScrimOn)
+const scrim = ref(initScrim)
 
 function name(e: ThemeEntry): string {
   return i18nState.locale === 'en' ? e.displayNameEn : e.displayNameZh
 }
 
-// 复用预制:选一个预制主题,把它的精选调色板填进编辑器(用户可再微调)。
+// 复用预制:选一个预制主题把它的精选调色板填进编辑器(用户可再微调)。
+// 应用后清空选择,让用户能再次选同一项重填(/code-review #7:@change 同值不触发)。
 const reuseId = ref('')
 function onReuse() {
   const src = props.presets.find((e) => e.id === reuseId.value)
+  reuseId.value = ''
   if (!src) return
   const sp = src.palette
   accentEnabled.value = !!sp.accent
@@ -43,13 +55,21 @@ function onReuse() {
 }
 
 function onSave() {
-  const ov: PaletteOverride = {
-    ink: ink.value,
-    baseColor: baseColor.value,
-    surface: surface.value,
+  // 合并到已有 override,只动用户真正改过的字段(未动字段保持原样 → 不冻结基底/既有覆盖)。
+  const ov: PaletteOverride = { ...(props.override ?? {}) }
+  const accentChanged = accentEnabled.value !== initAccentOn || (accentEnabled.value && accent.value !== initAccent)
+  if (accentChanged) {
+    if (accentEnabled.value) ov.accent = accent.value
+    else delete ov.accent
   }
-  if (accentEnabled.value) ov.accent = accent.value
-  if (scrimEnabled.value) ov.scrim = scrim.value
+  if (ink.value !== p.ink) ov.ink = ink.value
+  if (baseColor.value !== p.baseColor) ov.baseColor = baseColor.value
+  if (surface.value !== p.surface) ov.surface = surface.value
+  const scrimChanged = scrimEnabled.value !== initScrimOn || (scrimEnabled.value && scrim.value !== initScrim)
+  if (scrimChanged) {
+    if (scrimEnabled.value) ov.scrim = scrim.value
+    else delete ov.scrim
+  }
   emit('save', ov)
 }
 </script>

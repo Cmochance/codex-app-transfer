@@ -212,28 +212,31 @@ fn color_to_hex(s: &str) -> String {
     "#000000".to_string()
 }
 
-/// 读 config 里某主题的 palette override(已 sanitize)。无 / 非法 → None。
-pub fn palette_override_for(theme_id: &str) -> Option<PaletteOverride> {
-    let cfg = crate::admin::registry_io::load().ok()?;
-    let raw = cfg
-        .get("settings")?
-        .get("themePaletteOverrides")?
-        .get(theme_id)?;
-    serde_json::from_value::<PaletteOverride>(raw.clone())
+/// 从 config Value 解析 + sanitize 一个 palette override。
+pub fn parse_override(v: &serde_json::Value) -> Option<PaletteOverride> {
+    serde_json::from_value::<PaletteOverride>(v.clone())
         .ok()?
         .sanitized()
 }
 
-/// 某主题的有效精选调色板(基底 + override),供 `theme/list` 给编辑器回显。
-pub fn effective_curated_palette(theme_id: &str) -> CuratedPalette {
-    let metas = all_themes();
-    let base = metas
-        .iter()
-        .find(|m| m.id == theme_id)
-        .map(|m| &m.palette)
-        .unwrap_or(&NEUTRAL_PALETTE);
-    let ov = palette_override_for(theme_id);
-    let ov = ov.as_ref();
+/// 读 config 里某主题的 palette override(已 sanitize)。无 / 非法 → None。
+pub fn palette_override_for(theme_id: &str) -> Option<PaletteOverride> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    parse_override(
+        cfg.get("settings")?
+            .get("themePaletteOverrides")?
+            .get(theme_id)?,
+    )
+}
+
+/// 从 `rgba(r,g,b,a)` 取 alpha(把基底 scrim 反推成编辑器 0-100 用)。
+fn rgba_alpha(s: &str) -> Option<f32> {
+    let inner = s.trim().strip_prefix("rgba(")?.trim_end_matches(')');
+    inner.split(',').nth(3)?.trim().parse::<f32>().ok()
+}
+
+/// 基底 + override → 有效精选调色板(纯函数无 IO,供 `theme/list` 一次 load 后逐主题 map)。
+pub fn curated_from(base: &Palette, ov: Option<&PaletteOverride>) -> CuratedPalette {
     CuratedPalette {
         // accent 保留空串语义("" = 原生蓝),不走 color_to_hex(那会变 #000000)。
         accent: ov
@@ -248,7 +251,11 @@ pub fn effective_curated_palette(theme_id: &str) -> CuratedPalette {
         surface: ov
             .and_then(|o| o.surface.clone())
             .unwrap_or_else(|| color_to_hex(base.surface)),
-        scrim: ov.and_then(|o| o.scrim),
+        // scrim:override 优先;否则从基底 scrim_bot alpha 反推 0-100(我方公式 bot = f*0.62)→
+        // 让「复用预制」也能带上该预制的蒙版深浅(/code-review #4)。
+        scrim: ov.and_then(|o| o.scrim).or_else(|| {
+            rgba_alpha(base.scrim_bot).map(|a| ((a / 0.62) * 100.0).round().clamp(0.0, 100.0) as u8)
+        }),
     }
 }
 
@@ -271,18 +278,37 @@ pub fn custom_theme_exists() -> bool {
     custom_bg_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// User 上传图 bytes(JPG / PNG)→ 等比 resize 到最长边 ≤2048(节约 disk +
-/// base64 体积)→ JPEG 90% 写 `bg.jpg`;同步生成最长边 ≤640 的等比 preview 写
-/// `preview.jpg`。正常路径前端 `openCropModal` 已按 16:9 裁切;若直接 POST raw
-/// image 则后端仅缩放、不二次裁切。写入用 .tmp + rename 原子化避免半截文件。
+/// User 上传图 bytes(JPG / PNG)→ **16:9 中心裁切**(正常路径前端已 16:9,这里对齐;raw POST
+/// 非 16:9 图归一化,/code-review #6)→ 等比缩到宽 ≤2048(**只缩不放**,小图保原分辨率避免糊,
+/// /code-review #5)→ JPEG 90% 写 `bg.jpg`;同步生成 16:9 preview 写 `preview.jpg`。写入用
+/// .tmp + rename 原子化避免半截文件。
 pub fn save_custom_theme(image_bytes: &[u8]) -> Result<(), String> {
-    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
+    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView};
 
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| format!("无法解析图片(请用 JPG 或 PNG): {e}"))?;
 
-    let bg = img.resize(2048, 2048, FilterType::Lanczos3);
-    let preview = img.resize(640, 640, FilterType::Lanczos3);
+    // 16:9 中心裁切:太宽裁宽、太高裁高。
+    const RATIO: f32 = 16.0 / 9.0;
+    let (w, h) = img.dimensions();
+    let (cw, ch) = if w as f32 / h as f32 > RATIO {
+        (((h as f32) * RATIO).round() as u32, h)
+    } else {
+        (w, ((w as f32) / RATIO).round() as u32)
+    };
+    let cropped = img.crop_imm((w - cw) / 2, (h - ch) / 2, cw.max(1), ch.max(1));
+
+    // 只缩不放:宽 >2048 才缩(resize 保比例 fit 2048×2048 → 16:9 得 2048×1152);否则保原图。
+    let bg = if cw > 2048 {
+        cropped.resize(2048, 2048, FilterType::Lanczos3)
+    } else {
+        cropped.clone()
+    };
+    let preview = if cw > 640 {
+        cropped.resize(640, 640, FilterType::Lanczos3)
+    } else {
+        cropped.clone()
+    };
 
     let dir = custom_theme_dir().ok_or_else(|| "无法解析 home 目录".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
