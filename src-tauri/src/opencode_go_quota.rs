@@ -42,17 +42,36 @@ fn extract_num(block: &str, field: &str) -> Option<f64> {
 /// 解析单个窗口块,返回 `(usagePercent 已用%, resetInSec 重置倒计时秒)`。
 /// 块形如 `rollingUsage:$R[34]={status:"ok",resetInSec:12200,usagePercent:4}` —— 定位
 /// `<name>:` 后第一个 `{...}`(`$R[n]=` 引用前缀不影响),在该 `{}` 范围内取字段。
-/// 找不到该窗口 / 无 usagePercent → None(该窗口跳过,不产出 → 该档不显示)。
+///
+/// **同名多次出现**:同一 `<name>:` 在页面里可能出现 ≥2 次 —— 数据块 `<name>:$R[n]={...usagePercent..}`
+/// 和 billing 对象里的 decoy `<name>:null,...`(实测 `monthlyUsage` 就有,SSR 对象顺序每次请求会变,
+/// decoy 可能排在数据块前)。故**遍历所有出现**,只认「`{` 紧跟其后(≤16 字符,即 `$R[n]=` 短前缀)
+/// 且块内含 `usagePercent`」的那个数据块,跳过 `:null`(其后下一个 `{` 隔很远)。都不匹配 → None。
 fn parse_window(html: &str, name: &str) -> Option<(f64, Option<i64>)> {
     let key = format!("{name}:");
-    let name_at = html.find(&key)?;
-    let brace_off = html[name_at..].find('{')?;
-    let block_start = name_at + brace_off;
-    let block_end = html[block_start..].find('}')? + block_start;
-    let block = &html[block_start..block_end];
-    let used = extract_num(block, "usagePercent")?;
-    let reset_sec = extract_num(block, "resetInSec").map(|n| n as i64);
-    Some((used, reset_sec))
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(&key) {
+        let after_key = from + rel + key.len();
+        from = after_key;
+        let after = &html[after_key..];
+        let Some(brace_off) = after.find('{') else {
+            continue;
+        };
+        // 数据块 `{` 紧跟在 `$R[n]=` 短前缀后;`:null,...` 这种下一个 `{` 隔很远 → 排除。
+        if brace_off > 16 {
+            continue;
+        }
+        let block_start = after_key + brace_off;
+        let Some(end_off) = html[block_start..].find('}') else {
+            continue;
+        };
+        let block = &html[block_start..block_start + end_off];
+        if let Some(used) = extract_num(block, "usagePercent") {
+            let reset_sec = extract_num(block, "resetInSec").map(|n| n as i64);
+            return Some((used, reset_sec));
+        }
+    }
+    None
 }
 
 /// 取 OpenCode Go 套餐三窗口用量。`workspace_id` 形如 `wrk_...`(登录时从控制台 URL 抓),
@@ -135,5 +154,22 @@ mod tests {
         assert!(parse_window("no usage here", "rollingUsage").is_none());
         // 月窗口缺失(其他计划)→ None,不产出该档。
         assert!(parse_window(r#"rollingUsage:$R[1]={usagePercent:5}"#, "monthlyUsage").is_none());
+    }
+
+    // 回归:billing 对象里有 `monthlyUsage:null` decoy,且(实测)可能排在真数据块**之前**。
+    // 必须跳过 decoy、命中真数据块(线上「只缺月额度」的根因)。
+    #[test]
+    fn skips_null_decoy_before_data_block() {
+        let decoy_first = r#"...monthlyUsage:null,timeMonthlyUsageUpdated:null,reloadAmount:20,monthlyLimit:null}...{mine:!0,monthlyUsage:$R[32]={status:"ok",resetInSec:2538889,usagePercent:1}})..."#;
+        let monthly = parse_window(decoy_first, "monthlyUsage").expect("应跳过 decoy 命中数据块");
+        assert_eq!(monthly.0, 1.0);
+        assert_eq!(monthly.1, Some(2538889));
+    }
+
+    #[test]
+    fn skips_null_decoy_after_data_block() {
+        let data_first = r#"...monthlyUsage:$R[32]={status:"ok",resetInSec:100,usagePercent:7}...monthlyUsage:null,timeMonthlyUsageUpdated:null}..."#;
+        let monthly = parse_window(data_first, "monthlyUsage").unwrap();
+        assert_eq!(monthly.0, 7.0);
     }
 }
