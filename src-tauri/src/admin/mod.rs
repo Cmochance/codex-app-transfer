@@ -305,27 +305,9 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/mcp-toml/history",
             get(handlers::mcp_toml::history),
         )
-        // Memories 受管块 (#25 ~/.codex/memories/MEMORY.md 层次化索引)
-        .route(
-            "/api/codex/memories-md/status",
-            get(handlers::memories_md::status),
-        )
-        .route(
-            "/api/codex/memories-md/preview",
-            post(handlers::memories_md::preview),
-        )
-        .route(
-            "/api/codex/memories-md/apply",
-            post(handlers::memories_md::apply),
-        )
-        .route(
-            "/api/codex/memories-md/rollback",
-            post(handlers::memories_md::rollback),
-        )
-        .route(
-            "/api/codex/memories-md/clear",
-            post(handlers::memories_md::clear),
-        )
+        // Memories MEMORY.md(Memories tab):raw 全文编辑 + history/backup/restore + 路径管理。
+        // [MOC-261 二-2] 旧受管块 marker 模式(status/preview/apply/rollback/clear + 未路由 history)
+        // 已删:被 raw 整文件编辑取代、前端零引用、无内部调用方,按死代码移除。
         .route(
             "/api/codex/memories-md/history",
             get(handlers::memories_md::history_raw),

@@ -13,124 +13,14 @@ use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::super::services::managed_block::{
-    HistoryEntry, ManagedBlock, ManagedBlockError, MarkdownManagedBlock,
-};
+use super::super::services::managed_block::HistoryEntry;
 use super::super::services::memories_md_paths;
 use super::common::err;
 
-fn resolve_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .map(PathBuf::from)
-}
-
-/// target = `~/.codex/memories/MEMORY.md` (层次化 markdown 索引)
-/// history = `~/.codex-app-transfer/managed-history/memories.json`
-fn build_block() -> Result<MarkdownManagedBlock, String> {
-    let home = resolve_home().ok_or_else(|| "HOME / USERPROFILE not set".to_owned())?;
-    Ok(MarkdownManagedBlock {
-        block_type: "memories",
-        target: home.join(".codex").join("memories").join("MEMORY.md"),
-        history: home
-            .join(".codex-app-transfer")
-            .join("managed-history")
-            .join("memories.json"),
-    })
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ApplyInput {
-    pub content: String,
-    pub expected_outer_signature: Option<String>,
-}
-
+// raw restore 的 history 下标输入(restore_raw 用)。
 #[derive(Debug, Deserialize, Default)]
 pub struct RollbackInput {
     pub index: usize,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct PreviewQuery {
-    pub content: Option<String>,
-}
-
-pub async fn status() -> impl IntoResponse {
-    let block = match build_block() {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.status_json() {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-pub async fn preview(body: Option<Json<ApplyInput>>) -> impl IntoResponse {
-    let block = match build_block() {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let content = body.map(|j| j.0.content).unwrap_or_default();
-    match block.preview(&content) {
-        Ok(rendered) => Json(json!({
-            "success": true,
-            "rendered": rendered,
-            "newManaged": content,
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-pub async fn apply(Json(input): Json<ApplyInput>) -> impl IntoResponse {
-    let block = match build_block() {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.apply(&input.content, input.expected_outer_signature.as_deref()) {
-        Ok(()) => match block.status_json() {
-            Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => {
-            let status = match e {
-                ManagedBlockError::ProtectedCollision(_) => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            err(status, e.to_string()).into_response()
-        }
-    }
-}
-
-pub async fn rollback(Json(input): Json<RollbackInput>) -> impl IntoResponse {
-    let block = match build_block() {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.rollback(input.index) {
-        Ok(()) => match block.status_json() {
-            Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    }
-}
-
-pub async fn clear() -> impl IntoResponse {
-    let block = match build_block() {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.clear() {
-        Ok(()) => match block.status_json() {
-            Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -359,29 +249,4 @@ pub async fn history_raw(Query(q): Query<HashQuery>) -> impl IntoResponse {
         })
         .collect();
     Json(json!({"success": true, "history": payload})).into_response()
-}
-
-pub async fn history(_q: Query<PreviewQuery>) -> impl IntoResponse {
-    let block = match build_block() {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let hist = block.read_history().unwrap_or_default();
-    let payload: Vec<_> = hist
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            json!({
-                "index": i,
-                "managedContent": entry.managed_content,
-                "appliedContent": entry.applied_content,
-                "timestamp": entry.timestamp,
-            })
-        })
-        .collect();
-    Json(json!({
-        "success": true,
-        "history": payload,
-    }))
-    .into_response()
 }
