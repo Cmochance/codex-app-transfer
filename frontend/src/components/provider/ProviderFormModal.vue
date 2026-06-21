@@ -197,6 +197,31 @@ async function onMimoLogin() {
   }
 }
 
+// [CAT-256] OpenCode 账号登录:仅 OpenCode Go 的【已存】provider(登录按 provider id 落
+// opencodeCookie),记录控制台账号 session 供后续查 Go 套餐额度。镜像 MiMo。
+const opencodeLoggedIn = ref(false)
+const opencodeLoggingIn = ref(false)
+const showOpencodeLogin = computed(
+  () => isEdit.value && matchedPreset.value?.id === 'opencode-go',
+)
+async function onOpencodeLogin() {
+  if (!props.editId) return
+  opencodeLoggingIn.value = true
+  try {
+    const res = await providersApi.opencodeLogin(props.editId)
+    if (res.captured) {
+      opencodeLoggedIn.value = true
+      toast(t('providersAdd.opencodeLogin.success'))
+    } else {
+      toast(t('providersAdd.opencodeLogin.cancelled'))
+    }
+  } catch (e) {
+    toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
+  } finally {
+    opencodeLoggingIn.value = false
+  }
+}
+
 // 测试表单当前值的连接(后端用传入 payload 发探测,不读落盘配置)
 // draft 必须带 models + extraHeaders,否则探测请求与「保存后真实请求」不一致:
 //   • 缺 models → 后端回落硬编码 claude-sonnet-4-6,只支持 POST 探测的上游可能 404 误报不可达
@@ -369,6 +394,7 @@ onMounted(async () => {
   form.authScheme = p.authScheme || 'bearer'
   isBuiltin.value = !!p.isBuiltin
   mimoLoggedIn.value = !!p.hasMimoCookie
+  opencodeLoggedIn.value = !!p.hasOpencodeCookie
   form.reviewModelSlot = p.reviewModelSlot || ''
   for (const s of MODEL_SLOTS) {
     form.models[s.key] = (p.mappings as Record<string, string>)[s.key] || ''
@@ -573,6 +599,23 @@ async function save() {
             :label="mimoLoggingIn ? t('providersAdd.mimoLogin.statusLoggingIn') : t('providersAdd.mimoLogin.button')"
             :disabled="mimoLoggingIn"
             @click="onMimoLogin"
+          />
+        </div>
+      </SettingsRow>
+
+      <SettingsRow v-if="showOpencodeLogin" :title="t('providersAdd.opencodeLogin.label')">
+        <div class="pf__mimo">
+          <span class="pf__mimo-status" :class="{ ok: opencodeLoggedIn }">{{
+            opencodeLoggedIn
+              ? t('providersAdd.opencodeLogin.statusLoggedIn')
+              : t('providersAdd.opencodeLogin.statusNotLoggedIn')
+          }}</span>
+          <AppButton
+            size="sm"
+            variant="secondary"
+            :label="opencodeLoggingIn ? t('providersAdd.opencodeLogin.statusLoggingIn') : t('providersAdd.opencodeLogin.button')"
+            :disabled="opencodeLoggingIn"
+            @click="onOpencodeLogin"
           />
         </div>
       </SettingsRow>

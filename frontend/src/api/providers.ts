@@ -58,6 +58,7 @@ export function mapProvider(provider: Record<string, any>, activeId: string | nu
     authScheme: provider.authScheme || 'bearer',
     hasApiKey: !!provider.hasApiKey,
     hasMimoCookie: !!provider.hasMimoCookie,
+    hasOpencodeCookie: !!provider.hasOpencodeCookie,
     extraHeaders: provider.extraHeaders || {},
     modelCapabilities: provider.modelCapabilities || {},
     requestOptions: provider.requestOptions || {},
@@ -140,6 +141,11 @@ export const getProviderSecret = (id: string) =>
 // 长阻塞:窗口登录完成/关闭才返回;captured=true 表示已抓到 session。
 export const mimoLogin = (id: string) =>
   api<{ captured?: boolean }>('POST', `/api/providers/${id}/mimo-login`)
+
+// OpenCode 账号登录(内嵌窗口抓控制台 session cookie,供后续查 OpenCode Go 套餐额度)。
+// 长阻塞:窗口登录完成/关闭才返回;captured=true 表示已抓到 session。
+export const opencodeLogin = (id: string) =>
+  api<{ captured?: boolean }>('POST', `/api/providers/${id}/opencode-login`)
 
 // 获取上游可用模型:已存在 provider 走 id(用落盘 key);草稿(新增/编辑未存)走 payload。
 // 响应除 models 列表外还带 suggested(后端 suggest_model_mappings 自动建议的「槽位→模型 id」映射,

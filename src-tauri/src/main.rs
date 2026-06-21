@@ -16,6 +16,7 @@ mod mcp_webfetch_server;
 mod mimo_quota;
 mod mimo_session;
 mod moonshot_quota;
+mod opencode_session;
 mod provider_quota;
 mod proxy_runner;
 #[cfg(target_os = "macos")]
@@ -143,6 +144,8 @@ fn main() {
             // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
             // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
             mimo_session::init(app.handle().clone());
+            // [CAT-256] 同理供 OpenCode 账号内嵌 webview 登录开窗用。
+            opencode_session::init(app.handle().clone());
             // [Dock 隐藏] 存全局 AppHandle 供 save_settings hot-reload 切 activation policy。
             macos_dock::init(app.handle().clone());
 

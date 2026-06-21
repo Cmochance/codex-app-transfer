@@ -538,5 +538,13 @@ pub fn public_provider(p: &Value) -> Value {
         .unwrap_or(false);
     out.remove("mimoCookie");
     out.insert("hasMimoCookie".into(), Value::Bool(has_mimo_cookie));
+    // [CAT-256] opencodeCookie 同理(OpenCode 账号控制台 session),mask 出去只暴露 hasOpencodeCookie。
+    let has_opencode_cookie = out
+        .get("opencodeCookie")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    out.remove("opencodeCookie");
+    out.insert("hasOpencodeCookie".into(), Value::Bool(has_opencode_cookie));
     Value::Object(out)
 }

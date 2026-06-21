@@ -89,6 +89,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::providers::crud::mimo_login),
         )
         .route(
+            "/api/providers/{id}/opencode-login",
+            post(handlers::providers::crud::opencode_login),
+        )
+        .route(
             "/api/providers/{id}/secret",
             get(handlers::providers::crud::get_secret),
         )
