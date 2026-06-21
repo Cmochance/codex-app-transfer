@@ -24,9 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::super::services::agents_md_paths;
-use super::super::services::managed_block::{
-    HistoryEntry, ManagedBlock, ManagedBlockError, MarkdownManagedBlock,
-};
+use super::super::services::managed_block::{HistoryEntry, ManagedBlock, MarkdownManagedBlock};
 use super::common::err;
 
 /// 构造 AGENTS.md 受管块实例 — 根据 hash 解析 target path(缺省 → 全局)。
@@ -50,13 +48,7 @@ pub struct HashQuery {
     pub hash: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ApplyInput {
-    pub content: String,
-    pub expected_outer_signature: Option<String>,
-}
-
+// raw restore 的 history 下标输入(restore_raw 用)。
 #[derive(Debug, Deserialize, Default)]
 pub struct RollbackInput {
     pub index: usize,
@@ -70,88 +62,6 @@ pub struct AddPathInput {
 #[derive(Debug, Deserialize, Default)]
 pub struct RemovePathInput {
     pub hash: String,
-}
-
-pub async fn status(Query(q): Query<HashQuery>) -> impl IntoResponse {
-    let block = match build_block_for_hash(q.hash.as_deref()) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.status_json() {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-pub async fn preview(
-    Query(q): Query<HashQuery>,
-    body: Option<Json<ApplyInput>>,
-) -> impl IntoResponse {
-    let block = match build_block_for_hash(q.hash.as_deref()) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let content = body.map(|j| j.0.content).unwrap_or_default();
-    match block.preview(&content) {
-        Ok(rendered) => Json(json!({
-            "success": true,
-            "rendered": rendered,
-            "newManaged": content,
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-pub async fn apply(Query(q): Query<HashQuery>, Json(input): Json<ApplyInput>) -> impl IntoResponse {
-    let block = match build_block_for_hash(q.hash.as_deref()) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.apply(&input.content, input.expected_outer_signature.as_deref()) {
-        Ok(()) => match block.status_json() {
-            Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => {
-            let status = match e {
-                ManagedBlockError::ProtectedCollision(_) => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            err(status, e.to_string()).into_response()
-        }
-    }
-}
-
-pub async fn rollback(
-    Query(q): Query<HashQuery>,
-    Json(input): Json<RollbackInput>,
-) -> impl IntoResponse {
-    let block = match build_block_for_hash(q.hash.as_deref()) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.rollback(input.index) {
-        Ok(()) => match block.status_json() {
-            Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    }
-}
-
-pub async fn clear(Query(q): Query<HashQuery>) -> impl IntoResponse {
-    let block = match build_block_for_hash(q.hash.as_deref()) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match block.clear() {
-        Ok(()) => match block.status_json() {
-            Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
 }
 
 pub async fn history(Query(q): Query<HashQuery>) -> impl IntoResponse {

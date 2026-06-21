@@ -255,27 +255,9 @@ pub fn build_app_router(state: AdminState) -> Router {
         .merge(handlers::antigravity_oauth::routes())
         // z.ai / bigmodel GLM 账号登录 OAuth (login / status / logout / cancel,MOC-252 Stage 3)
         .merge(handlers::zai_oauth::routes())
-        // Codex AGENTS.md 受管块管理(#24 / #25 Agents tab MVP, 借鉴 borawong/AiMaMi)
-        .route(
-            "/api/codex/agents-md/status",
-            get(handlers::agents_md::status),
-        )
-        .route(
-            "/api/codex/agents-md/preview",
-            post(handlers::agents_md::preview),
-        )
-        .route(
-            "/api/codex/agents-md/apply",
-            post(handlers::agents_md::apply),
-        )
-        .route(
-            "/api/codex/agents-md/rollback",
-            post(handlers::agents_md::rollback),
-        )
-        .route(
-            "/api/codex/agents-md/clear",
-            post(handlers::agents_md::clear),
-        )
+        // Codex AGENTS.md(Agents tab):raw 全文编辑 + history/backup/restore + 路径管理。
+        // [MOC-261 二-1] 旧受管块 marker 模式(status/preview/apply/rollback/clear)已删:
+        // 被 raw 整文件编辑取代、前端零引用、无内部调用方,按死代码移除。
         .route(
             "/api/codex/agents-md/history",
             get(handlers::agents_md::history),
