@@ -2,7 +2,13 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
+
+/// [CAT-255] 串行化所有「关 Codex → 维护 → 重启」流程(`launch_codex_app_restart` +
+/// `with_codex_closed`),避免两个流程并发:一个在写 Codex 独占的 state DB,另一个把 Codex
+/// 重新拉起 → DB 在 Codex 运行时被写 = 整个设计要防的数据损坏。
+static CODEX_MAINTENANCE_LOCK: Mutex<()> = Mutex::new(());
 
 const MACOS_APP_NAME: &str = "Codex";
 // [MOC-100 B] macOS 进程树匹配 token:`pkill -x Codex` / `pgrep -x Codex` 只认主进程名,
@@ -636,6 +642,9 @@ fn open_codex_app(platform: &str) -> Result<(), String> {
 }
 
 pub fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
+    let _guard = CODEX_MAINTENANCE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let was_running = is_codex_app_running(platform);
     quit_codex_app_with_retries(platform)?;
     // 退出确认后给 launchd 一段 grace 让它 reap 完旧进程,LaunchServices 才会
@@ -648,22 +657,35 @@ pub fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
     open_codex_app(platform)
 }
 
-/// [CAT-255] 退出 Codex.app 并阻塞到退出确认 + launchd grace —— 给「必须在 Codex
-/// 关闭时做」的维护操作(如就地改它独占的 `state_<N>.sqlite`)用。返回调用前 Codex
-/// 是否在运行,供调用方决定维护完是否需要重启。退出失败回 `Err`(调用方据此中止、
-/// **绝不在 Codex 可能运行时写它的 DB**)。
-pub fn quit_codex_app_blocking(platform: &str) -> Result<bool, String> {
+/// [CAT-255] **关闭 Codex.app → 跑 `work`(必须 Codex 关闭时做的维护,如就地改它独占的
+/// `state_<N>.sqlite`)→ 重启 Codex.app**,全程持有 [`CODEX_MAINTENANCE_LOCK`] 跟其他
+/// Codex 维护流程互斥。
+///
+/// - 退出失败 → 直接回 `Err`(**绝不在 Codex 可能运行时跑 `work`**);
+/// - `work` 无论成败都会重启 Codex(原本开着才拉起;没开则不擅自启);
+/// - 返回 `(work 结果, codex_running_after)`:`codex_running_after=false` 表示原本开着但
+///   重启失败,调用方据此提示用户手动打开。
+///
+/// 注:内部有阻塞 sleep(quit retries + launchd grace),async 调用方应包进
+/// `tokio::task::spawn_blocking` 再 await,别堵 tokio worker。
+pub fn with_codex_closed<T>(platform: &str, work: impl FnOnce() -> T) -> Result<(T, bool), String> {
+    let _guard = CODEX_MAINTENANCE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let was_running = is_codex_app_running(platform);
     quit_codex_app_with_retries(platform)?;
     if was_running {
         std::thread::sleep(POST_QUIT_LAUNCHD_GRACE);
     }
-    Ok(was_running)
-}
-
-/// [CAT-255] 启动 Codex.app —— `quit_codex_app_blocking` 维护完后重新拉起用。
-pub fn launch_codex_app(platform: &str) -> Result<(), String> {
-    open_codex_app(platform)
+    let out = work();
+    // 维护后重启:原本开着才拉起。relaunched=true 表示「维护后 Codex 应在运行」
+    // (没开过 → 无需拉起,也算 true,不让调用方误报「重启失败」)。
+    let relaunched = if was_running {
+        open_codex_app(platform).is_ok()
+    } else {
+        true
+    };
+    Ok((out, relaunched))
 }
 
 #[cfg(test)]

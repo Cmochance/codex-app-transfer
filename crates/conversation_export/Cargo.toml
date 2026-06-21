@@ -10,7 +10,9 @@ repository.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order:[CAT-255] 就地改写 rollout 首行 session_meta 时保留原 JSON 键序,
+# 别让 serde_json 默认按字母重排(Codex 对那行格式敏感,重排可能解析失败/backfill 错乱)。
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }

@@ -30,6 +30,12 @@ use std::path::{Path, PathBuf};
 /// **检测时只把第三方挑出来,openai / 没写的不碰**(用户硬性约束);导入时归到它。
 const ANCHOR_PROVIDER: &str = "openai";
 
+/// 不算「第三方」的 model_provider —— detect 排除它们:
+/// - `openai`:锚点本身;
+/// - `codex-app-transfer`:本工具自己的旧 tag(早期版本写过),不能误当其他工具的会话导入/重写。
+///   (改这里要同步改下方 detect SQL 里 NOT IN 的字面量。)
+const NON_FOREIGN_PROVIDERS: [&str; 2] = ["openai", "codex-app-transfer"];
+
 /// 一条被其他工具隔离的会话(待导入)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,15 +92,18 @@ pub fn detect_foreign_sessions(codex_home: &Path) -> Result<Vec<ForeignSession>,
     let Some(db) = find_state_db(codex_home) else {
         return Ok(Vec::new());
     };
+    debug_assert_eq!(NON_FOREIGN_PROVIDERS, ["openai", "codex-app-transfer"]);
     let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // `NON_FOREIGN_PROVIDERS` 排除自有/锚点 tag;`COALESCE(archived,0)` 防 archived 为 NULL 时
+    // `archived = 0` 在 SQL 里判 false 而漏掉(第三方工具写的行可能没设该列)。
     let mut stmt = conn.prepare(
         "SELECT id, model_provider, COALESCE(cwd,''), COALESCE(title,''), COALESCE(rollout_path,'') \
          FROM threads \
          WHERE model_provider IS NOT NULL AND model_provider != '' \
-           AND LOWER(model_provider) != ?1 \
-           AND archived = 0",
+           AND LOWER(model_provider) NOT IN ('openai', 'codex-app-transfer') \
+           AND COALESCE(archived, 0) = 0",
     )?;
-    let rows = stmt.query_map([ANCHOR_PROVIDER], |r| {
+    let rows = stmt.query_map([], |r| {
         Ok(ForeignSession {
             id: r.get(0)?,
             model_provider: r.get(1)?,
@@ -187,9 +196,13 @@ pub fn set_sessions_provider(
     };
     let conn = Connection::open(&db)?;
 
-    // 导入额外点亮可见性(空会话不强行点亮 has_user_event,对齐上游 repair 脚本)
+    // 导入额外点亮可见性。`has_user_event` 仅有 user 消息时点亮(空会话不强行点亮,对齐上游
+    // repair 脚本);`thread_source` 仅原本为空时补 'user'(已有值不覆盖 —— 减少对来源元数据的
+    // 破坏性改写,让会话回到其他工具时元数据更接近原样)。
     let sql = if mark_visible {
-        "UPDATE threads SET model_provider = ?1, thread_source = 'user', \
+        "UPDATE threads SET model_provider = ?1, \
+         thread_source = CASE WHEN thread_source IS NULL OR thread_source = '' \
+           THEN 'user' ELSE thread_source END, \
          has_user_event = CASE \
            WHEN first_user_message IS NOT NULL AND length(trim(first_user_message)) > 0 \
            THEN 1 ELSE has_user_event END \
@@ -199,20 +212,31 @@ pub fn set_sessions_provider(
     };
 
     for id in session_ids {
-        // 先拿 rollout_path(顺带验证 id 存在)
-        let rollout_path: Option<Option<String>> = conn
+        // 先拿 rollout_path(顺带验证 id 存在)。真 sqlite 错(锁/IO)逐条收 failed、**不 `?`
+        // 中断整批**(否则前面已 UPDATE+提交的会话被静默改了却报整体失败)。
+        let rollout_path = match conn
             .query_row(
                 "SELECT rollout_path FROM threads WHERE id = ?1",
                 [id],
                 |r| r.get::<_, Option<String>>(0),
             )
-            .optional()?;
-        let Some(rollout_path) = rollout_path else {
-            result.failed.push(RepairFailure {
-                session_id: id.clone(),
-                reason: "threads 表无此会话".into(),
-            });
-            continue;
+            .optional()
+        {
+            Ok(Some(rp)) => rp, // 行存在,rp = rollout_path(可能 NULL/空)
+            Ok(None) => {
+                result.failed.push(RepairFailure {
+                    session_id: id.clone(),
+                    reason: "threads 表无此会话".into(),
+                });
+                continue;
+            }
+            Err(e) => {
+                result.failed.push(RepairFailure {
+                    session_id: id.clone(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
         };
 
         match conn.execute(sql, rusqlite::params![target_provider, id]) {
@@ -301,26 +325,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = make_state_db(dir.path(), 5);
         let conn = Connection::open(&db).unwrap();
-        // 一条第三方(cas)+ openai(锚点,不检出)+ 空 provider(不碰)
+        // a=第三方(检出);b=openai 锚点(不碰);c=空(不碰);d=codex-app-transfer 自有 tag
+        // (不碰,#1);e=第三方但 archived 为 NULL(COALESCE 后仍检出,防漏)
         conn.execute(
             "INSERT INTO threads (id, model_provider, cwd, title, rollout_path, archived, first_user_message) VALUES \
                ('a','cas','/p','t','',0,'hello'), \
                ('b','openai','/p','t','',0,'hi'), \
-               ('c','','/p','t','',0,'x')",
+               ('c','','/p','t','',0,'x'), \
+               ('d','codex-app-transfer','/p','t','',0,'own'), \
+               ('e','deepseek','/p','t','',NULL,'nullarch')",
             [],
         )
         .unwrap();
 
-        let foreign = detect_foreign_sessions(dir.path()).unwrap();
-        assert_eq!(foreign.len(), 1);
-        assert_eq!(foreign[0].id, "a");
-        assert_eq!(foreign[0].model_provider, "cas");
+        let mut foreign = detect_foreign_sessions(dir.path()).unwrap();
+        foreign.sort_by(|x, y| x.id.cmp(&y.id));
+        let ids: Vec<&str> = foreign.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "e"],
+            "只检出第三方(排除 openai/空/codex-app-transfer)"
+        );
 
         // 导入:cas → openai + 点亮可见
         let r = set_sessions_provider(dir.path(), &["a".into()], "openai", true).unwrap();
         assert_eq!(r.repaired, vec!["a".to_string()]);
         assert!(r.failed.is_empty());
-        assert!(detect_foreign_sessions(dir.path()).unwrap().is_empty());
         let hue: i64 = conn
             .query_row("SELECT has_user_event FROM threads WHERE id='a'", [], |r| {
                 r.get(0)

@@ -46,7 +46,15 @@ export function useSessionImport() {
     busy.value = true
     try {
       const r = await importForeignSessions()
-      toast(tFmt('settings.sessionImportOk', { count: r.imported }))
+      if (!r.success) {
+        toast(
+          tFmt('settings.sessionImportPartial', { ok: r.imported, failed: r.failed.length }),
+          'error',
+        )
+      } else {
+        toast(tFmt('settings.sessionImportOk', { count: r.imported }))
+      }
+      if (!r.codexRelaunched) toast(t('settings.codexRelaunchFailed'), 'error')
     } catch (e) {
       toast((e as Error).message || t('settings.sessionImportFailed'), 'error')
     } finally {
@@ -74,7 +82,15 @@ export function useSessionImport() {
     busy.value = true
     try {
       const r = await restoreForeignSessions(ids, provider)
-      toast(tFmt('settings.sessionRestoreOk', { count: r.imported, provider }))
+      if (!r.success) {
+        toast(
+          tFmt('settings.sessionRestorePartial', { ok: r.imported, failed: r.failed.length }),
+          'error',
+        )
+      } else {
+        toast(tFmt('settings.sessionRestoreOk', { count: r.imported, provider }))
+      }
+      if (!r.codexRelaunched) toast(t('settings.codexRelaunchFailed'), 'error')
     } catch (e) {
       toast((e as Error).message || t('settings.sessionRestoreFailed'), 'error')
     } finally {

@@ -89,6 +89,13 @@ export interface ForeignSession {
   title: string
   rolloutPath: string
 }
+export interface SessionWriteResult {
+  success: boolean
+  imported: number
+  failed: { sessionId: string; reason: string }[]
+  codexRelaunched: boolean
+  message?: string
+}
 /** 扫出第三方 model_provider 的会话(只读,Codex 运行时也安全)。 */
 export function detectForeignSessions() {
   return api<{ count: number; sessions: ForeignSession[] }>(
@@ -96,16 +103,33 @@ export function detectForeignSessions() {
     '/api/codex-sessions/detect-foreign',
   )
 }
+// import/restore 不走 api():后端在「部分会话失败」时返 HTTP 200 + {success:false, imported, failed}。
+// api() 遇 success===false 即抛、吞掉 imported/failed 计数 + codexRelaunched(致 UI 把「部分成功 +
+// Codex 已重启」误报成泛化 "Request failed")。用 raw fetch 读完整 payload,只在真正传输错时抛。
+async function postSessionWrite(path: string, body?: unknown): Promise<SessionWriteResult> {
+  const resp = await fetch(path, {
+    method: 'POST',
+    headers: { 'X-CAS-Request': '1', 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  let data: SessionWriteResult & { message?: string }
+  try {
+    data = await resp.json()
+  } catch (parseErr) {
+    throw new Error(
+      `Request failed: POST ${path} — HTTP ${resp.status} ${resp.statusText || ''} (非 JSON: ${String(parseErr)})`,
+    )
+  }
+  if (!resp.ok) throw new Error(data.message || `Request failed: HTTP ${resp.status}`)
+  return data
+}
 /** 全部第三方会话就地归一成 openai(transfer 可见);后端关 Codex→写→重启。 */
 export function importForeignSessions() {
-  return api<{ imported: number; codexRelaunched: boolean }>('POST', '/api/codex-sessions/import')
+  return postSessionWrite('/api/codex-sessions/import')
 }
 /** 把选中会话的 model_provider 写回指定值(其他工具可见);后端关 Codex→写→重启。 */
 export function restoreForeignSessions(sessionIds: string[], modelProvider: string) {
-  return api<{ imported: number; codexRelaunched: boolean }>('POST', '/api/codex-sessions/restore', {
-    sessionIds,
-    modelProvider,
-  })
+  return postSessionWrite('/api/codex-sessions/restore', { sessionIds, modelProvider })
 }
 // 在系统文件管理器打开 Codex 原配置快照目录(~/.codex-app-transfer/codex-snapshots/active/)
 export function openSnapshotDir() {

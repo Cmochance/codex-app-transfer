@@ -6,9 +6,9 @@
 //! - `POST /api/codex-sessions/import`         → 全部第三方就地归一成 openai(transfer 可见)
 //! - `POST /api/codex-sessions/restore`        → 把选中会话的 model_provider 写成用户指定值(其他工具可见)
 //!
-//! import / restore **写 Codex 独占的 `state_<N>.sqlite`**,所以这两个端点负责
-//! 先退出 Codex、写完再重启(用户在弹窗选「关闭Codex」即授权了这一流程)。
-//! 机制见 `conversation_export::repair`。
+//! import / restore **写 Codex 独占的 `state_<N>.sqlite`**,所以这两个端点经
+//! `process::with_codex_closed` 先退出 Codex、写完再重启(全程持维护锁,跟其他 Codex
+//! 维护流程互斥)。机制见 `conversation_export::repair`。
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::CodexPaths;
@@ -16,7 +16,7 @@ use codex_app_transfer_conversation_export as cexp;
 use codex_app_transfer_proxy::proxy_telemetry;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::admin::handlers::common::err;
 use crate::admin::services::desktop::process;
@@ -48,12 +48,23 @@ pub async fn detect_foreign_handler() -> impl IntoResponse {
 }
 
 /// POST `/api/codex-sessions/import` → 关闭 Codex → 所有第三方会话归一成 openai → 重启 Codex.
+/// **detect-before-quit**:先只读探测,0 条就直接返回、不白白强杀 + 重启用户的 Codex。
 pub async fn import_handler() -> impl IntoResponse {
     let home = match codex_home() {
         Ok(p) => p,
         Err(r) => return r,
     };
-    with_codex_closed_write("import", |home| cexp::import_foreign_sessions(home), home)
+    match cexp::detect_foreign_sessions(&home) {
+        Ok(f) if f.is_empty() => {
+            return Json(json!({
+                "success": true, "imported": 0, "failed": [], "codexRelaunched": true
+            }))
+            .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    run_codex_write("import", home, |h| cexp::import_foreign_sessions(h)).await
 }
 
 #[derive(Deserialize)]
@@ -80,49 +91,57 @@ pub async fn restore_handler(Json(body): Json<RestoreBody>) -> impl IntoResponse
     if body.session_ids.is_empty() {
         return err(StatusCode::BAD_REQUEST, "sessionIds 不能为空").into_response();
     }
-    with_codex_closed_write(
-        "restore",
-        move |home| cexp::set_sessions_provider(home, &body.session_ids, &target, false),
-        home,
-    )
+    let ids = body.session_ids;
+    run_codex_write("restore", home, move |h| {
+        cexp::set_sessions_provider(h, &ids, &target, false)
+    })
+    .await
 }
 
-/// import / restore 共用:**退出 Codex → 跑 `work`(写 state DB)→ 重启 Codex**,
-/// 统一成 `{ success, imported, failed, codexRelaunched }` 响应。
-/// 退出失败 → 直接报错不写 DB;`work` 报错 → 仍把 Codex 拉回来再报错。
-fn with_codex_closed_write(
-    op: &str,
-    work: impl FnOnce(&std::path::Path) -> Result<cexp::RepairResult, cexp::ExportError>,
+/// import / restore 共用:**spawn_blocking 包住「关 Codex→写 state DB→重启」**(别堵 tokio
+/// worker),统一成 `{ success, imported, failed, codexRelaunched }` 响应。
+/// 退出失败 → 报错不写;`work` 报错 → with_codex_closed 已重启 Codex,带 relaunch 状态报错;
+/// 部分失败 → success=false + 完整 failed 列表(前端 raw-fetch 读 body,绝不把部分失败报成功)。
+async fn run_codex_write(
+    op: &'static str,
     home: PathBuf,
+    work: impl FnOnce(&Path) -> Result<cexp::RepairResult, cexp::ExportError> + Send + 'static,
 ) -> axum::response::Response {
     let os = std::env::consts::OS;
+    let outcome =
+        tokio::task::spawn_blocking(move || process::with_codex_closed(os, || work(&home))).await;
 
-    // ① 退出 Codex(失败直接报错,绝不在它可能运行时写它的 DB)
-    let was_running = match process::quit_codex_app_blocking(os) {
-        Ok(r) => r,
-        Err(e) => {
+    let (work_result, relaunched) = match outcome {
+        Ok(Ok(pair)) => pair,
+        // with_codex_closed 退出 Codex 失败 → 没写 DB
+        Ok(Err(e)) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("退出 Codex 失败,未改动会话:{e}"),
             )
             .into_response()
         }
-    };
-
-    // ② 写 state DB + rollout
-    let result = match work(&home) {
-        Ok(r) => r,
         Err(e) => {
-            // 失败也要把 Codex 拉回来(用户原本开着的)
-            if was_running {
-                let _ = process::launch_codex_app(os);
-            }
-            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("任务执行失败:{e}"),
+            )
+            .into_response()
         }
     };
 
-    // ③ 重启 Codex(用户选「关闭Codex」就期望写完自动重启;原本没开则不擅自拉起)
-    let relaunched = was_running && process::launch_codex_app(os).is_ok();
+    let result = match work_result {
+        Ok(r) => r,
+        Err(e) => {
+            // 写失败:Codex 已被 with_codex_closed 拉回来(若原本开着);带重启状态报错
+            let tail = if relaunched {
+                String::new()
+            } else {
+                "(且 Codex 未能自动重启,请手动打开)".into()
+            };
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}{tail}")).into_response();
+        }
+    };
 
     let success = result.failed.is_empty();
     proxy_telemetry().logs.add(
@@ -134,11 +153,18 @@ fn with_codex_closed_write(
         ),
     );
 
-    Json(json!({
+    let mut body = json!({
         "success": success,
         "imported": result.repaired.len(),
         "failed": result.failed,
         "codexRelaunched": relaunched,
-    }))
-    .into_response()
+    });
+    if !success {
+        body["message"] = json!(format!(
+            "{} 条成功,{} 条失败",
+            result.repaired.len(),
+            result.failed.len()
+        ));
+    }
+    Json(body).into_response()
 }
