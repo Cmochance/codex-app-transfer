@@ -286,25 +286,9 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/agents-md/restore-raw",
             post(handlers::agents_md::restore_raw),
         )
-        // MCP servers 受管块 (#24 #25 PR-A, config.toml TOML 变种)
-        .route(
-            "/api/codex/mcp-toml/status",
-            get(handlers::mcp_toml::status),
-        )
-        .route(
-            "/api/codex/mcp-toml/preview",
-            post(handlers::mcp_toml::preview),
-        )
-        .route("/api/codex/mcp-toml/apply", post(handlers::mcp_toml::apply))
-        .route(
-            "/api/codex/mcp-toml/rollback",
-            post(handlers::mcp_toml::rollback),
-        )
-        .route("/api/codex/mcp-toml/clear", post(handlers::mcp_toml::clear))
-        .route(
-            "/api/codex/mcp-toml/history",
-            get(handlers::mcp_toml::history),
-        )
+        // [MOC-261 二-3] config.toml MCP 段旧「受管块」端点(mcp-toml/status|preview|apply|
+        // rollback|clear|history)已删:MCP UI 走 mcp_servers CRUD + config/raw,整模块前端零引用、
+        // 无内部调用方。共享 managed_block 服务保留(history 读取仍被 agents-md 用;写路径深剥离见 MOC-273)。
         // Memories MEMORY.md(Memories tab):raw 全文编辑 + history/backup/restore + 路径管理。
         // [MOC-261 二-2] 旧受管块 marker 模式(status/preview/apply/rollback/clear + 未路由 history)
         // 已删:被 raw 整文件编辑取代、前端零引用、无内部调用方,按死代码移除。
