@@ -66,7 +66,18 @@ async function onClearSessionHistory() {
   clearingSessions.value = true
   try {
     const r = await clearAllConversations()
-    toast(tFmt('settings.sessionHistoryClearOk', { count: r.sessionsTrashed }))
+    if (r.sessionsFailed > 0) {
+      // 部分 / 全部 rollout 移回收站失败(权限/沙箱等)→ 明确告知,别报成功(隐私清除未达成)。
+      toast(
+        tFmt('settings.sessionHistoryClearPartial', {
+          ok: r.sessionsTrashed,
+          failed: r.sessionsFailed,
+        }),
+        'error',
+      )
+    } else {
+      toast(tFmt('settings.sessionHistoryClearOk', { count: r.sessionsTrashed }))
+    }
   } catch (e) {
     toast((e as Error).message || t('settings.sessionHistoryClearFailed'), 'error')
   } finally {

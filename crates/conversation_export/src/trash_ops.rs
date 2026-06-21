@@ -58,6 +58,27 @@ pub fn move_sessions_to_trash(
     Ok(result)
 }
 
+/// 把 codex_home 下 **全部** rollout(`list_sessions` 能列出的 active + archived `.jsonl`;
+/// 冷归档 `.jsonl.zst` 当前被 list_sessions 跳过、见 MOC-214)整批移到回收站。
+///
+/// 跟 [`move_sessions_to_trash`] 的区别:**只扫一次目录**(直接用 list_sessions 的 path,
+/// 不需调用方先 list 拿 id 再传进来二次扫描),给「清空会话历史」一键全清用。
+pub fn move_all_sessions_to_trash(codex_home: &Path) -> Result<TrashResult, ExportError> {
+    let all = list_sessions(codex_home)?;
+    let mut result = TrashResult::default();
+    for s in all {
+        match trash::delete(&s.path) {
+            Ok(_) => result.deleted.push(s.id),
+            Err(e) => result.failed.push(TrashFailure {
+                session_id: s.id,
+                path: s.path,
+                reason: e.to_string(),
+            }),
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +114,15 @@ mod tests {
         assert_eq!(r.deleted.len(), 0);
         assert_eq!(r.failed.len(), 1);
         assert!(r.failed[0].reason.contains("not found"));
+    }
+
+    /// 无会话时 `move_all_sessions_to_trash` 返回空结果、不报错(clear-all 在空 codex_home
+    /// 上照常成功的路径)。不真 trash 文件,CI 安全。
+    #[test]
+    fn move_all_on_empty_home_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = move_all_sessions_to_trash(tmp.path()).unwrap();
+        assert_eq!(r.deleted.len(), 0);
+        assert_eq!(r.failed.len(), 0);
     }
 }
