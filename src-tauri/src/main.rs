@@ -680,6 +680,20 @@ fn main() {
                     .await
                 });
             }
+            // [CAT-250] 同理取消 in-flight antigravity OAuth login:此前 antigravity 漏接这套
+            // app-exit 取消(gemini/zai 都有),用户登 antigravity 期间退出 app 时后台 task 残留 +
+            // ghost 凭证落盘。机器(cancel_in_flight_login + wait_for_login_epoch_complete)已在,补接线。
+            let ag_outcome = handlers::antigravity_oauth::cancel_in_flight_login();
+            if let (true, Some(target_epoch)) = (ag_outcome.cancelled, ag_outcome.cancelled_epoch) {
+                tracing::info!(target_epoch, "app exit: cancelled in-flight antigravity OAuth login");
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::antigravity_oauth::wait_for_login_epoch_complete(target_epoch),
+                    )
+                    .await
+                });
+            }
             // [devin review] 同理取消 in-flight `codex login`(真实账号登录):否则 user 在
             // OAuth 等待期间退出 app,孤儿 codex login 进程可能在下面 restore_codex_if_enabled
             // 恢复原配置**之后**才写 ~/.codex/auth.json,把刚恢复的状态又改脏(数据完整性)。

@@ -2,15 +2,13 @@
 
 use std::time::{Duration, Instant};
 
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use axum::{response::IntoResponse, Json};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE},
     StatusCode as ReqwestStatusCode,
 };
 use serde_json::{json, Value};
 
-use super::super::super::registry_io::load as load_registry;
-use super::super::common::err;
 use super::{normalize_provider_api_format, provider_api_key, provider_test_model};
 
 pub(super) fn build_provider_test_url(base_url: &str, api_format: &str) -> String {
@@ -351,28 +349,6 @@ async fn test_provider_connection(provider: &Value) -> Value {
     })
 }
 
-pub async fn test_provider(Path(id): Path<String>) -> impl IntoResponse {
-    let cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let provider = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .and_then(|providers| {
-            providers.iter().find(|provider| {
-                provider
-                    .as_object()
-                    .and_then(|o| o.get("id"))
-                    .and_then(|v| v.as_str())
-                    == Some(id.as_str())
-            })
-        });
-    let Some(provider) = provider else {
-        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
-    };
-    Json(test_provider_connection(provider).await).into_response()
-}
 pub async fn test_provider_payload(Json(payload): Json<Value>) -> impl IntoResponse {
     Json(test_provider_connection(&payload).await).into_response()
 }

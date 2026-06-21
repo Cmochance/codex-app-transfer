@@ -6,7 +6,6 @@
 //! 跟 mcp_servers.rs 互补:`mcp_servers` 管直配单 server,`codex_plugins` 管 plugin
 //! bundle(plugin 内部含多 MCP server + skill + app + hook)。
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};

@@ -20,7 +20,6 @@ use crate::admin::handlers::proxy::read_proxy_port;
 use crate::admin::registry_io::load as load_registry;
 
 // Re-export core services to preserve public API / downstream integration stability (e.g. called by main.rs)
-pub use crate::admin::services::desktop::process::is_codex_app_running;
 pub use crate::admin::services::desktop::snapshot::{
     auto_apply_on_startup_if_enabled, mcp_credentials_on_setting_changed,
     mcp_credentials_startup_sync, restore_codex_if_enabled, switch_provider_and_sync,
