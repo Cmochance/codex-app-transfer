@@ -754,7 +754,7 @@ export default {
   "confirm.providerApplyDesktop": "This will save the provider and model mapping, generate Codex CLI environment config, and start the forwarding service. Continue?",
   "confirm.installUpdate": "This will download the installer. After the download finishes, the app will quit automatically and start the installer. Continue?",
   "confirm.openDocs": "Open {provider}'s official docs in the browser?",
-  "theme.cropTitle": "Crop 1:1 (drag to move, scroll to zoom)",
+  "theme.cropTitle": "Crop 16:9 (drag to move, scroll to zoom)",
   "theme.cropConfirm": "Use this crop",
   "theme.uploadDecodeFailed": "Image could not be decoded — try a different file",
   "theme.hiddenCount": "{count} hidden",

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // Codex Desktop 主题注入页 — 移植旧 app.js renderTheme + bindThemeEvents(#264 / MOC-102)。
-// 主题 grid + 选中/隐藏/删除/上传(1:1 crop)+ 徽章派生(绝不暴露 raw CDP 502)+ 重启对话框。
+// 主题 grid + 选中/隐藏/删除/上传(16:9 crop)+ 徽章派生(绝不暴露 raw CDP 502)+ 重启对话框。
 import { computed, onMounted, ref, watch } from 'vue'
 import { i18nState, t, tFmt } from '@/i18n'
 import { useSettingsStore } from '@/stores/settings'
@@ -300,7 +300,7 @@ async function onDelete(themeId: string, isCustom: boolean) {
   }
 }
 
-// 上传 / 替换:file picker → readAsDataURL → 打开 1:1 crop 弹窗。
+// 上传 / 替换:file picker → readAsDataURL → 打开 16:9 crop 弹窗。
 function openUpload() {
   const input = document.createElement('input')
   input.type = 'file'

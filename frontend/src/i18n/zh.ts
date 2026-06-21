@@ -881,7 +881,7 @@ export default {
   "confirm.installUpdate":
     "将自动下载安装包。下载完成后，当前应用会自动退出并启动安装器。确认继续？",
   "confirm.openDocs": "即将在浏览器打开 {provider} 的官方文档页面。继续？",
-  "theme.cropTitle": "1:1 截取（拖动调整位置，滚轮缩放）",
+  "theme.cropTitle": "16:9 截取（拖动调整位置，滚轮缩放）",
   "theme.cropConfirm": "使用此截取",
   "theme.uploadDecodeFailed": "图片无法解码，请换一张",
   "theme.hiddenCount": "已隐藏 {count} 个",
