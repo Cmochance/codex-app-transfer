@@ -19,7 +19,8 @@ use serde_json::json;
 
 use crate::codex_theme_injector::{
     all_themes, apply_theme, bg_download_progress, clear_theme, delete_custom_theme,
-    get_status as get_theme_status, load_theme_assets, reload_codex_page, save_custom_theme,
+    effective_curated_palette, get_status as get_theme_status, load_theme_assets,
+    reload_codex_page, save_custom_theme,
 };
 use axum::routing::delete;
 
@@ -42,6 +43,8 @@ pub async fn list_handler() -> impl IntoResponse {
                 "displayNameEn": m.display_name_en,
                 "hasMascot": m.has_mascot,
                 "previewDataUri": preview_data_uri,
+                // [MOC-272] 有效精选调色板(基底 + 用户 override)→ 前端调色盘编辑器回显当前值。
+                "palette": effective_curated_palette(m.id),
             })
         })
         .collect();
