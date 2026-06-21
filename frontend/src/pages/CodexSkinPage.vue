@@ -16,14 +16,17 @@ import {
   themeDeleteCustom,
   restartCodexApp,
   type ThemeEntry,
+  type PaletteOverride,
 } from '@/api/desktop'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import ThemeCropModal from '@/components/codex/ThemeCropModal.vue'
+import ThemePaletteModal from '@/components/codex/ThemePaletteModal.vue'
 import IconChevronLeft from '~icons/lucide/chevron-left'
 import IconRefreshCw from '~icons/lucide/refresh-cw'
 import IconPlus from '~icons/lucide/plus'
+import IconPalette from '~icons/lucide/palette'
 
 const store = useSettingsStore()
 const { show: toast } = useToast()
@@ -32,6 +35,9 @@ const themes = ref<ThemeEntry[]>([])
 const badge = ref('')
 const cropSrc = ref<string | null>(null)
 const showRestart = ref(false)
+// [MOC-272] 正在编辑调色盘的主题(null = 未开);预制(非 custom)供「复用调色盘」选取。
+const paletteTarget = ref<ThemeEntry | null>(null)
+const presets = computed(() => themes.value.filter((th) => th.id !== 'custom'))
 
 // 背景全图 on-demand 下载:正在下载的主题 id + 进度(0-100),给缩略图渲染白蒙版 + 进度环。
 const downloadingId = ref<string | null>(null)
@@ -338,8 +344,56 @@ async function onCropConfirm(dataUri: string) {
     toast(t('theme.uploadOk'))
     await loadThemes()
     await pickTheme('custom')
+    // [MOC-272] 上传后引导设调色盘(可复用预制 或 自定义);取消 = 保持中性默认。
+    const custom = themes.value.find((th) => th.id === 'custom')
+    if (custom) paletteTarget.value = custom
   } catch (e) {
     toast(`${t('theme.uploadFailed')}: ${errMsg(e)}`, 'error')
+  }
+}
+
+// [MOC-272] 调色盘:存 / 还原都落 settings.themePaletteOverrides + 若该主题正注入则重注入生效。
+function currentOverrides(): Record<string, unknown> {
+  const cur = store.settings.themePaletteOverrides
+  return cur && typeof cur === 'object' ? { ...(cur as Record<string, unknown>) } : {}
+}
+async function reinjectIfActive(themeId: string) {
+  if (enabledModel.value && selectedId.value === themeId) {
+    try {
+      await applyWithProgress(themeId)
+    } catch {
+      await promptRestart()
+    }
+  }
+}
+async function onPaletteSave(override: PaletteOverride) {
+  const target = paletteTarget.value
+  if (!target) return
+  paletteTarget.value = null
+  try {
+    const map = currentOverrides()
+    map[target.id] = override
+    await store.save({ themePaletteOverrides: map })
+    await loadThemes()
+    await reinjectIfActive(target.id)
+    toast(t('theme.paletteSaved'))
+  } catch (e) {
+    toast(`${t('theme.saveFailed')}: ${errMsg(e)}`, 'error')
+  }
+}
+async function onPaletteReset() {
+  const target = paletteTarget.value
+  if (!target) return
+  paletteTarget.value = null
+  try {
+    const map = currentOverrides()
+    delete map[target.id]
+    await store.save({ themePaletteOverrides: map })
+    await loadThemes()
+    await reinjectIfActive(target.id)
+    toast(t('theme.paletteResetDone'))
+  } catch (e) {
+    toast(`${t('theme.saveFailed')}: ${errMsg(e)}`, 'error')
   }
 }
 
@@ -425,6 +479,9 @@ async function onRestartChoice(choice: 'now' | 'later') {
             @click.stop="openUpload"
             >{{ t('theme.replace') }}</span
           >
+          <span class="card-pal" :title="t('theme.paletteEdit')" @click.stop="paletteTarget = th">
+            <IconPalette />
+          </span>
           <span
             class="card-del"
             :title="th.id === 'custom' ? t('common.delete') : t('theme.hide')"
@@ -474,6 +531,15 @@ async function onRestartChoice(choice: 'now' | 'later') {
     </section>
 
     <ThemeCropModal v-if="cropSrc" :src="cropSrc" @confirm="onCropConfirm" @cancel="cropSrc = null" />
+
+    <ThemePaletteModal
+      v-if="paletteTarget"
+      :entry="paletteTarget"
+      :presets="presets"
+      @save="onPaletteSave"
+      @reset="onPaletteReset"
+      @close="paletteTarget = null"
+    />
 
     <AppModal v-if="showRestart" :title="t('theme.savedTitle')" @close="onRestartChoice('later')">
       <p class="restart-body">{{ t('theme.savedPendingRestart') }}</p>
@@ -670,7 +736,7 @@ async function onRestartChoice(choice: 'now' | 'later') {
 .card-replace {
   position: absolute;
   top: 6px;
-  right: 34px;
+  right: 60px;
   z-index: 3;
   background: rgba(0, 0, 0, 0.55);
   color: #fff;
@@ -678,6 +744,25 @@ async function onRestartChoice(choice: 'now' | 'later') {
   padding: 1px 7px;
   border-radius: var(--radius-sm);
   cursor: pointer;
+}
+.card-pal {
+  position: absolute;
+  top: 6px;
+  right: 34px;
+  z-index: 3;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+}
+.card-pal svg {
+  width: 12px;
+  height: 12px;
 }
 .card-del {
   position: absolute;

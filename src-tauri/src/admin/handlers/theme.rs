@@ -124,9 +124,9 @@ pub struct CustomUploadPayload {
     pub data_uri: String,
 }
 
-/// 接 user 上传的图片(JPG / PNG)→ 后端中心 crop 方形 + resize 2048 + JPEG
+/// 接 user 上传的图片(JPG / PNG)→ 后端等比 resize(最长边 ≤2048)+ JPEG
 /// encode → 写 `~/.codex-app-transfer/themes/custom/bg.jpg` + `preview.jpg`。
-/// 接着前端 list 会拿到 custom 卡片(在内置 5 个之后第 6 位)。
+/// 前端 `ThemeCropModal` 已按 16:9 裁切;接着前端 list 会拿到 custom 卡片。
 pub async fn custom_upload_handler(Json(payload): Json<CustomUploadPayload>) -> impl IntoResponse {
     use base64::{engine::general_purpose, Engine as _};
 
