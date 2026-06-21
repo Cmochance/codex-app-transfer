@@ -1,11 +1,15 @@
 <script setup lang="ts">
-// 1:1 crop 弹窗 — 移植旧 app.js openCropModal。全屏暗背景 + 中央舞台显示原图,
-// 叠居中方形选区:拖动调位置、滚轮缩放、确认 → canvas drawImage 缩到 ≤2048 方形 JPEG。
-// 自建全屏 overlay(非 AppModal):需要暗底 + 自定义舞台/选区,与设置型 modal 形态不同。
+// 16:9 crop 弹窗 — 全屏暗背景 + 中央舞台显示原图,叠居中 16:9 选区:拖动调位置、
+// 滚轮缩放、确认 → canvas drawImage 缩到 16:9 JPEG(宽 ≤2048)。Codex Desktop 背景是
+// 宽屏,16:9 让裁切预览与实际背景一致(扩充自 #522)。自建全屏 overlay(非 AppModal):
+// 需要暗底 + 自定义舞台/选区,与设置型 modal 形态不同。
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { t } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import AppButton from '@/components/ui/AppButton.vue'
+
+// 选区宽高比 16:9(高 = 宽 / ASPECT)。
+const ASPECT = 16 / 9
 
 const props = defineProps<{ src: string }>()
 const emit = defineEmits<{ confirm: [dataUri: string]; cancel: [] }>()
@@ -15,29 +19,32 @@ const imgEl = ref<HTMLImageElement>()
 const stageEl = ref<HTMLDivElement>()
 const ready = ref(false)
 
-// box 状态(相对 stage 像素 = 显示坐标);非响应,经 applyBox() 推到响应式 boxStyle
+// box 状态(相对 stage 像素 = 显示坐标);非响应,经 applyBox() 推到响应式 boxStyle。
+// 只存宽 boxW,高由 boxW / ASPECT 派生,保证恒为 16:9。
 let boxX = 0
 let boxY = 0
-let boxSize = 0
+let boxW = 0
 let stageW = 0
 let stageH = 0
 const boxStyle = reactive({ left: '0px', top: '0px', width: '0px', height: '0px' })
 
 function clampBox() {
-  const minSide = Math.min(stageW, stageH)
-  if (boxSize > minSide) boxSize = minSide
-  if (boxSize < 40) boxSize = 40
+  // 宽上限:既不超 stage 宽,也不让派生高超 stage 高(boxW/ASPECT ≤ stageH)
+  const maxW = Math.min(stageW, stageH * ASPECT)
+  if (boxW > maxW) boxW = maxW
+  if (boxW < 80) boxW = Math.min(80, maxW)
+  let boxH = boxW / ASPECT
   if (boxX < 0) boxX = 0
   if (boxY < 0) boxY = 0
-  if (boxX + boxSize > stageW) boxX = stageW - boxSize
-  if (boxY + boxSize > stageH) boxY = stageH - boxSize
+  if (boxX + boxW > stageW) boxX = stageW - boxW
+  if (boxY + boxH > stageH) boxY = stageH - boxH
 }
 function applyBox() {
   clampBox()
   boxStyle.left = `${boxX}px`
   boxStyle.top = `${boxY}px`
-  boxStyle.width = `${boxSize}px`
-  boxStyle.height = `${boxSize}px`
+  boxStyle.width = `${boxW}px`
+  boxStyle.height = `${boxW / ASPECT}px`
 }
 
 function onImgLoad() {
@@ -45,9 +52,10 @@ function onImgLoad() {
   if (!img) return
   stageW = img.offsetWidth
   stageH = img.offsetHeight
-  boxSize = Math.min(stageW, stageH) * 0.9
-  boxX = (stageW - boxSize) / 2
-  boxY = (stageH - boxSize) / 2
+  boxW = Math.min(stageW, stageH * ASPECT) * 0.9
+  const boxH = boxW / ASPECT
+  boxX = (stageW - boxW) / 2
+  boxY = (stageH - boxH) / 2
   applyBox()
   ready.value = true
 }
@@ -80,11 +88,12 @@ function onMouseUp() {
 }
 function onWheel(e: WheelEvent) {
   e.preventDefault()
-  const cx = boxX + boxSize / 2
-  const cy = boxY + boxSize / 2
-  boxSize *= e.deltaY < 0 ? 1.05 : 0.95
-  boxX = cx - boxSize / 2
-  boxY = cy - boxSize / 2
+  const boxH = boxW / ASPECT
+  const cx = boxX + boxW / 2
+  const cy = boxY + boxH / 2
+  boxW *= e.deltaY < 0 ? 1.05 : 0.95
+  boxX = cx - boxW / 2
+  boxY = cy - boxW / ASPECT / 2
   applyBox()
 }
 
@@ -100,16 +109,20 @@ onBeforeUnmount(() => {
 function onConfirm() {
   const img = imgEl.value
   if (!img || !ready.value) return
-  // 显示坐标 → 原图坐标(1:1 所以 X/Y scale 相同)
+  // 显示坐标 → 原图坐标
   const scaleX = img.naturalWidth / stageW
   const scaleY = img.naturalHeight / stageH
+  const boxH = boxW / ASPECT
   const sx = boxX * scaleX
   const sy = boxY * scaleY
-  const ssize = boxSize * scaleX
-  const outSize = Math.min(2048, Math.round(ssize)) // 不放大,只缩(或保持)
+  const sw = boxW * scaleX
+  const sh = boxH * scaleY
+  // 输出恒为 16:9;宽不放大(≤2048 且 ≤ 选区原图宽),高按比例派生。
+  const outW = Math.min(2048, Math.round(sw))
+  const outH = Math.round(outW / ASPECT)
   const canvas = document.createElement('canvas')
-  canvas.width = outSize
-  canvas.height = outSize
+  canvas.width = outW
+  canvas.height = outH
   const ctx = canvas.getContext('2d')
   if (!ctx) {
     // canvas 2d 上下文不可用(webview 里近乎不可能)— 对齐 onImgError,surface + 关闭。
@@ -118,7 +131,7 @@ function onConfirm() {
     return
   }
   ctx.imageSmoothingQuality = 'high'
-  ctx.drawImage(img, sx, sy, ssize, ssize, 0, 0, outSize, outSize)
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, outW, outH)
   emit('confirm', canvas.toDataURL('image/jpeg', 0.92))
 }
 </script>
