@@ -883,7 +883,7 @@ fn is_quota_whitelisted(authscheme: &str) -> bool {
 }
 
 /// 从 URL 轻量提取 host(剥 scheme / 端口 / userinfo,不引 url crate)。
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let after = url.split("://").nth(1).unwrap_or(url);
     let authority = after.split('/').next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority);
@@ -953,131 +953,36 @@ fn active_glm_provider() -> Option<(String, String)> {
     Some((host, api_key.to_string()))
 }
 
-/// [MOC-211] 活动 provider 若是 MiMo Token Plan(baseUrl host 含 `xiaomimimo.com` 且路径含
-/// `token-plan`)且已存网页 session → 返回 `(provider id, mimoCookie)`,否则 None。按量计费的
-/// MiMo(`api.xiaomimimo.com`,无 token-plan)不匹配——它无订阅套餐额度。额度查询走小米账号
-/// session(见 mimo_quota / mimo_session),非 apiKey。
+/// [MOC-211] MiMo Token Plan 的额度源接线规格:host `xiaomimimo.com` + 路径含 `token-plan`
+/// (区分按量 MiMo `api.xiaomimimo.com`,它无订阅套餐额度);session cookie 存 `mimoCookie`。
+const MIMO_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
+    crate::web_session_quota::QuotaSourceSpec {
+        host_suffix: "xiaomimimo.com",
+        path_contains: Some("token-plan"),
+        cookie_field: "mimoCookie",
+        workspace_field: None,
+    };
+
+/// 活动 provider 是 MiMo token-plan 且已存网页 session → `(provider id, mimoCookie)`,否则 None。
 fn active_mimo_session() -> Option<(String, String)> {
-    let cfg = crate::admin::registry_io::load().ok()?;
-    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
-    let providers = cfg.get("providers")?.as_array()?;
-    let p = match active_id {
-        Some(id) => providers
-            .iter()
-            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
-        None => providers.first()?,
+    let s = crate::web_session_quota::active_session(&MIMO_SOURCE_SPEC)?;
+    Some((s.provider_id, s.cookie))
+}
+
+/// [CAT-256] OpenCode Go 的额度源接线规格:host `opencode.ai`;session cookie 存 `opencodeCookie`,
+/// workspace id 存 `opencodeWorkspaceId`(查 Go 用量端点 `/workspace/<id>/go` 必需,缺则不查)。
+const OPENCODE_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
+    crate::web_session_quota::QuotaSourceSpec {
+        host_suffix: "opencode.ai",
+        path_contains: None,
+        cookie_field: "opencodeCookie",
+        workspace_field: Some("opencodeWorkspaceId"),
     };
-    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
-    let host = host_of(base_url)?;
-    if !(host.ends_with("xiaomimimo.com") && base_url.contains("token-plan")) {
-        return None;
-    }
-    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
-    let cookie = p
-        .get("mimoCookie")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    Some((id, cookie))
-}
 
-/// session 失效(Auth)时清掉该 provider 存的 `mimoCookie`,让前端 `hasMimoCookie` 转 false
-/// 显「未登录」、提示重新登录(MiMo session 无 refresh,只能重登)。
-fn clear_mimo_cookie(provider_id: &str, used_cookie: &str) {
-    let _ = crate::admin::registry_io::with_config_write(|cfg| {
-        let Some(providers) = cfg
-            .as_object_mut()
-            .and_then(|o| o.get_mut("providers"))
-            .and_then(|v| v.as_array_mut())
-        else {
-            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
-        };
-        let mut changed = false;
-        for p in providers.iter_mut() {
-            if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
-                if let Some(obj) = p.as_object_mut() {
-                    // 仅当当前存的 cookie 仍是本次失败用的那把才清:避免请求在途时用户已重新
-                    // 登录(存了新 session),这条迟到的 Auth 把刚捕获的新 cookie 误删。
-                    let still_same =
-                        obj.get("mimoCookie").and_then(|v| v.as_str()) == Some(used_cookie);
-                    if still_same && obj.remove("mimoCookie").is_some() {
-                        changed = true;
-                    }
-                }
-                break;
-            }
-        }
-        if changed {
-            Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
-        } else {
-            Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()))
-        }
-    });
-}
-
-/// [CAT-256] 活动 provider 若是 OpenCode Go(baseUrl host 含 `opencode.ai`)且已存网页 session
-/// + workspace id → 返回 `(provider id, workspace_id, opencodeCookie)`,否则 None。Go 套餐 5h/周/月
-/// 用量走 OpenCode 账号控制台 session(见 opencode_go_quota / opencode_session),非 apiKey。
+/// 活动 provider 是 OpenCode Go 且已存 session + workspace → `(provider id, workspace_id, opencodeCookie)`。
 fn active_opencode_go_session() -> Option<(String, String, String)> {
-    let cfg = crate::admin::registry_io::load().ok()?;
-    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
-    let providers = cfg.get("providers")?.as_array()?;
-    let p = match active_id {
-        Some(id) => providers
-            .iter()
-            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
-        None => providers.first()?,
-    };
-    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
-    let host = host_of(base_url)?;
-    if !host.ends_with("opencode.ai") {
-        return None;
-    }
-    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
-    let cookie = p
-        .get("opencodeCookie")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let workspace_id = p
-        .get("opencodeWorkspaceId")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    Some((id, workspace_id, cookie))
-}
-
-/// session 失效(Auth)时清掉该 provider 存的 `opencodeCookie`,让前端 `hasOpencodeCookie` 转 false
-/// 显「未登录」、提示重新登录(OpenCode 控制台 session 无 refresh,只能重登)。镜像 clear_mimo_cookie。
-fn clear_opencode_cookie(provider_id: &str, used_cookie: &str) {
-    let _ = crate::admin::registry_io::with_config_write(|cfg| {
-        let Some(providers) = cfg
-            .as_object_mut()
-            .and_then(|o| o.get_mut("providers"))
-            .and_then(|v| v.as_array_mut())
-        else {
-            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
-        };
-        let mut changed = false;
-        for p in providers.iter_mut() {
-            if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
-                if let Some(obj) = p.as_object_mut() {
-                    // 仅当当前存的 cookie 仍是本次失败用的那把才清(同 clear_mimo_cookie 的在途保护)。
-                    let still_same =
-                        obj.get("opencodeCookie").and_then(|v| v.as_str()) == Some(used_cookie);
-                    if still_same && obj.remove("opencodeCookie").is_some() {
-                        changed = true;
-                    }
-                }
-                break;
-            }
-        }
-        if changed {
-            Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
-        } else {
-            Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()))
-        }
-    });
+    let s = crate::web_session_quota::active_session(&OPENCODE_SOURCE_SPEC)?;
+    Some((s.provider_id, s.workspace_id?, s.cookie))
 }
 
 /// [MOC-211] 活动 provider 若是 DeepSeek(baseUrl host 含 `deepseek.com`)且有 apiKey →
@@ -1325,7 +1230,7 @@ async fn fetch_mimo_quota(
         Err(QuotaError::Auth) => {
             tracing::debug!("[Quota] MiMo session 失效 → 清缓存 + 清存储 cookie(需重新登录)");
             *cache = None;
-            clear_mimo_cookie(&id, &cookie);
+            crate::web_session_quota::clear_cookie(&id, MIMO_SOURCE_SPEC.cookie_field, &cookie);
             None
         }
         Err(QuotaError::Transient(e)) => {
@@ -1375,7 +1280,7 @@ async fn fetch_opencode_go_quota(
                 "[Quota] OpenCode 控制台 session 失效 → 清缓存 + 清存储 cookie(需重新登录)"
             );
             *cache = None;
-            clear_opencode_cookie(&id, &cookie);
+            crate::web_session_quota::clear_cookie(&id, OPENCODE_SOURCE_SPEC.cookie_field, &cookie);
             None
         }
         Err(QuotaError::Transient(e)) => {
