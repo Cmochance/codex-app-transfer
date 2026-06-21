@@ -1,14 +1,11 @@
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_app_transfer_codex_integration::{
-    apply_provider, catalog_models_for_provider_with_display_names, ensure_file_store_mode,
-    get_snapshot_status, has_snapshot, has_stale_active_snapshot, list_snapshots, read_auth,
-    restore_codex_snapshot, restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
+    apply_provider, ensure_file_store_mode, has_snapshot, has_stale_active_snapshot,
+    restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_gemini_oauth::antigravity_static_models;
-use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
 use serde_json::{json, Value};
 
@@ -18,14 +15,10 @@ use crate::admin::handlers::providers::{
     provider_model_capabilities, provider_model_mappings, provider_review_model_slot,
     provider_supports_1m,
 };
-use crate::admin::handlers::proxy::{
-    ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed,
-};
+use crate::admin::handlers::proxy::{ensure_gateway_key, read_proxy_port, start_proxy_if_needed};
 use crate::admin::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use crate::admin::state::AdminState;
 use crate::proxy_runner::ProxyManager;
-
-pub const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
 pub struct DesktopConfigTarget {
     pub base_url: String,
@@ -143,32 +136,9 @@ pub fn active_provider_supports_relay() -> bool {
         .unwrap_or(false)
 }
 
-pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
-    catalog_models_for_provider_with_display_names(
-        &target.provider_name,
-        &target.default_model,
-        target.supports_1m,
-        Some(&target.model_mappings),
-        Some(&target.model_capabilities),
-        Some(&target.model_display_names),
-        target.review_model_slot.as_deref(),
-    )
-    .into_iter()
-    .map(|model| {
-        let mut item = json!({
-            "name": model.slug,
-            "displayName": model.display_name,
-        });
-        if model.context_window >= ONE_M_CONTEXT_WINDOW {
-            item["supports1m"] = Value::Bool(true);
-        }
-        item
-    })
-    .collect()
-}
-
+/// 读 `~/.codex/config.toml` 顶层(table 之前)某 key 的字符串值(去引号 / 去行尾注释)。
 pub fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
-    let content = std::fs::read_to_string(&paths.config_toml).ok()?;
+    let content = fs::read_to_string(&paths.config_toml).ok()?;
     for line in content.lines() {
         let stripped = line.trim_start();
         if stripped.starts_with('[') {
@@ -190,156 +160,6 @@ pub fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<Stri
         return Some(trimmed.to_owned());
     }
     None
-}
-
-pub fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
-    read_auth(&paths.auth_json)
-        .ok()
-        .and_then(|auth| {
-            auth.get("OPENAI_API_KEY")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-        })
-        .unwrap_or(false)
-}
-
-pub fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
-    // 防御性 guard:不经代理的 target(`requires_proxy=false`)不写 model_catalog_json,
-    // 「1M catalog 是否写入」对它无意义 → 视为就绪,否则 desktop_health 会因 config.toml
-    // 没有 model_catalog_json 而永远返回 false → needsApply 死循环。
-    // [MOC-234] direct 直连已移除后,desktop target 恒 `requires_proxy=true`,此分支当前
-    // 不会被命中,仅作防御保留(未来若再出现不经代理的 target 仍正确)。
-    if !target.requires_proxy {
-        return true;
-    }
-    let one_million_names: Vec<String> = desktop_expected_model_items(target)
-        .into_iter()
-        .filter_map(|item| {
-            if item.get("supports1m").and_then(|v| v.as_bool()) == Some(true) {
-                item.get("name")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if one_million_names.is_empty() {
-        return true;
-    }
-
-    let Some(catalog_path) = read_codex_toml_root_string(paths, "model_catalog_json") else {
-        return false;
-    };
-    let catalog_path = PathBuf::from(catalog_path);
-    let telemetry = proxy_telemetry();
-    let catalog: Value = match fs::read_to_string(&catalog_path) {
-        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                telemetry.logs.add(
-                    "WARN",
-                    format!(
-                        "one_million_catalog_ready: model_catalog JSON 解析失败 ({}): {e}",
-                        catalog_path.display(),
-                    ),
-                );
-                return false;
-            }
-        },
-        Err(e) => {
-            telemetry.logs.add(
-                "WARN",
-                format!(
-                    "one_million_catalog_ready: model_catalog 文件读取失败 ({}): {e}",
-                    catalog_path.display(),
-                ),
-            );
-            return false;
-        }
-    };
-    let Some(models) = catalog.get("models").and_then(|v| v.as_array()) else {
-        return false;
-    };
-    models.iter().any(|item| {
-        let slug = item
-            .get("slug")
-            .or_else(|| item.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !one_million_names.iter().any(|name| name == slug) {
-            return false;
-        }
-        let context_window = item
-            .get("context_window")
-            .or_else(|| item.get("max_context_window"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        context_window >= ONE_M_CONTEXT_WINDOW
-    })
-}
-
-pub fn desktop_health(
-    paths: Option<&CodexPaths>,
-    configured: bool,
-    actual_base_url: Option<&str>,
-    actual_api_key_present: bool,
-    target: Option<&DesktopConfigTarget>,
-) -> Value {
-    let expected_base_url = target
-        .map(|target| target.base_url.trim_end_matches('/').to_owned())
-        .unwrap_or_default();
-    let actual_base_url = actual_base_url
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches('/')
-        .to_owned();
-    let mut issues = Vec::new();
-
-    if !configured {
-        if !actual_base_url.is_empty() || actual_api_key_present {
-            issues.push(json!({
-                "code": "not_managed_by_cas",
-                "message": "Current Codex CLI config was not written by the latest version of this tool.",
-            }));
-        } else {
-            issues.push(json!({
-                "code": "codex_snapshot_missing",
-                "message": "Codex CLI config has not been applied by this tool — re-generate the config from the dashboard.",
-            }));
-        }
-    }
-
-    if !actual_base_url.is_empty()
-        && !expected_base_url.is_empty()
-        && actual_base_url != expected_base_url
-    {
-        issues.push(json!({
-            "code": "gateway_base_url_mismatch",
-            "message": "Codex CLI 仍指向旧地址，请重新一键生成 Codex CLI 配置。",
-        }));
-    }
-
-    let one_million_ready = match (paths, target) {
-        (Some(paths), Some(target)) => one_million_catalog_ready(paths, target),
-        _ => true,
-    };
-    if !one_million_ready {
-        issues.push(json!({
-            "code": "one_million_not_written",
-            "message": "1M 上下文模型尚未写入 Codex CLI 配置，请重新一键生成配置并重启终端。",
-        }));
-    }
-
-    json!({
-        "needsApply": !configured || !issues.is_empty(),
-        "oneMillionReady": one_million_ready,
-        "expectedBaseUrl": expected_base_url,
-        "actualBaseUrl": actual_base_url,
-        "mode": target.map(|target| target.mode),
-        "requiresProxy": target.map(|target| target.requires_proxy).unwrap_or(false),
-        "issues": issues,
-    })
 }
 
 pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
@@ -1384,94 +1204,6 @@ mod tests {
     }
 
     #[test]
-    fn desktop_inference_models_use_current_codex_catalog_slots() {
-        let mut cfg = config_with_secret();
-        cfg["providers"][0]["models"] = json!({
-            "default": "deepseek-v4-pro[1m]",
-            "gpt_5_5": "kimi-k2",
-            "gpt_5_4": "glm-4.6",
-        });
-        let provider = active_provider(&cfg).unwrap();
-        let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
-        let raw = serde_json::to_string(&desktop_expected_model_items(&target)).unwrap();
-
-        assert!(!raw.contains("sonnet"));
-        assert!(!raw.contains("haiku"));
-        assert!(!raw.contains("opus"));
-
-        let models: Vec<Value> = serde_json::from_str(&raw).unwrap();
-        let names: Vec<&str> = models
-            .iter()
-            .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
-            .collect();
-        assert!(names.contains(&"gpt-5.5"));
-        assert!(names.contains(&"gpt-5.4"));
-        // [MOC-154] gpt_5_4_mini 槽未配置 → 跳过;fallback entry(slug=实际模型名)已删
-        assert!(
-            !names.contains(&"gpt-5.4-mini"),
-            "empty slot should be skipped"
-        );
-        assert!(
-            !names.contains(&"deepseek-v4-pro"),
-            "fallback entry removed in MOC-154"
-        );
-        // [MOC-154] kimi-k2(258_400) / glm-4.6(200_000) 均非 1M;旧逻辑 fallback entry
-        // deepseek-v4-pro[1m] 已删,无 supports1m=true 的 entry
-        assert!(
-            models
-                .iter()
-                .all(|item| item.get("supports1m").and_then(|v| v.as_bool()) != Some(true)),
-            "kimi-k2 / glm-4.6 均非 1M,不应有 supports1m=true"
-        );
-    }
-
-    #[test]
-    fn desktop_health_reports_base_url_mismatch() {
-        with_isolated_home(|home| {
-            let cfg = config_with_secret();
-            let provider = active_provider(&cfg).unwrap();
-            let mut target_cfg = cfg.clone();
-            let target =
-                desktop_config_target_for_provider(&mut target_cfg, &provider, Some(19090));
-
-            let codex_dir = home.join(".codex");
-            fs::create_dir_all(&codex_dir).unwrap();
-            fs::write(
-                codex_dir.join("config.toml"),
-                "openai_base_url = \"http://127.0.0.1:18080\"\n",
-            )
-            .unwrap();
-            fs::write(
-                codex_dir.join("auth.json"),
-                "{\"OPENAI_API_KEY\":\"cas_old\"}\n",
-            )
-            .unwrap();
-
-            let paths = CodexPaths::from_home_env().unwrap();
-            let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
-            let health = desktop_health(
-                Some(&paths),
-                false,
-                actual_base_url.as_deref(),
-                true,
-                Some(&target),
-            );
-
-            assert_eq!(health["needsApply"], json!(true));
-            assert_eq!(health["expectedBaseUrl"], json!("http://127.0.0.1:19090"));
-            assert_eq!(health["actualBaseUrl"], json!("http://127.0.0.1:18080"));
-            let codes: Vec<&str> = health["issues"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
-                .collect();
-            assert!(codes.contains(&"not_managed_by_cas"));
-            assert!(codes.contains(&"gateway_base_url_mismatch"));
-        });
-    }
-
-    #[test]
     fn qwen_local_proxy_apply_writes_codex_auth_and_base_url() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1560,34 +1292,5 @@ mod tests {
                 manager.stop_silent();
             });
         });
-    }
-
-    /// 防御性 guard 回归保护:不经代理的 target(`requires_proxy=false`)不写
-    /// model_catalog_json,`one_million_catalog_ready` 必须直接判就绪(short-circuit),
-    /// 不读 catalog 文件。否则带 [1m] 的 provider 会让 desktop_health 永远 needsApply=true。
-    /// 短路在读文件之前,即便 paths 指向不存在目录也成立。[MOC-234] direct 移除后此态为
-    /// 合成态(prod 恒 requires_proxy=true),仍单测 guard 本身正确。
-    #[test]
-    fn one_million_catalog_ready_short_circuits_when_proxy_not_required() {
-        let paths = CodexPaths::from_home_dir(std::path::Path::new("/nonexistent-cas-317"));
-        let no_proxy_target = DesktopConfigTarget {
-            base_url: "https://up.example.com/v1".into(),
-            api_key: "sk".into(),
-            supports_1m: true,
-            provider_name: "Custom".into(),
-            default_model: "gpt-5.5[1m]".into(),
-            model_mappings: Value::Null,
-            model_capabilities: Value::Null,
-            model_display_names: serde_json::Value::Null,
-            review_model_slot: None,
-            requires_proxy: false,
-            mode: "local_proxy",
-            proxy_port: 0,
-            codex_network_access: true,
-        };
-        assert!(
-            one_million_catalog_ready(&paths, &no_proxy_target),
-            "requires_proxy=false 应直接判 1M 就绪,不依赖 catalog 文件"
-        );
     }
 }

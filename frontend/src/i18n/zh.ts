@@ -336,7 +336,6 @@ export default {
     "这里会一直保留还没添加的厂商，点一个就能带着预设进入添加页。",
   "status.configured": "已配置",
   "status.notConfigured": "未配置",
-  "status.needsApply": "需重新应用",
   "status.running": "运行中",
   "status.stopped": "已停止",
   "status.default": "默认",

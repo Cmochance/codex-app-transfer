@@ -308,7 +308,6 @@ export default {
   "dashboard.availablePresetsHint": "Presets that are not yet added stay visible here. Pick one to open the add form with recommended settings.",
   "status.configured": "Configured",
   "status.notConfigured": "Not configured",
-  "status.needsApply": "Needs reapply",
   "status.running": "Running",
   "status.stopped": "Stopped",
   "status.default": "Default",

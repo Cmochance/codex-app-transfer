@@ -8,13 +8,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use codex_app_transfer_codex_integration::{has_snapshot, CodexPaths};
 use codex_app_transfer_registry::RawConfig;
 use serde_json::{json, Value};
 
-use super::super::registry_io::{load as load_registry, public_provider};
 use super::super::state::AdminState;
 
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -145,60 +143,9 @@ pub async fn instance_show_window() -> Json<Value> {
     Json(json!({"success": true}))
 }
 
-// ── /api/status ──────────────────────────────────────────────────────
-
-pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
-    let cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let providers_count = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let active = super::providers::active_provider(&cfg).map(|p| public_provider(&p));
-    let active_id = cfg
-        .get("activeProvider")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
-    let proxy_port = super::proxy::read_proxy_port(&cfg);
-    let proxy_status = state.proxy_manager.status();
-    let codex_paths = CodexPaths::from_home_env().ok();
-    let codex_configured = codex_paths.as_ref().map(has_snapshot).unwrap_or(false);
-    let actual_base_url = codex_paths
-        .as_ref()
-        .and_then(|paths| super::desktop::read_codex_toml_root_string(paths, "openai_base_url"));
-    let actual_api_key_present = codex_paths
-        .as_ref()
-        .map(super::desktop::codex_openai_api_key_present)
-        .unwrap_or(false);
-    let desktop_target = super::desktop::desktop_target_for_active_provider(&cfg);
-    let desktop_health = super::desktop::desktop_health(
-        codex_paths.as_ref(),
-        codex_configured,
-        actual_base_url.as_deref(),
-        actual_api_key_present,
-        desktop_target.as_ref(),
-    );
-
-    Json(json!({
-        "desktopConfigured": codex_configured,
-        "proxyRunning": proxy_status.running,
-        "proxyPort": proxy_port,
-        "desktopMode": desktop_target.as_ref().map(|target| target.mode).unwrap_or("unconfigured"),
-        "desktopRequiresProxy": desktop_target
-            .as_ref()
-            .map(|target| target.requires_proxy)
-            .unwrap_or(false),
-        "activeProvider": active,
-        "activeProviderId": active_id,
-        "providerCount": providers_count,
-        "desktopHealth": desktop_health,
-        "exposeAllProviderModels": false,
-    }))
-    .into_response()
-}
+// [MOC-261 二-5] 旧综合状态聚合端点 /api/status(common::status)已删:前端零引用、
+// 无内部调用方,被 /api/proxy/status + providers list + /api/desktop/* 分端点取代;
+// desktopHealth 能力未丢(desktop.rs 仍暴露)。共享 helper 全保留。
 
 // ── /api/version ─────────────────────────────────────────────────────
 

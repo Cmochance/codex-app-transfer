@@ -31,8 +31,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/instance-show-window",
             post(handlers::common::instance_show_window),
         )
-        // 总状态
-        .route("/api/status", get(handlers::common::status))
+        // [MOC-261 二-5] 旧综合状态聚合 /api/status 已删(死代码,见 common.rs 注释)
         // Chrome 探测/按需下载 (MOC-144 headless 抓取后端)
         .route("/api/chrome/detect", get(handlers::chrome::detect))
         .route("/api/chrome/ready", get(handlers::chrome::ready))
