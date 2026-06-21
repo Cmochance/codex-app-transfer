@@ -33,6 +33,8 @@ const ICON_MAP: Record<string, IconSpec> = {
   generativelanguage: { logo: 'assets/providers/google-ai-studio.png' },
   'grok-web': { logo: 'assets/providers/grok.svg' },
   anyrouter: { logo: 'assets/providers/anyrouter.png' },
+  // OpenCode Go(opencode.ai)官方 favicon(深底白 O logo);无其它 provider 字符串含 opencode,无歧义
+  opencode: { logo: 'assets/providers/opencode.svg' },
 }
 
 // 逐字移植 computeIcon: 拼 id+name+baseUrl+apiFormat → normalize(_/空格→-)→ 子串匹配 ICON_MAP
