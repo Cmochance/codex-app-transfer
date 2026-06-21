@@ -40,17 +40,6 @@ pub enum PathCategory {
     Subdir,
 }
 
-impl PathCategory {
-    /// i18n key suffix — 前端用 `codex.agentsPath.{global|projectRoot|subdir}`
-    pub fn label_key_suffix(&self) -> &'static str {
-        match self {
-            PathCategory::Global => "global",
-            PathCategory::ProjectRoot => "projectRoot",
-            PathCategory::Subdir => "subdir",
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentsPathEntry {
@@ -163,11 +152,6 @@ pub fn classify_path_full(path: &Path) -> (PathCategory, Option<String>, Option<
     // case 3: 找不到 `.git/` — 用户没用 git,用 path.parent 的 file_name 当 fallback project name
     let project_name = parent.file_name().map(|s| s.to_string_lossy().into_owned());
     (PathCategory::ProjectRoot, project_name, None)
-}
-
-/// 仅返回 category(向后兼容 + 测试用)
-pub fn classify_path(path: &Path) -> PathCategory {
-    classify_path_full(path).0
 }
 
 /// 读 path store(不存在 → 空 store)
@@ -357,14 +341,14 @@ mod tests {
     #[test]
     fn classify_global_path() {
         let global = global_agents_path().expect("HOME set");
-        assert_eq!(classify_path(&global), PathCategory::Global);
+        assert_eq!(classify_path_full(&global).0, PathCategory::Global);
     }
 
     #[test]
     fn classify_non_git_project_root_default() {
         let p = PathBuf::from("/tmp/no-git-here/AGENTS.md");
         let _ = std::fs::create_dir_all("/tmp/no-git-here");
-        assert_eq!(classify_path(&p), PathCategory::ProjectRoot);
+        assert_eq!(classify_path_full(&p).0, PathCategory::ProjectRoot);
     }
 
     #[test]
