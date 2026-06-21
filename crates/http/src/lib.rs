@@ -13,7 +13,7 @@
 //!
 //! 统一抓取层 (MOC-144): [`fetch`] 模块的 [`web_fetch`] 按设置页"内置联网抓取工具"的
 //! 档位路由: `curl`(reqwest 静态) / `wreq`(浏览器 TLS 指纹) / `headless`(Chromium CDP)。
-//! 配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure` 供设置页探测/按需下载 Chrome。
+//! 配套 `GET /api/chrome/ready` + `POST /api/chrome/ensure` 供设置页就绪检查/按需下载 Chrome。
 //! `webFetchBackend != off` 时 transfer 自动往 `~/.codex/config.toml` 注册
 //! `[mcp_servers.cat-webfetch]`(stdio MCP server),向 Codex 模型暴露 `web_fetch` 工具。
 //!
