@@ -18,6 +18,7 @@ export interface Provider {
   hasApiKey: boolean
   hasMimoCookie: boolean
   hasOpencodeCookie: boolean
+  hasKimiCookie: boolean
   extraHeaders: Record<string, string>
   modelCapabilities: Record<string, unknown>
   requestOptions: Record<string, unknown>

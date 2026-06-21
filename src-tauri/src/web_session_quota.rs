@@ -34,6 +34,9 @@ pub enum CaptureSignal {
     CookiePresent(&'static str),
     /// 等 webview URL 含某片段(OpenCode:登录后跳 `/workspace`)。
     UrlContains(&'static str),
+    /// 等 `cookie_domain` 域出现任意非空 cookie。适合**登录前不设任何 cookie 的 SPA**
+    /// (Kimi Code:实测 `kimi.com` 登录前 jar 空,登录后第一个 cookie 即 session),URL 不变也能判。
+    AnyCookieOnDomain,
 }
 
 /// 一个 web-session provider 的登录抓取规格(声明式,差异都在这)。
@@ -47,6 +50,15 @@ pub struct SessionLoginSpec {
     pub signal: CaptureSignal,
     /// 限定 cookie 名(MiMo:按名匹配、按此顺序拼头);**空 = 该域全部 cookie**(OpenCode)。
     pub want_cookies: &'static [&'static str],
+    /// 忽略的 cookie 名**前缀**:`AnyCookieOnDomain` 信号 + 全量拼头时都跳过这些(排除登录前/无关的
+    /// 主题、分析 cookie,避免提前误判登录)。如 Kimi:`["theme", "Hm_", "HMACCOUNT"]`(百度统计)。
+    pub ignore_cookie_prefixes: &'static [&'static str],
+    /// 每轮轮询前注入执行的 JS(best-effort)。用于**把 localStorage 里的鉴权 token 复制进一个
+    /// cookie**,再被 cookie 抓取读到 —— 因 Tauri `eval` 不能直接回传值,且外部页拿不到 Tauri IPC,
+    /// 这是跨 webview 边界取 localStorage 的可行办法。如 Kimi:API 用 `Authorization: Bearer
+    /// <localStorage.access_token>`,cookie 拿不到,故注入 JS 复制进 `cas_kimi_token` cookie。
+    /// `None` = 不注入(MiMo/OpenCode 走纯 cookie)。
+    pub pre_capture_eval: Option<&'static str>,
     /// 是否从 authed URL 抓 `/workspace/<id>`(OpenCode 查用量端点需要)。
     pub extract_workspace_from_url: bool,
 }
@@ -76,13 +88,24 @@ struct CookieInfo {
     domain: String,
 }
 
+/// cookie 名是否命中 spec 的忽略前缀(主题 / 分析等非 session cookie)。
+fn is_ignored(name: &str, spec: &SessionLoginSpec) -> bool {
+    spec.ignore_cookie_prefixes
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
 /// 按 spec 拼 `Cookie:` 头:`want_cookies` 非空 → 按名匹配(不卡 domain,与 MiMo 原实现一致)、
-/// 按 want 顺序;空 → 取 `cookie_domain` 域的全部非空 cookie。
+/// 按 want 顺序;空 → 取 `cookie_domain` 域的全部非空 cookie(跳过 `ignore_cookie_prefixes`)。
 fn build_cookie_header(cookies: &[CookieInfo], spec: &SessionLoginSpec) -> String {
     if spec.want_cookies.is_empty() {
         cookies
             .iter()
-            .filter(|c| c.domain.contains(spec.cookie_domain) && !c.value.is_empty())
+            .filter(|c| {
+                c.domain.contains(spec.cookie_domain)
+                    && !c.value.is_empty()
+                    && !is_ignored(&c.name, spec)
+            })
             .map(|c| format!("{}={}", c.name, c.value))
             .collect::<Vec<_>>()
             .join("; ")
@@ -107,6 +130,11 @@ fn signal_triggered(spec: &SessionLoginSpec, cur_url: &str, cookies: &[CookieInf
             .iter()
             .any(|c| c.name == name && !c.value.is_empty()),
         CaptureSignal::UrlContains(frag) => cur_url.contains(frag),
+        CaptureSignal::AnyCookieOnDomain => cookies.iter().any(|c| {
+            c.domain.contains(spec.cookie_domain)
+                && !c.value.is_empty()
+                && !is_ignored(&c.name, spec)
+        }),
     }
 }
 
@@ -168,6 +196,11 @@ pub async fn login_and_capture(spec: &SessionLoginSpec) -> Result<Option<Capture
             tracing::info!(win = spec.win_label, "[WebSession] 登录窗口被关闭,放弃捕获");
             return Ok(None);
         };
+
+        // best-effort 注入(如把 localStorage token 复制进 cookie 供下面 cookie 抓取读到)。
+        if let Some(js) = spec.pre_capture_eval {
+            let _ = win.eval(js);
+        }
 
         let cur_url = win.url().map(|u| u.to_string()).unwrap_or_default();
         let cookies: Vec<CookieInfo> = match win.cookies() {

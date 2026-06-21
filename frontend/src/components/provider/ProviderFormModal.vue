@@ -222,6 +222,29 @@ async function onOpencodeLogin() {
   }
 }
 
+// [CAT-256 后续] Kimi 账号登录:仅 Kimi Code 的【已存】provider(登录按 provider id 落
+// kimiCookie),记录控制台账号 session 供后续查 Kimi Code 套餐额度。镜像 OpenCode。
+const kimiLoggedIn = ref(false)
+const kimiLoggingIn = ref(false)
+const showKimiLogin = computed(() => isEdit.value && matchedPreset.value?.id === 'kimi-code')
+async function onKimiLogin() {
+  if (!props.editId) return
+  kimiLoggingIn.value = true
+  try {
+    const res = await providersApi.kimiLogin(props.editId)
+    if (res.captured) {
+      kimiLoggedIn.value = true
+      toast(t('providersAdd.kimiLogin.success'))
+    } else {
+      toast(t('providersAdd.kimiLogin.cancelled'))
+    }
+  } catch (e) {
+    toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
+  } finally {
+    kimiLoggingIn.value = false
+  }
+}
+
 // 测试表单当前值的连接(后端用传入 payload 发探测,不读落盘配置)
 // draft 必须带 models + extraHeaders,否则探测请求与「保存后真实请求」不一致:
 //   • 缺 models → 后端回落硬编码 claude-sonnet-4-6,只支持 POST 探测的上游可能 404 误报不可达
@@ -395,6 +418,7 @@ onMounted(async () => {
   isBuiltin.value = !!p.isBuiltin
   mimoLoggedIn.value = !!p.hasMimoCookie
   opencodeLoggedIn.value = !!p.hasOpencodeCookie
+  kimiLoggedIn.value = !!p.hasKimiCookie
   form.reviewModelSlot = p.reviewModelSlot || ''
   for (const s of MODEL_SLOTS) {
     form.models[s.key] = (p.mappings as Record<string, string>)[s.key] || ''
@@ -616,6 +640,23 @@ async function save() {
             :label="opencodeLoggingIn ? t('providersAdd.opencodeLogin.statusLoggingIn') : t('providersAdd.opencodeLogin.button')"
             :disabled="opencodeLoggingIn"
             @click="onOpencodeLogin"
+          />
+        </div>
+      </SettingsRow>
+
+      <SettingsRow v-if="showKimiLogin" :title="t('providersAdd.kimiLogin.label')">
+        <div class="pf__mimo">
+          <span class="pf__mimo-status" :class="{ ok: kimiLoggedIn }">{{
+            kimiLoggedIn
+              ? t('providersAdd.kimiLogin.statusLoggedIn')
+              : t('providersAdd.kimiLogin.statusNotLoggedIn')
+          }}</span>
+          <AppButton
+            size="sm"
+            variant="secondary"
+            :label="kimiLoggingIn ? t('providersAdd.kimiLogin.statusLoggingIn') : t('providersAdd.kimiLogin.button')"
+            :disabled="kimiLoggingIn"
+            @click="onKimiLogin"
           />
         </div>
       </SettingsRow>

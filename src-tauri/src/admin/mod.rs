@@ -93,6 +93,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::providers::crud::opencode_login),
         )
         .route(
+            "/api/providers/{id}/kimi-login",
+            post(handlers::providers::crud::kimi_login),
+        )
+        .route(
             "/api/providers/{id}/secret",
             get(handlers::providers::crud::get_secret),
         )

@@ -609,6 +609,49 @@ pub async fn opencode_login(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// [CAT-256 后续] 触发 Kimi 账号内嵌 webview 登录,抓取控制台 session cookie 存到该 provider 的
+/// `kimiCookie`,后续 quota daemon 带它查 Kimi Code 套餐用量(5h/周/月)。仅对 Kimi Code provider
+/// 有意义(前端只在 kimi-code preset 上显示登录按钮)。镜像 [`mimo_login`] / [`opencode_login`]。
+pub async fn kimi_login(Path(id): Path<String>) -> impl IntoResponse {
+    let exists = load_registry()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("providers").and_then(|v| v.as_array()).map(|ps| {
+                ps.iter()
+                    .any(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            })
+        })
+        .unwrap_or(false);
+    if !exists {
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
+    }
+    let cookie = match crate::kimi_session::login_and_capture().await {
+        Ok(Some(c)) => c,
+        Ok(None) => return Json(json!({"success": true, "captured": false})).into_response(),
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let result = with_config_write(|cfg| {
+        let providers = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| "providers missing".to_string())?;
+        let p = providers
+            .iter_mut()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .ok_or_else(|| "provider not found".to_string())?;
+        let obj = p
+            .as_object_mut()
+            .ok_or_else(|| "provider not object".to_string())?;
+        obj.insert("kimiCookie".into(), Value::String(cookie));
+        Ok(ConfigMutation::Modified(()))
+    });
+    match result {
+        Ok(()) => Json(json!({"success": true, "captured": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 pub async fn set_default_provider(
     State(state): State<AdminState>,
     Path(id): Path<String>,

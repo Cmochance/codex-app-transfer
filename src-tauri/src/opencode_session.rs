@@ -19,6 +19,8 @@ const LOGIN_SPEC: SessionLoginSpec = SessionLoginSpec {
     cookie_domain: "opencode.ai",
     signal: CaptureSignal::UrlContains("/workspace"),
     want_cookies: &[],
+    ignore_cookie_prefixes: &[],
+    pre_capture_eval: None,
     extract_workspace_from_url: true,
 };
 

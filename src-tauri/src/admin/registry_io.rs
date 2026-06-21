@@ -546,5 +546,13 @@ pub fn public_provider(p: &Value) -> Value {
         .unwrap_or(false);
     out.remove("opencodeCookie");
     out.insert("hasOpencodeCookie".into(), Value::Bool(has_opencode_cookie));
+    // [CAT-256 后续] kimiCookie 同理(Kimi 账号控制台 session),mask 出去只暴露 hasKimiCookie。
+    let has_kimi_cookie = out
+        .get("kimiCookie")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    out.remove("kimiCookie");
+    out.insert("hasKimiCookie".into(), Value::Bool(has_kimi_cookie));
     Value::Object(out)
 }

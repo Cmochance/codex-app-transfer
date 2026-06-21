@@ -24,6 +24,8 @@ const LOGIN_SPEC: SessionLoginSpec = SessionLoginSpec {
         "api-platform_ph",
         "userId",
     ],
+    ignore_cookie_prefixes: &[],
+    pre_capture_eval: None,
     extract_workspace_from_url: false,
 };
 
