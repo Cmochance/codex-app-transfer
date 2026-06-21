@@ -985,6 +985,23 @@ fn active_opencode_go_session() -> Option<(String, String, String)> {
     Some((s.provider_id, s.workspace_id?, s.cookie))
 }
 
+/// [CAT-256 后续] Kimi Code 的额度源接线规格:host `api.kimi.com` + 路径含 `coding`;`kimiCookie`
+/// 字段存的是 web 控制台 access_token(非 cookie,见 kimi_session 的 localStorage 抓取),供
+/// `Authorization: Bearer` 用。
+const KIMI_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
+    crate::web_session_quota::QuotaSourceSpec {
+        host_suffix: "api.kimi.com",
+        path_contains: Some("coding"),
+        cookie_field: "kimiCookie",
+        workspace_field: None,
+    };
+
+/// 活动 provider 是 Kimi Code 且已存 access_token → `(provider id, access_token)`,否则 None。
+fn active_kimi_session() -> Option<(String, String)> {
+    let s = crate::web_session_quota::active_session(&KIMI_SOURCE_SPEC)?;
+    Some((s.provider_id, s.cookie))
+}
+
 /// [MOC-211] 活动 provider 若是 DeepSeek(baseUrl host 含 `deepseek.com`)且有 apiKey →
 /// 返回 `(host, apiKey)`,否则 None。DeepSeek 余额走推理同一把 key(Bearer),官方
 /// `/user/balance` 接口。
@@ -1299,6 +1316,52 @@ async fn fetch_opencode_go_quota(
     }
 }
 
+/// [CAT-256 后续] 取 Kimi Code 套餐用量(host gate + 控制台 access_token + 45s 缓存)。非 Kimi Code /
+/// 无 token → 清缓存 + None。token 失效(Auth)→ 清缓存 + 清存储 token(前端转「未登录」提示重登)。
+async fn fetch_kimi_code_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::kimi_code_quota::{fetch_kimi_code_quota as fetch_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((id, token)) = active_kimi_session() else {
+        *cache = None;
+        return None;
+    };
+    let fp = quota_fingerprint(&[&id, &token]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_summary(http, &token).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth) => {
+            tracing::debug!("[Quota] Kimi access_token 失效 → 清缓存 + 清存储 token(需重新登录)");
+            *cache = None;
+            crate::web_session_quota::clear_cookie(&id, KIMI_SOURCE_SPEC.cookie_field, &token);
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] Kimi Code quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// [MOC-211] 取 DeepSeek 账户余额(host gate + 45s 缓存)。非 DeepSeek / key 失效 → 清缓存 +
 /// None。用推理同一把 apiKey 查官方 `/user/balance`。
 async fn fetch_deepseek_quota(
@@ -1482,6 +1545,7 @@ pub async fn run_quota_daemon() {
     let mut glm_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut mimo_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut opencode_go_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut kimi_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
@@ -1515,6 +1579,7 @@ pub async fn run_quota_daemon() {
         let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
         let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
         let opencode_go = fetch_opencode_go_quota(&quota_http, &mut opencode_go_cache).await;
+        let kimi = fetch_kimi_code_quota(&quota_http, &mut kimi_cache).await;
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
         let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
@@ -1523,6 +1588,7 @@ pub async fn run_quota_daemon() {
             .or(glm)
             .or(mimo)
             .or(opencode_go)
+            .or(kimi)
             .or(deepseek)
             .or(anyrouter)
             .or(moonshot)
