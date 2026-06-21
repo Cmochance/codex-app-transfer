@@ -12,6 +12,8 @@ import AppCombobox from '@/components/ui/AppCombobox.vue'
 import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
+import IconEye from '~icons/lucide/eye'
+import IconEyeOff from '~icons/lucide/eye-off'
 import OAuthLoginSection from '@/components/provider/OAuthLoginSection.vue'
 import type { OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
@@ -64,6 +66,24 @@ function loadCachedModels(baseUrl: string) {
   }
 }
 
+function saveMsgFiltered(baseUrl: string, v: boolean) {
+  if (!baseUrl.trim()) return
+  try {
+    localStorage.setItem(msgFilteredKey(baseUrl), v ? '1' : '0')
+  } catch {
+    /* localStorage 不可用时静默跳过 */
+  }
+}
+function loadMsgFiltered(baseUrl: string) {
+  messagesFiltered.value = false
+  if (!baseUrl.trim()) return
+  try {
+    messagesFiltered.value = localStorage.getItem(msgFilteredKey(baseUrl)) === '1'
+  } catch {
+    /* 解析失败忽略 */
+  }
+}
+
 // Codex 槽位 → 上游模型 id 映射(对齐后端 models 字段 + 旧 providerFormDefaultRows)
 const MODEL_SLOTS = [
   { key: 'default', label: t('models.defaultModel') },
@@ -100,7 +120,13 @@ const showAdvanced = ref(false)
 const isBuiltin = ref(false)
 const fetching = ref(false)
 const testing = ref(false)
+const showKey = ref(false)
 const availableModels = ref<ModelOpt[]>([])
+// [CAT-256] 「获取模型」过滤掉走 messages(anthropic)端点的模型(如 OpenCode Go 的
+// minimax/qwen 系)后,持久显示已过滤状态(按 baseUrl 缓存,重开弹窗仍显示)。
+const messagesFiltered = ref(false)
+const MSG_FILTERED_PREFIX = 'cas:msgfiltered:'
+const msgFilteredKey = (baseUrl: string) => MSG_FILTERED_PREFIX + baseUrl.trim().replace(/\/+$/, '')
 
 // baseUrl 归一(去 scheme / 末尾斜杠 / 大小写)后反查命中的内置 preset。
 // 对齐后端 healing 的 baseUrl→preset 匹配:命中即视作内置 provider。
@@ -247,6 +273,7 @@ function applyPreset(p: Preset) {
   // 该上游若之前抓过模型, 带出缓存清单, 否则清空待用户「获取模型」
   availableModels.value = []
   loadCachedModels(form.baseUrl)
+  loadMsgFiltered(form.baseUrl)
 }
 
 // 名称下拉显式点选(自由键入自定义名称不触发, 走 v-model 直更 form.name)
@@ -287,6 +314,9 @@ async function fetchModels() {
       })
       .filter((o) => o.value)
     saveCachedModels(form.baseUrl, availableModels.value)
+    // [CAT-256] 后端过滤掉走 messages 端点的模型后回传 filteredMessagesModels;非空则持久显示已过滤状态
+    messagesFiltered.value = (res.filteredMessagesModels?.length ?? 0) > 0
+    saveMsgFiltered(form.baseUrl, messagesFiltered.value)
     // [MOC-261 一-7] 自动填充:用后端 suggested(槽位→模型 id 自动建议,目前主要给 default 槽)
     // 预填**空**槽位,不覆盖用户已选;只接受确在可用列表里的 id。
     const suggested = res.suggested || {}
@@ -348,6 +378,7 @@ onMounted(async () => {
   form.requestOptions = stringifyIfAny(p.requestOptions)
   // 该上游之前抓过模型 → 带出本地缓存清单, 无需重新「获取模型」即可切换映射
   loadCachedModels(form.baseUrl)
+  loadMsgFiltered(form.baseUrl)
   const secret = await providersApi.getProviderSecret(props.editId).catch(() => ({ apiKey: '' }))
   form.apiKey = secret.apiKey || ''
 })
@@ -452,7 +483,18 @@ async function save() {
             :disabled="testing"
             @click="onTestConnection"
           />
-          <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
+          <AppInput
+            v-model="form.apiKey"
+            :type="showKey ? 'text' : 'password'"
+            placeholder="sk-..."
+          />
+          <AppButton
+            size="sm"
+            variant="ghost"
+            :icon="showKey ? IconEyeOff : IconEye"
+            :title="showKey ? t('providerForm.hideKey') : t('providerForm.showKey')"
+            @click="showKey = !showKey"
+          />
         </div>
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
@@ -464,13 +506,18 @@ async function save() {
 
       <div class="pf__section-row">
         <span class="pf__section">{{ t('providerForm.modelMapSection') }}</span>
-        <AppButton
-          size="sm"
-          variant="ghost"
-          :label="fetching ? t('providerForm.fetching') : t('providerForm.fetchModels')"
-          :disabled="fetching"
-          @click="fetchModels"
-        />
+        <div class="pf__fetch-actions">
+          <span v-if="messagesFiltered" class="pf__filter-status">
+            {{ t('providerForm.messagesModelsFiltered') }}
+          </span>
+          <AppButton
+            size="sm"
+            variant="ghost"
+            :label="fetching ? t('providerForm.fetching') : t('providerForm.fetchModels')"
+            :disabled="fetching"
+            @click="fetchModels"
+          />
+        </div>
       </div>
       <SettingsRow v-for="s in MODEL_SLOTS" :key="s.key" :title="s.label">
         <AppCombobox
@@ -633,5 +680,15 @@ async function save() {
 }
 .pf__mimo-status.ok {
   color: var(--success);
+}
+.pf__fetch-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.pf__filter-status {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 </style>

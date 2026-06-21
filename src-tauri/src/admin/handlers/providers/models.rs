@@ -231,6 +231,37 @@ fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
     }
 }
 
+/// [CAT-256] OpenCode Go(`opencode.ai/zen/go`)的 `/models` 同时返回走 `/chat/completions`
+/// 的(GLM/Kimi/DeepSeek/MiMo)和走 `/messages`(anthropic)的(MiniMax/Qwen)。本 provider 是
+/// `openai_chat`,只能调 `/chat/completions`,所以把走 messages 的剔除,避免用户选了发不通。
+/// 返回 `(保留, 被过滤)`。**仅对 `opencode.ai` 生效**,不影响其它 provider(原样返回 + 空过滤)。
+fn filter_messages_protocol_models(
+    provider: &Value,
+    model_ids: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let base_url = provider
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !base_url.contains("opencode.ai") {
+        return (model_ids, Vec::new());
+    }
+    // OpenCode Go 上走 /messages(anthropic)端点的模型前缀
+    const MESSAGES_ONLY_PREFIXES: [&str; 2] = ["minimax", "qwen"];
+    let mut kept = Vec::new();
+    let mut filtered = Vec::new();
+    for id in model_ids {
+        let lower = id.to_ascii_lowercase();
+        if MESSAGES_ONLY_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            filtered.push(id);
+        } else {
+            kept.push(id);
+        }
+    }
+    (kept, filtered)
+}
+
 fn pick_model(model_ids: &[String], keywords: &[&str], fallback_index: usize) -> String {
     for keyword in keywords {
         for model_id in model_ids {
@@ -613,11 +644,15 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         };
         let model_ids = extract_model_ids(&payload);
         if !model_ids.is_empty() {
+            // [CAT-256] openai_chat provider 剔除走 messages 端点的模型(仅 opencode.ai 生效)
+            let (model_ids, filtered_messages) =
+                filter_messages_protocol_models(provider, model_ids);
             return json!({
                 "success": true,
                 "endpoint": endpoint,
                 "models": model_ids,
                 "suggested": suggest_model_mappings(&model_ids),
+                "filteredMessagesModels": filtered_messages,
             });
         }
         errors.push(json!({"host": host, "code": "models_not_found"}));

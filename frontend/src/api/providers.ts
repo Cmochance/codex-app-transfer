@@ -144,7 +144,12 @@ export const mimoLogin = (id: string) =>
 // 获取上游可用模型:已存在 provider 走 id(用落盘 key);草稿(新增/编辑未存)走 payload。
 // 响应除 models 列表外还带 suggested(后端 suggest_model_mappings 自动建议的「槽位→模型 id」映射,
 // 目前主要给 default 槽),供前端 fetchModels 一键预填空槽位(取代已删的 autofill 专用端点)。
-type ModelsAvailableResp = { models?: unknown[]; suggested?: Record<string, string> }
+type ModelsAvailableResp = {
+  models?: unknown[]
+  suggested?: Record<string, string>
+  // [CAT-256] 后端为 openai_chat provider 剔除掉走 messages(anthropic)端点的模型 id(如 OpenCode Go 的 minimax/qwen 系)
+  filteredMessagesModels?: string[]
+}
 export const fetchProviderModels = (id: string) =>
   api<ModelsAvailableResp>('GET', `/api/providers/${id}/models/available`)
 export const fetchProviderModelsDraft = (payload: ProviderPayload) =>
