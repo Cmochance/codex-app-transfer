@@ -521,5 +521,51 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "baseUrl": "https://opencode.ai/zen/go/v1",
+    "docsUrl": "https://opencode.ai/docs/zh-cn/go",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "glm-5.2"
+    },
+    "modelCapabilities": {
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "kimi-k2.7-code": {
+        "context_window": 262144
+      },
+      "kimi-k2.6": {
+        "context_window": 262144
+      },
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "mimo-v2.5": {
+        "context_window": 1000000
+      },
+      "mimo-v2.5-pro": {
+        "context_window": 1000000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "OpenCode Go（opencode.ai/zen/go）—— 低成本开源编程模型订阅（$5 首月 / $10 月，在 opencode.ai 注册后取 API key）。本 preset 走 OpenAI 兼容端点（/chat/completions），涵盖 GLM / Kimi / DeepSeek / MiMo 系；OpenCode Go 的 MiniMax / Qwen 系走 Anthropic 端点（/messages），不在本 preset。"
+      }
+    ],
+    "requestOptions": {},
+    "extraHeaders": {},
+    "isBuiltin": true
   }
 ]

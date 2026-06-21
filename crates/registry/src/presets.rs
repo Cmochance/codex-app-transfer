@@ -45,7 +45,8 @@ mod tests {
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
         // (2026-06-13 加智谱 GLM Coding preset:Coding Plan 端点 + Claude Code UA 伪装)
         // (2026-06-16 加 zai-login / bigmodel-login OAuth preset:GLM Coding Plan 账号登录,MOC-252)
-        assert_eq!(builtin_presets().len(), 16);
+        // (2026-06-22 加 OpenCode Go preset:opencode.ai/zen/go 编程模型订阅,openai_chat)
+        assert_eq!(builtin_presets().len(), 17);
     }
 
     #[test]
