@@ -10,7 +10,7 @@
 //! - **恢复**([`set_sessions_provider`] 写任意 provider):`openai` → 用户选定的
 //!   provider,让其他工具重新看到该会话(导入的逆操作)。
 //!
-//! 可见性三要素(实测 + meta-xucong/ccswitch-codex-guide 开源项目双重验证):
+//! 可见性三要素(真机实测验证):
 //! 1. `threads.model_provider` = 当前活动 provider(transfer = `openai`)
 //! 2. `threads.has_user_event = 1`(列表只显示有用户消息的会话)
 //! 3. 会话 `cwd` 是 Codex 侧边栏项目(本模块管不到 —— cwd 不在项目里的会话修了也要
@@ -196,9 +196,9 @@ pub fn set_sessions_provider(
     };
     let conn = Connection::open(&db)?;
 
-    // 导入额外点亮可见性。`has_user_event` 仅有 user 消息时点亮(空会话不强行点亮,对齐上游
-    // repair 脚本);`thread_source` 仅原本为空时补 'user'(已有值不覆盖 —— 减少对来源元数据的
-    // 破坏性改写,让会话回到其他工具时元数据更接近原样)。
+    // 导入额外点亮可见性。`has_user_event` 仅有 user 消息时点亮(空会话不强行点亮);
+    // `thread_source` 仅原本为空时补 'user'(已有值不覆盖 —— 减少对来源元数据的破坏性改写,
+    // 让会话回到其他工具时元数据更接近原样)。
     let sql = if mark_visible {
         "UPDATE threads SET model_provider = ?1, \
          thread_source = CASE WHEN thread_source IS NULL OR thread_source = '' \
