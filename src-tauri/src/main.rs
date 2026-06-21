@@ -545,6 +545,27 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            // [MOC-271] Bug 2:tray 的 provider ✓ 之前只在「托盘内切 provider」后 refresh_tray_menu
+            // (handle_tray_menu);主界面(REST set_default_provider/activate_provider)切 provider 不刷新
+            // → ✓ 停在旧值、与主界面实际启用不符。这里起后台 watcher 轮询 `activeProvider`,变化即
+            // refresh_tray_menu —— 覆盖**所有**切换源(托盘 / 主界面 / 外部直接改 config)。用轮询而非事件:
+            // REST 层 AdminState 无 AppHandle、无法直接回调 tray;且 provider 变化仅随用户操作发生(非高频),
+            // 1.5s 读一个小 JSON 开销可忽略。set_menu 发生在「菜单未呈现」的后台时机(变化只在用户切换时,
+            // 不会与托盘菜单正在呈现重叠),避开 Windows 呈现中热替换雷区(见上 on_tray_icon_event 注释)。
+            let watch_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut last = current_active_provider();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let cur = current_active_provider();
+                    if cur != last {
+                        last = cur;
+                        refresh_tray_menu(&watch_handle);
+                    }
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -555,22 +576,13 @@ fn main() {
                     return;
                 }
                 api.prevent_close();
-                // macOS:用 NSApp.hide:(`app.hide()`)而不是 NSWindow.orderOut:
-                // (`window.hide()`)。NSApp.hide/unhide 是 Apple 提供的 app 级
-                // 隐藏 API,状态切换比 NSWindow.orderOut 干净;且与 NSStatusItem
-                // 组合的官方 menubar-app 模式就是这样写的。
-                // 非 macOS 仍用 window.hide()。
-                #[cfg(target_os = "macos")]
-                {
-                    let app_handle = window.app_handle().clone();
-                    let _ = window.run_on_main_thread(move || {
-                        let _ = app_handle.hide();
-                    });
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = window.hide();
-                }
+                // [MOC-271] close-to-tray 一律用**窗口级** `window.hide()`(NSWindow.orderOut:),
+                // 不再用 app 级 `app.hide()`(NSApp.hide:)。原注释以为「官方 menubar-app 用 NSApp.hide:」
+                // 实为反的:menubar app(尤其 hideDockIcon=Accessory 模式)应只隐藏**窗口**、保持 app +
+                // 状态栏存活。app 级 NSApp.hide/unhide 跟 `.accessory` + NSStatusItem 组合在 macOS 上脆弱
+                // ——点状态栏 item 使 app 失活、app 级隐藏状态机错乱 → 窗口被连带隐藏(纯显示 bug,后台正常)。
+                // 改窗口级后关窗只影响该窗口,跨平台一致。
+                let _ = window.hide();
             }
         })
         .build(tauri::generate_context!())
@@ -889,6 +901,15 @@ fn refresh_tray_menu(app: &AppHandle) {
     }
 }
 
+/// [MOC-271] 读当前活动 provider id(`activeProvider`),供 tray watcher 检测变化用。
+fn current_active_provider() -> Option<String> {
+    admin::registry_io::load().ok().and_then(|cfg| {
+        cfg.get("activeProvider")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    })
+}
+
 struct TrayProviderEntry {
     id: String,
     name: String,
@@ -923,11 +944,9 @@ fn tray_provider_entries() -> Vec<TrayProviderEntry> {
 }
 
 fn show_main_window(app: &AppHandle) {
-    // macOS:NSApp.unhide:(`app.show()`)反向唤醒 app + 全部窗口,
-    // 与关窗时的 NSApp.hide: 配对。
-    #[cfg(target_os = "macos")]
-    let _ = app.show();
-
+    // [MOC-271] 只做**窗口级**显示(配对窗口级 `window.hide()`)。不再调 app 级 `app.show()`
+    // (NSApp.unhide:)—— close-to-tray 已改窗口级,无需 app 级唤醒;且 app 级 unhide 跟 `.accessory`
+    // 组合是窗口被连带隐藏的脆弱点。
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -935,13 +954,13 @@ fn show_main_window(app: &AppHandle) {
     }
 
     // macOS 14+:`NSApplicationActivateIgnoringOtherApps` 已废弃,改用
-    // `NSRunningApplication.activate(.activateAllWindows)` 强制带到前台。
+    // `NSRunningApplication.activate(.activateAllWindows)` 强制带到前台(`.accessory` 下也有效)。
     #[cfg(target_os = "macos")]
     activate_macos_app();
 }
 
 #[cfg(target_os = "macos")]
-fn activate_macos_app() {
+pub(crate) fn activate_macos_app() {
     // macOS 14(Sonoma)起 `NSApplicationActivateIgnoringOtherApps` 已被
     // deprecated 且**实际无效** —— 这就是我们之前 Tauri set_focus()
     // 失效的根本原因(Tauri 内部就用这个 flag 走 NSApp.activate)。
