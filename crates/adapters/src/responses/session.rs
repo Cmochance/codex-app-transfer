@@ -20,8 +20,8 @@
 //!   远续得上"。`evict_expired_persisted` 机制保留(短 TTL 仍可触发,供测试 / 未
 //!   来可配置 retention),只是默认不在启动时调用。
 //! - **隐私**:db 文件包含完整对话历史(messages JSON),用户可:(a) admin
-//!   endpoint `POST /api/sessions/clear` 全清;(b) 直接删 db 文件。README 在
-//!   隐私小节里写明。
+//!   endpoint `POST /api/conversations/clear-all`(设置 →「清空会话历史」,同时把
+//!   Codex 对话 rollout 移回收站)全清;(b) 直接删 db 文件。README 在隐私小节里写明。
 //! - **并发**:rusqlite `Connection` 不是 Sync,用 `Mutex` 包。WAL + synchronous
 //!   NORMAL 提升单写多读性能;sqlite 自身保证原子性,不需要额外 transaction。
 
@@ -240,7 +240,7 @@ impl ResponseSessionCache {
     }
 
     /// **彻底清除**:L1 内存 + L2 sqlite 表 + blob。给 admin endpoint
-    /// `POST /api/sessions/clear` 用。返回清掉的 L2 行数(L1 总是清空)。
+    /// `POST /api/conversations/clear-all`(设置 →「清空会话历史」)用。返回清掉的 L2 行数(L1 总是清空)。
     ///
     /// **db 不可用(`db=None`)时返回 `Err` 且不动 blob**(数据完整性 BLOCKER 修):`db=None`
     /// 可能只是**瞬时**(db 文件数据完好、blob 仍被磁盘 row 有效引用,本进程只是没打开 db,
@@ -1101,7 +1101,7 @@ fn backup_blobs_dir(db_path: &Path, ts: i64) {
 /// - `SESSIONS_BLOB_TMP_REMOVE_FAILED` — 残留 `.tmp.`(含在途 blob 字节)删除失败,**计入
 ///   `failed`** → 隐私清除据此报不完整(NotFound 静默;codex-connector P1)
 /// - `SESSIONS_BLOB_SWEEP_PARTIAL` — 启动 GC 部分 blob 删失败(best-effort,下次重试)
-/// - `SESSIONS_BLOB_CLEAR_INCOMPLETE` — 隐私清除(`/api/sessions/clear`)blob 没删干净,
+/// - `SESSIONS_BLOB_CLEAR_INCOMPLETE` — 隐私清除(`/api/conversations/clear-all`)blob 没删干净,
 ///   **已 Err 上报**(行已删但私密图片可能残留;codex-connector P1)
 /// - `SESSIONS_BLOB_BACKUP_FAILED` — schema 重建备份 db 后,`blobs/` → `blobs.bak.<ts>/`
 ///   rename 失败(启动 sweep 可能删掉 `.bak` 引用的图;codex-connector P2)
@@ -2087,7 +2087,7 @@ mod tests {
             &path,
         );
         assert!(warn_b.is_some(), "db 应 init 失败 fallback 纯内存(db=None)");
-        // 用户点「清除会话历史」→ POST /api/sessions/clear → clear_all_persisted。
+        // 用户点「清空会话历史」→ POST /api/conversations/clear-all → clear_all_persisted。
         let result = cache_b.clear_all_persisted();
 
         // 恢复权限后验证:修复后 blob 应保留、db 行不变、clear 返回 Err。

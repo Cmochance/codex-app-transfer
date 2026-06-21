@@ -6,6 +6,8 @@ import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
 import { useSettingsStore } from '@/stores/settings'
 import { exportConfig, importConfig, type Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
+import { clearAllConversations } from '@/api/codex'
 import { useMcpRecovery } from '@/composables/useMcpRecovery'
 import { getAppVersion, checkAppUpdate, installAppUpdate, openExternalUrl } from '@/api/system'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
@@ -49,6 +51,28 @@ const mcpRecoveryStatus = computed(() =>
     ? tFmt('settings.mcpRecoveryPending', { count: mcpRecovery.pending.value })
     : tFmt('settings.mcpRecoveryAllIgnored', { count: mcpRecovery.entries.value.length }),
 )
+
+// MOC-261 二-4:清空会话历史(两者都清)—— 全部 Codex 对话 rollout 移回收站(可恢复)+ 清 proxy 续轮缓存。
+const { confirm } = useConfirm()
+const clearingSessions = ref(false)
+async function onClearSessionHistory() {
+  const ok = await confirm({
+    title: t('settings.sessionHistoryClearConfirmTitle'),
+    message: t('settings.sessionHistoryClearConfirm'),
+    confirmLabel: t('settings.sessionHistoryClear'),
+    danger: true,
+  })
+  if (!ok) return
+  clearingSessions.value = true
+  try {
+    const r = await clearAllConversations()
+    toast(tFmt('settings.sessionHistoryClearOk', { count: r.sessionsTrashed }))
+  } catch (e) {
+    toast((e as Error).message || t('settings.sessionHistoryClearFailed'), 'error')
+  } finally {
+    clearingSessions.value = false
+  }
+}
 
 onMounted(() => {
   if (!store.loaded) store.load().catch(() => {})
@@ -601,6 +625,18 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
           variant="secondary"
           :label="t('settings.mcpRecoveryHandle')"
           @click="mcpRecovery.openModal()"
+        />
+      </SettingsRow>
+      <SettingsRow
+        :title="t('settings.sessionHistoryTitle')"
+        :description="t('settings.sessionHistoryDesc')"
+      >
+        <AppButton
+          size="sm"
+          variant="danger"
+          :label="t('settings.sessionHistoryClear')"
+          :disabled="clearingSessions"
+          @click="onClearSessionHistory"
         />
       </SettingsRow>
       <SettingsRow :title="t('settings.proxyPort')" :description="t('settings.proxyPortDesc')">

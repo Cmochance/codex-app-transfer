@@ -174,6 +174,11 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/conversations/delete",
             post(handlers::conversations::delete_handler),
         )
+        // [MOC-261 二-4] 清空会话历史(两者都清):全部 rollout 移回收站 + 清 proxy L2 续轮缓存。
+        .route(
+            "/api/conversations/clear-all",
+            post(handlers::conversations::clear_all_handler),
+        )
         // Token usage stats (#279, ccusage-vendored)
         .route("/api/usage/summary", get(handlers::usage::usage_summary))
         .route(
@@ -219,7 +224,8 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/proxy/logs/open-dir",
             post(handlers::proxy::proxy_logs_open_dir),
         )
-        .route("/api/sessions/clear", post(handlers::proxy::sessions_clear))
+        // [MOC-261 二-4] 旧 /api/sessions/clear(只清 proxy L2 缓存、前端从未接)已并入
+        // /api/conversations/clear-all(两者都清),独立端点移除。
         // Settings
         .route(
             "/api/settings",

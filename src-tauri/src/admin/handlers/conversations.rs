@@ -374,6 +374,57 @@ pub async fn delete_handler(Json(req): Json<DeleteRequest>) -> impl IntoResponse
     }
 }
 
+/// `POST /api/conversations/clear-all` — 一键清空本地会话历史(两者都清):
+/// ① 把 `~/.codex/sessions` + `~/.codex/archived_sessions` 全部 rollout **移到回收站**(可恢复)。
+/// ② 清 proxy 的 L2 Responses 续轮缓存(`~/.codex-app-transfer/sessions.db` 全表 + 内存 hot cache)。
+///
+/// 前端设置页「会话历史」→「清空会话历史」按钮(二次确认)调用。非破坏:rollout 走系统回收站、
+/// 不彻底删,用户可在 Finder Trash 恢复。无会话时也照常清缓存。
+pub async fn clear_all_handler() -> impl IntoResponse {
+    let codex_home = match codex_home_from_env() {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+
+    // ① 全部 rollout(active + archived)→ 回收站
+    let ids: Vec<String> = match cexp::list_sessions(&codex_home) {
+        Ok(sessions) => sessions.into_iter().map(|s| s.id).collect(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let trash = if ids.is_empty() {
+        cexp::TrashResult::default()
+    } else {
+        match cexp::move_sessions_to_trash(&codex_home, &ids) {
+            Ok(r) => r,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    };
+
+    // ② proxy L2 Responses 续轮缓存
+    let cache_rows =
+        match codex_app_transfer_adapters::responses::session::global_response_session_cache()
+            .clear_all_persisted()
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("clear sessions.db failed: {e}"),
+                )
+                .into_response()
+            }
+        };
+
+    Json(json!({
+        "success": true,
+        "sessionsTrashed": trash.deleted.len(),
+        "sessionsFailed": trash.failed.len(),
+        "failed": trash.failed,
+        "cacheRowsRemoved": cache_rows,
+    }))
+    .into_response()
+}
+
 /// 把 session id / 时间戳里可能的 `/` `\` 等剔掉,生成安全文件名。
 fn sanitize_filename(name: &str) -> String {
     name.chars()

@@ -71,7 +71,7 @@ impl std::fmt::Display for InlineError {
 }
 
 /// `sweep` 结果:成功删除的 blob 数 + **失败**数(分片读不出 / 文件删不掉)。
-/// 隐私清除(`clear_all_persisted` → `POST /api/sessions/clear`)据 `failed > 0`
+/// 隐私清除(`clear_all_persisted` → `POST /api/conversations/clear-all`)据 `failed > 0`
 /// 上报"没清干净"(私密图片可能残留),不能 best-effort 静默成功;启动孤儿 GC
 /// 则仅观测 `failed`、不因此 abort(单个锁文件不该挡住其余回收)。
 #[derive(Debug, Clone, Copy, Default)]
