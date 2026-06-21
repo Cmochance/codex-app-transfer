@@ -20,7 +20,7 @@
 //! **健壮性**:session 失效时控制台会把 `/workspace/<id>/go` 跳登录页 → 解析不到任何窗口 →
 //! 返 [`QuotaError::Auth`],caller 清存储 cookie 让前端转「未登录」提示重登(session 无 refresh)。
 
-use crate::provider_quota::{ProviderQuota, QuotaWindow};
+use crate::provider_quota::{ProviderQuota, RollingWindows};
 
 /// 抓取错误:`Auth`=session 失效(需重登,清 cookie);`Transient`=网络/瞬时(留旧缓存重试)。
 pub enum QuotaError {
@@ -103,30 +103,28 @@ pub async fn fetch_opencode_go_quota(
         .map_err(|e| QuotaError::Transient(e.to_string()))?;
 
     let now = chrono::Utc::now();
-    let mut windows = Vec::new();
-    // 固定顺序:5 小时 → 每周 → 每月(与 GLM 5h/周 同序;月窗口 OpenCode Go 独有,无则自动跳过)。
-    for (name, label) in [
-        ("rollingUsage", "5 小时额度"),
-        ("weeklyUsage", "每周额度"),
-        ("monthlyUsage", "每月额度"),
-    ] {
-        if let Some((used, reset_sec)) = parse_window(&html, name) {
-            let reset = reset_sec
-                .filter(|s| *s > 0)
-                .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
-            windows.push(QuotaWindow {
-                label: label.into(),
-                remaining_percent: (100.0 - used).clamp(0.0, 100.0),
-                reset_rfc3339: reset,
-            });
-        }
+    // resetInSec(重置倒计时)→ 绝对 RFC3339(≤0 / 缺 → None,不显刷新时间)。
+    let reset_at = |sec: Option<i64>| {
+        sec.filter(|s| *s > 0)
+            .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339())
+    };
+    // usagePercent=已用% → 剩余=100-已用(builder 自动 clamp);无该窗口则不填该槽(自动不显)。
+    let mut rolling = RollingWindows::default();
+    if let Some((used, reset)) = parse_window(&html, "rollingUsage") {
+        rolling = rolling.five_hour(100.0 - used, reset_at(reset));
     }
-    if windows.is_empty() {
+    if let Some((used, reset)) = parse_window(&html, "weeklyUsage") {
+        rolling = rolling.weekly(100.0 - used, reset_at(reset));
+    }
+    if let Some((used, reset)) = parse_window(&html, "monthlyUsage") {
+        rolling = rolling.monthly(100.0 - used, reset_at(reset));
+    }
+    if rolling.is_empty() {
         // 一个窗口都没解析到:多半 session 失效跳了登录页(或页面结构变)。按 Auth 让前端提示重登。
         return Err(QuotaError::Auth);
     }
     Ok(ProviderQuota {
-        windows,
+        rolling,
         ..Default::default()
     })
 }

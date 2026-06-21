@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-use crate::provider_quota::{ProviderQuota, QuotaWindow};
+use crate::provider_quota::ProviderQuota;
 
 /// 用量 / 套餐详情都在控制台域名(与推理 host 无关)。
 const PLATFORM_HOST: &str = "platform.xiaomimimo.com";
@@ -97,12 +97,13 @@ pub async fn fetch_mimo_quota_summary(
             .map(str::to_owned)
     })
     .and_then(|s| period_end_to_rfc3339(&s));
+    // MiMo 是月度套餐(按 plan period 重置)→ 归「月」槽,但文案保留「套餐用量」(非日历月额度)。
     Ok(ProviderQuota {
-        windows: vec![QuotaWindow {
-            label: "套餐用量".into(),
-            remaining_percent: remaining,
-            reset_rfc3339: reset,
-        }],
+        rolling: crate::provider_quota::RollingWindows::default().monthly_labeled(
+            "套餐用量",
+            remaining,
+            reset,
+        ),
         ..Default::default()
     })
 }

@@ -1,21 +1,21 @@
-//! Provider-neutral 额度类型(MOC-211)。
+//! Provider-neutral 额度类型(MOC-211 / CAT-256 统一三槽)。
 //!
-//! 各 provider 的额度**体系不同**,是相互独立的显示系统:
-//! - antigravity(gemini)/ GLM Coding:**5 小时 + 每周**双滚动窗口(剩余% 进度条);
-//! - 小米 MiMo Token Plan:**月度套餐**单窗口(剩余% 进度条,自然月重置);
-//! - DeepSeek:**充值余额**(钱,无上限/百分比)→ 纯数值条目,不画进度条。
+//! 各 coding-plan provider 的滚动窗口额度**统一成 5 小时 / 每周 / 每月 三槽**([`RollingWindows`]),
+//! 每档 `Option` —— 有则填、无则 `None`(渲染时不显示该档),所以同一套结构涵盖:
+//! - GLM Coding / antigravity:`{5h, 周}`(月 = None);
+//! - OpenCode Go:`{5h, 周, 月}`(三档全有);
+//! - 小米 MiMo Token Plan:`{月}`(5h/周 = None;月槽文案为「套餐用量」,见 `monthly_labeled`)。
 //!
-//! 故中性类型同时承载两类展示:
-//! - [`QuotaWindow`] 列表 → 渲染成带进度条的 bar(有「满额/剩余」语义的);
-//! - [`QuotaStat`] 列表 → 渲染成 `label: value` 纯文本条目(余额这种无百分比的)。
+//! 另有 [`QuotaStat`] 纯数值条目(无 5h/周/月 滚动语义,**不进三槽**):如 DeepSeek「余额 ¥5.37」
+//! → 渲染成 `label: value` 文本条。
 //!
-//! 每个 provider 的 fetcher 产出自己的窗口/条目(各带 label),[`crate::codex_quota_injector`]
-//! 逐条渲染——各 provider 各显各的、互不混淆。新增 provider 额度源只要产出这两个列表即可。
+//! [`crate::codex_quota_injector`] 按 `5h→周→月` 固定顺序逐条渲染存在的窗口 + stats;各 provider
+//! 各显各的、互不混淆。新增同类 provider 只要产出 [`RollingWindows`](builder 链)即可。
 
 /// 单个额度窗口(有满额/剩余语义 → 进度条)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaWindow {
-    /// 窗口名(bar 标签):如「5 小时额度」「每周额度」「套餐用量」。
+    /// 窗口名(bar 标签):如「5 小时额度」「每周额度」「每月额度」「套餐用量」。
     pub label: String,
     /// **剩余**百分比(满额=100,消耗后降),clamp 0-100。
     pub remaining_percent: f64,
@@ -31,40 +31,91 @@ pub struct QuotaStat {
     pub value: String,
 }
 
-/// 一个 provider 的额度(窗口 bar + 数值条目)。两者皆空 = 不显额度行。
+/// 统一的「5 小时 / 每周 / 每月」三槽滚动窗口。每档 `Option`,`None` = 该 provider 无此档、不显示。
+/// 用 builder 链填(标签由槽位固定,避免各 provider 文案漂移):
+/// `RollingWindows::default().five_hour(96.0, reset).weekly(99.0, None)`。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RollingWindows {
+    pub five_hour: Option<QuotaWindow>,
+    pub weekly: Option<QuotaWindow>,
+    pub monthly: Option<QuotaWindow>,
+}
+
+impl RollingWindows {
+    /// 5 小时窗口(标签固定「5 小时额度」)。`remaining_percent` 自动 clamp 0-100。
+    pub fn five_hour(mut self, remaining_percent: f64, reset_rfc3339: Option<String>) -> Self {
+        self.five_hour = Some(make_window("5 小时额度", remaining_percent, reset_rfc3339));
+        self
+    }
+    /// 每周窗口(标签固定「每周额度」)。
+    pub fn weekly(mut self, remaining_percent: f64, reset_rfc3339: Option<String>) -> Self {
+        self.weekly = Some(make_window("每周额度", remaining_percent, reset_rfc3339));
+        self
+    }
+    /// 每月窗口(标签固定「每月额度」)。
+    pub fn monthly(self, remaining_percent: f64, reset_rfc3339: Option<String>) -> Self {
+        self.monthly_labeled("每月额度", remaining_percent, reset_rfc3339)
+    }
+    /// 月槽自定义文案 —— 给「月度套餐」类(MiMo「套餐用量」:按 plan period 重置,非日历月额度,
+    /// 结构上归月槽但文案保留各自准确语义)。
+    pub fn monthly_labeled(
+        mut self,
+        label: impl Into<String>,
+        remaining_percent: f64,
+        reset_rfc3339: Option<String>,
+    ) -> Self {
+        self.monthly = Some(make_window(label, remaining_percent, reset_rfc3339));
+        self
+    }
+    /// 按 `5h→周→月` 固定顺序遍历**存在**的窗口(`None` 跳过)。渲染只认这个顺序。
+    pub fn iter(&self) -> impl Iterator<Item = &QuotaWindow> {
+        [&self.five_hour, &self.weekly, &self.monthly]
+            .into_iter()
+            .flatten()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.five_hour.is_none() && self.weekly.is_none() && self.monthly.is_none()
+    }
+}
+
+fn make_window(
+    label: impl Into<String>,
+    remaining_percent: f64,
+    reset: Option<String>,
+) -> QuotaWindow {
+    QuotaWindow {
+        label: label.into(),
+        remaining_percent: remaining_percent.clamp(0.0, 100.0),
+        reset_rfc3339: reset,
+    }
+}
+
+/// 一个 provider 的额度(三槽滚动窗口 + 数值条目)。两者皆空 = 不显额度行。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderQuota {
-    pub windows: Vec<QuotaWindow>,
+    pub rolling: RollingWindows,
     pub stats: Vec<QuotaStat>,
 }
 
 impl ProviderQuota {
     /// 是否有任一窗口/条目(caller 判定要不要显示额度行)。
     pub fn has_any(&self) -> bool {
-        !self.windows.is_empty() || !self.stats.is_empty()
+        !self.rolling.is_empty() || !self.stats.is_empty()
     }
 }
 
-// antigravity 的 gemini 双窗口 → 中性窗口列表(labels:5 小时额度 / 每周额度)。
+// antigravity 的 gemini 双窗口 → 三槽(5h + 周;月 = None)。
 impl From<codex_app_transfer_gemini_oauth::GeminiQuota> for ProviderQuota {
     fn from(g: codex_app_transfer_gemini_oauth::GeminiQuota) -> Self {
-        let mut windows = Vec::new();
+        let mut rolling = RollingWindows::default();
         if let Some(w) = g.five_hour {
-            windows.push(QuotaWindow {
-                label: "5 小时额度".into(),
-                remaining_percent: w.remaining_percent,
-                reset_rfc3339: w.reset_rfc3339,
-            });
+            rolling = rolling.five_hour(w.remaining_percent, w.reset_rfc3339);
         }
         if let Some(w) = g.weekly {
-            windows.push(QuotaWindow {
-                label: "每周额度".into(),
-                remaining_percent: w.remaining_percent,
-                reset_rfc3339: w.reset_rfc3339,
-            });
+            rolling = rolling.weekly(w.remaining_percent, w.reset_rfc3339);
         }
         Self {
-            windows,
+            rolling,
             ..Default::default()
         }
     }
@@ -88,15 +139,34 @@ mod tests {
         };
         let p = ProviderQuota::from(g);
         assert!(p.has_any());
-        assert_eq!(p.windows.len(), 2);
+        let windows: Vec<&QuotaWindow> = p.rolling.iter().collect();
+        assert_eq!(windows.len(), 2);
         assert!(p.stats.is_empty());
-        assert_eq!(p.windows[0].label, "5 小时额度");
-        assert_eq!(p.windows[0].remaining_percent, 98.0);
+        assert_eq!(windows[0].label, "5 小时额度");
+        assert_eq!(windows[0].remaining_percent, 98.0);
         assert_eq!(
-            p.windows[0].reset_rfc3339.as_deref(),
+            windows[0].reset_rfc3339.as_deref(),
             Some("2026-06-13T17:56:06Z")
         );
-        assert_eq!(p.windows[1].label, "每周额度");
+        assert_eq!(windows[1].label, "每周额度");
+        assert!(p.rolling.monthly.is_none());
+    }
+
+    #[test]
+    fn iter_order_is_5h_weekly_monthly() {
+        let r = RollingWindows::default()
+            .monthly(100.0, None)
+            .five_hour(96.0, None)
+            .weekly(99.0, None);
+        let labels: Vec<&str> = r.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["5 小时额度", "每周额度", "每月额度"]);
+    }
+
+    #[test]
+    fn monthly_labeled_keeps_custom_text_and_clamps() {
+        let r = RollingWindows::default().monthly_labeled("套餐用量", 150.0, None);
+        assert_eq!(r.monthly.as_ref().unwrap().label, "套餐用量");
+        assert_eq!(r.monthly.as_ref().unwrap().remaining_percent, 100.0);
     }
 
     #[test]
@@ -114,6 +184,6 @@ mod tests {
             ..Default::default()
         };
         assert!(p.has_any());
-        assert!(p.windows.is_empty());
+        assert!(p.rolling.is_empty());
     }
 }

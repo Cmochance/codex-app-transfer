@@ -17,7 +17,7 @@
 //! 端口 / 鉴权方式 / 字段语义借鉴上游 opencode-glm-quota(`guyinwonder168/opencode-glm-quota`),
 //! 并以真实 GLM Coding key 实测取证。
 
-use crate::provider_quota::{ProviderQuota, QuotaWindow};
+use crate::provider_quota::ProviderQuota;
 
 /// fetch 失败分类(对称 antigravity 的 `QuotaError`):让 caller 区别对待「鉴权失效(清缓存)」
 /// 与「瞬时错(留旧缓存重试)」。
@@ -79,23 +79,15 @@ pub fn parse_glm_quota(json: &serde_json::Value) -> ProviderQuota {
             _ => {}
         }
     }
-    let mut windows = Vec::new();
+    let mut rolling = crate::provider_quota::RollingWindows::default();
     if let Some((remaining, reset)) = five_hour {
-        windows.push(QuotaWindow {
-            label: "5 小时额度".into(),
-            remaining_percent: remaining,
-            reset_rfc3339: reset,
-        });
+        rolling = rolling.five_hour(remaining, reset);
     }
     if let Some((remaining, reset)) = weekly {
-        windows.push(QuotaWindow {
-            label: "每周额度".into(),
-            remaining_percent: remaining,
-            reset_rfc3339: reset,
-        });
+        rolling = rolling.weekly(remaining, reset);
     }
     ProviderQuota {
-        windows,
+        rolling,
         ..Default::default()
     }
 }
@@ -134,6 +126,7 @@ pub async fn fetch_glm_quota_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_quota::QuotaWindow;
     use serde_json::json;
 
     /// 真机抓的响应骨架(2026-06-14):data.limits = 5h + weekly(TOKENS_LIMIT)+ MCP(TIME_LIMIT)。
@@ -154,16 +147,17 @@ mod tests {
     }
 
     fn win<'a>(q: &'a ProviderQuota, label: &str) -> Option<&'a QuotaWindow> {
-        q.windows.iter().find(|w| w.label == label)
+        q.rolling.iter().find(|w| w.label == label)
     }
 
     #[test]
     fn parses_both_token_windows_as_remaining() {
         let q = parse_glm_quota(&real_response());
-        assert_eq!(q.windows.len(), 2);
+        let ws: Vec<&QuotaWindow> = q.rolling.iter().collect();
+        assert_eq!(ws.len(), 2);
         // 顺序:5 小时额度 在前、每周额度 在后
-        assert_eq!(q.windows[0].label, "5 小时额度");
-        assert_eq!(q.windows[1].label, "每周额度");
+        assert_eq!(ws[0].label, "5 小时额度");
+        assert_eq!(ws[1].label, "每周额度");
         // percentage=已用 → 剩余 = 100 - 已用
         let h = win(&q, "5 小时额度").expect("5h");
         assert!(
@@ -185,7 +179,7 @@ mod tests {
     fn ignores_time_limit_mcp_bucket() {
         // TIME_LIMIT(MCP 工具)不应被当成 token 窗口;只保留两个 TOKENS_LIMIT。
         let q = parse_glm_quota(&real_response());
-        assert_eq!(q.windows.len(), 2);
+        assert_eq!(q.rolling.iter().count(), 2);
     }
 
     #[test]
@@ -201,7 +195,7 @@ mod tests {
             {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":140}
         ]}});
         let q = parse_glm_quota(&j);
-        assert_eq!(q.windows.len(), 1);
+        assert_eq!(q.rolling.iter().count(), 1);
         assert_eq!(
             win(&q, "5 小时额度").unwrap().remaining_percent,
             0.0,

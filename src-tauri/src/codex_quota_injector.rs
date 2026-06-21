@@ -719,16 +719,16 @@ fn quota_bar(w: &QuotaWindow) -> serde_json::Value {
     json!({"kind":"bar","cls":"quota","label":w.label,"pct":pct,"detail":detail,"hot":pct <= 10})
 }
 
-/// [MOC-204 / MOC-211] 额度行:白名单 provider 的每个窗口渲染一条 bar(antigravity/GLM =
-/// 5h + 每周;MiMo = 套餐用量月窗口)。label 随窗口走,故 5h/周 与 月度套餐各显各、互不混。
-/// 非白名单 / 拿不到 → 空(不显额度行)。
+/// [MOC-204 / MOC-211 / CAT-256] 额度行:白名单 provider 的滚动窗口按 `5h→周→月` 固定顺序逐条
+/// 渲染成 bar(antigravity/GLM = 5h+周;OpenCode Go = 5h+周+月;MiMo = 月槽「套餐用量」)。每档
+/// `Option`,无则不渲染该条。label 随窗口走,各显各、互不混。非白名单 / 拿不到 → 空(不显额度行)。
 fn quota_rows(quota: Option<&ProviderQuota>) -> Vec<serde_json::Value> {
     let Some(q) = quota else {
         return vec![];
     };
-    // 先窗口 bar(5h/周/套餐用量),再数值条目(DeepSeek 余额等)。stat 行无进度条:
-    // 注入脚本 buildRow 对非 bar/duo/ctx 的 kind 落 `cqs`(label + detail)分支渲染。
-    let mut rows: Vec<serde_json::Value> = q.windows.iter().map(quota_bar).collect();
+    // 先三槽窗口 bar(5h/周/月,RollingWindows::iter 固定序),再数值条目(DeepSeek 余额等)。
+    // stat 行无进度条:注入脚本 buildRow 对非 bar/duo/ctx 的 kind 落 `cqs`(label + detail)分支渲染。
+    let mut rows: Vec<serde_json::Value> = q.rolling.iter().map(quota_bar).collect();
     rows.extend(
         q.stats
             .iter()
@@ -1811,18 +1811,9 @@ mod tests {
         // [MOC-204 / MOC-211] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
         // 用中性 ProviderQuota 多窗口(antigravity / GLM 都归一到它)。
         let q = ProviderQuota {
-            windows: vec![
-                QuotaWindow {
-                    label: "5 小时额度".into(),
-                    remaining_percent: 94.0, // 剩 94%
-                    reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
-                },
-                QuotaWindow {
-                    label: "每周额度".into(),
-                    remaining_percent: 8.0, // 剩 8% → 应标红 hot
-                    reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
-                },
-            ],
+            rolling: crate::provider_quota::RollingWindows::default()
+                .five_hour(94.0, Some("2026-06-13T17:56:06Z".into())) // 剩 94%
+                .weekly(8.0, Some("2026-06-20T12:56:06Z".into())), // 剩 8% → 应标红 hot
             ..Default::default()
         };
         let p = build_payload(Some(&q), None);
