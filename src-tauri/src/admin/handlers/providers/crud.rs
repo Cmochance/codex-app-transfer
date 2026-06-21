@@ -578,7 +578,7 @@ pub async fn opencode_login(Path(id): Path<String>) -> impl IntoResponse {
     if !exists {
         return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     }
-    let cookie = match crate::opencode_session::login_and_capture().await {
+    let (cookie, workspace_id) = match crate::opencode_session::login_and_capture().await {
         Ok(Some(c)) => c,
         Ok(None) => return Json(json!({"success": true, "captured": false})).into_response(),
         Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
@@ -596,7 +596,11 @@ pub async fn opencode_login(Path(id): Path<String>) -> impl IntoResponse {
         let obj = p
             .as_object_mut()
             .ok_or_else(|| "provider not object".to_string())?;
-        obj.insert("opencodeCookie".into(), Value::String(cookie));
+        obj.insert("opencodeCookie".into(), Value::String(cookie.clone()));
+        // workspace id 抓 Go 用量端点 `/workspace/<id>/go` 必需(非敏感,不 mask)。
+        if let Some(ws) = workspace_id.clone() {
+            obj.insert("opencodeWorkspaceId".into(), Value::String(ws));
+        }
         Ok(ConfigMutation::Modified(()))
     });
     match result {

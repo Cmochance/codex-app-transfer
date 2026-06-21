@@ -1015,6 +1015,71 @@ fn clear_mimo_cookie(provider_id: &str, used_cookie: &str) {
     });
 }
 
+/// [CAT-256] 活动 provider 若是 OpenCode Go(baseUrl host 含 `opencode.ai`)且已存网页 session
+/// + workspace id → 返回 `(provider id, workspace_id, opencodeCookie)`,否则 None。Go 套餐 5h/周/月
+/// 用量走 OpenCode 账号控制台 session(见 opencode_go_quota / opencode_session),非 apiKey。
+fn active_opencode_go_session() -> Option<(String, String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !host.ends_with("opencode.ai") {
+        return None;
+    }
+    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+    let cookie = p
+        .get("opencodeCookie")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let workspace_id = p
+        .get("opencodeWorkspaceId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((id, workspace_id, cookie))
+}
+
+/// session 失效(Auth)时清掉该 provider 存的 `opencodeCookie`,让前端 `hasOpencodeCookie` 转 false
+/// 显「未登录」、提示重新登录(OpenCode 控制台 session 无 refresh,只能重登)。镜像 clear_mimo_cookie。
+fn clear_opencode_cookie(provider_id: &str, used_cookie: &str) {
+    let _ = crate::admin::registry_io::with_config_write(|cfg| {
+        let Some(providers) = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
+        };
+        let mut changed = false;
+        for p in providers.iter_mut() {
+            if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
+                if let Some(obj) = p.as_object_mut() {
+                    // 仅当当前存的 cookie 仍是本次失败用的那把才清(同 clear_mimo_cookie 的在途保护)。
+                    let still_same =
+                        obj.get("opencodeCookie").and_then(|v| v.as_str()) == Some(used_cookie);
+                    if still_same && obj.remove("opencodeCookie").is_some() {
+                        changed = true;
+                    }
+                }
+                break;
+            }
+        }
+        if changed {
+            Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
+        } else {
+            Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()))
+        }
+    });
+}
+
 /// [MOC-211] 活动 provider 若是 DeepSeek(baseUrl host 含 `deepseek.com`)且有 apiKey →
 /// 返回 `(host, apiKey)`,否则 None。DeepSeek 余额走推理同一把 key(Bearer),官方
 /// `/user/balance` 接口。
@@ -1279,6 +1344,56 @@ async fn fetch_mimo_quota(
     }
 }
 
+/// [CAT-256] 取 OpenCode Go 套餐 5h/周/月 用量(host gate + 控制台网页 session + workspace id + 45s
+/// 缓存)。非 OpenCode Go / 无 cookie+workspace → 清缓存 + None。session 失效(Auth)→ 清缓存 +
+/// 清存储 cookie(前端转「未登录」提示重登;OpenCode 控制台 session 无 refresh)。镜像 fetch_mimo_quota。
+async fn fetch_opencode_go_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::opencode_go_quota::{fetch_opencode_go_quota as fetch_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((id, workspace_id, cookie)) = active_opencode_go_session() else {
+        *cache = None;
+        return None;
+    };
+    // 指纹按 (provider id, workspace_id, cookie):换账号重登(cookie/workspace 变)即缓存失效。
+    let fp = quota_fingerprint(&[&id, &workspace_id, &cookie]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_summary(http, &workspace_id, &cookie).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth) => {
+            tracing::debug!(
+                "[Quota] OpenCode 控制台 session 失效 → 清缓存 + 清存储 cookie(需重新登录)"
+            );
+            *cache = None;
+            clear_opencode_cookie(&id, &cookie);
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] OpenCode Go quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// [MOC-211] 取 DeepSeek 账户余额(host gate + 45s 缓存)。非 DeepSeek / key 失效 → 清缓存 +
 /// None。用推理同一把 apiKey 查官方 `/user/balance`。
 async fn fetch_deepseek_quota(
@@ -1461,6 +1576,7 @@ pub async fn run_quota_daemon() {
     // 缓存带账号指纹(u64):切同类型 provider 的不同账号时即失效,不串旧账号额度。
     let mut glm_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut mimo_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut opencode_go_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
@@ -1493,6 +1609,7 @@ pub async fn run_quota_daemon() {
             .map(ProviderQuota::from);
         let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
         let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
+        let opencode_go = fetch_opencode_go_quota(&quota_http, &mut opencode_go_cache).await;
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
         let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
@@ -1500,6 +1617,7 @@ pub async fn run_quota_daemon() {
         let quota = antigravity
             .or(glm)
             .or(mimo)
+            .or(opencode_go)
             .or(deepseek)
             .or(anyrouter)
             .or(moonshot)

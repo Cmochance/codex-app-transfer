@@ -16,6 +16,7 @@ mod mcp_webfetch_server;
 mod mimo_quota;
 mod mimo_session;
 mod moonshot_quota;
+mod opencode_go_quota;
 mod opencode_session;
 mod provider_quota;
 mod proxy_runner;

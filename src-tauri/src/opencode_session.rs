@@ -1,16 +1,14 @@
 //! OpenCode 控制台网页 session 抓取(CAT-256 / 镜像 MiMo `mimo_session.rs`)。
 //!
-//! OpenCode Go 的 5h/周/月用量只在 `opencode.ai` 控制台后面(走 OpenCode 账号登录,
-//! 数据由 SolidStart server-function 取),**inference API key 查不到**(实测 balance/usage
+//! OpenCode Go 的 5h/周/月用量只在 `opencode.ai` 控制台后面(走 OpenCode 账号登录,数据 SSR
+//! 内嵌在 `/workspace/<id>/go` 页 HTML 里),**inference API key 查不到**(实测 balance/usage
 //! 等端点全 404)。所以跟 MiMo 一样:app 内嵌 Tauri `WebviewWindow` 让用户登一次 OpenCode
 //! 账号 → Rust 侧轮询 `webview.cookies()`(底层 `WKHTTPCookieStore.getAllCookies`,**含
-//! httpOnly**)抓到 `opencode.ai` 域全部 cookie → 拼成 `Cookie:` 头返回给 caller 落库
-//! (provider 的 `opencodeCookie`),后续 quota fetcher 带它查控制台用量。
+//! httpOnly**)抓到 `opencode.ai` 域全部 cookie → 拼成 `Cookie:` 头,并从控制台 authed URL
+//! 抓 workspace id(`wrk_...`)→ 一并落库(provider 的 `opencodeCookie` + `opencodeWorkspaceId`)。
+//! [`crate::opencode_go_quota`] 带它俩查 Go 套餐用量。
 //!
 //! 体积零增量:复用主窗口已在用的系统 WebView + 已链接的 tauri/wry,无新依赖。
-//!
-//! **注**:OpenCode 控制台是 SolidStart RPC,具体用量端点还要抓包确定(见 CAT-256 讨论);
-//! 本模块只负责「登录 + 抓 session cookie 落库」这层基础设施,先把账号记下来不反复登。
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -32,11 +30,23 @@ const AUTHED_PATH_MARKER: &str = "/workspace";
 const COOKIE_DOMAIN_MARKER: &str = "opencode.ai";
 const POLL_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// 打开内嵌登录窗,轮询抓 `opencode.ai` 域的 session cookie。
-/// - `Ok(Some(header))`:登录成功,返回拼好的 `Cookie:` 头(opencode.ai 域全部 cookie,供 caller 落库)。
+/// 从控制台 authed URL(`https://opencode.ai/workspace/<wrk_id>[/...]`)抽 workspace id。
+/// 取 `/workspace/` 后到下一个 `/` `?` `#` 之间的段;查 Go 套餐用量端点 `/workspace/<id>/go` 需要它。
+fn extract_workspace_id(url: &str) -> Option<String> {
+    let marker = "/workspace/";
+    let start = url.find(marker)? + marker.len();
+    let rest = &url[start..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let id = &rest[..end];
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// 打开内嵌登录窗,轮询抓 `opencode.ai` 域的 session cookie + workspace id。
+/// - `Ok(Some((cookie, workspace_id)))`:登录成功,`cookie`=拼好的 `Cookie:` 头(opencode.ai 域全部
+///   cookie),`workspace_id`=控制台 URL 里的 `wrk_...`(抓不到则 None;供查 Go 用量端点)。
 /// - `Ok(None)`:用户关窗 / 超时未完成(非错误,前端显「未登录」不弹错)。
 /// - `Err(_)`:真错误(开窗失败 / AppHandle 未初始化)。
-pub async fn login_and_capture() -> Result<Option<String>, String> {
+pub async fn login_and_capture() -> Result<Option<(String, Option<String>)>, String> {
     let app = APP_HANDLE.get().ok_or("AppHandle 未初始化")?.clone();
 
     // 防连点:已有同名登录窗先关掉重开。
@@ -127,14 +137,16 @@ pub async fn login_and_capture() -> Result<Option<String>, String> {
                 .map(|c| c.name())
                 .collect();
             let header = parts.join("; ");
+            let workspace_id = extract_workspace_id(&cur_url);
             tracing::info!(
                 parts = parts.len(),
                 names = ?names,
+                workspace_id = ?workspace_id,
                 url = %cur_url,
                 "[OpenCode] 已捕获 session cookie,关闭登录窗"
             );
             close_win(&app);
-            return Ok(Some(header));
+            return Ok(Some((header, workspace_id)));
         }
     }
 }
