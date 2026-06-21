@@ -78,6 +78,35 @@ export function themeDeleteCustom() {
 export function restartCodexApp() {
   return api('POST', '/api/desktop/restart-codex-app')
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// [CAT-255] 导入/恢复其他工具(cc-switch 等)留下的隔离会话(第三方 model_provider)。
+// import/restore 写 Codex 独占 state DB → 后端负责先关 Codex、写完自动重启。
+export interface ForeignSession {
+  id: string
+  modelProvider: string
+  cwd: string
+  title: string
+  rolloutPath: string
+}
+/** 扫出第三方 model_provider 的会话(只读,Codex 运行时也安全)。 */
+export function detectForeignSessions() {
+  return api<{ count: number; sessions: ForeignSession[] }>(
+    'GET',
+    '/api/codex-sessions/detect-foreign',
+  )
+}
+/** 全部第三方会话就地归一成 openai(transfer 可见);后端关 Codex→写→重启。 */
+export function importForeignSessions() {
+  return api<{ imported: number; codexRelaunched: boolean }>('POST', '/api/codex-sessions/import')
+}
+/** 把选中会话的 model_provider 写回指定值(其他工具可见);后端关 Codex→写→重启。 */
+export function restoreForeignSessions(sessionIds: string[], modelProvider: string) {
+  return api<{ imported: number; codexRelaunched: boolean }>('POST', '/api/codex-sessions/restore', {
+    sessionIds,
+    modelProvider,
+  })
+}
 // 在系统文件管理器打开 Codex 原配置快照目录(~/.codex-app-transfer/codex-snapshots/active/)
 export function openSnapshotDir() {
   return api('POST', '/api/desktop/open-snapshot-dir')

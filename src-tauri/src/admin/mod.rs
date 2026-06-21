@@ -178,6 +178,19 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/conversations/clear-all",
             post(handlers::conversations::clear_all_handler),
         )
+        // [CAT-255] 导入/恢复其他工具留下的隔离会话(第三方 model_provider 就地双向归一)。
+        .route(
+            "/api/codex-sessions/detect-foreign",
+            get(handlers::codex_sessions::detect_foreign_handler),
+        )
+        .route(
+            "/api/codex-sessions/import",
+            post(handlers::codex_sessions::import_handler),
+        )
+        .route(
+            "/api/codex-sessions/restore",
+            post(handlers::codex_sessions::restore_handler),
+        )
         // Token usage stats (#279, ccusage-vendored)
         .route("/api/usage/summary", get(handlers::usage::usage_summary))
         .route(

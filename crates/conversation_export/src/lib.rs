@@ -20,6 +20,7 @@ pub mod export;
 pub mod list;
 pub mod parse;
 pub mod redact;
+pub mod repair;
 pub mod trash_ops;
 pub mod types;
 
@@ -27,6 +28,10 @@ pub use export::{export_json, export_markdown, read_raw_jsonl, write_bulk_zip};
 pub use list::{list_sessions, read_session_index_titles};
 pub use parse::parse_session;
 pub use redact::redact_secrets;
+pub use repair::{
+    detect_foreign_sessions, import_foreign_sessions, set_sessions_provider, ForeignSession,
+    RepairFailure, RepairResult,
+};
 pub use trash_ops::{move_all_sessions_to_trash, move_sessions_to_trash, TrashResult};
 pub use types::{
     ExportFormat, ExportOptions, NormalizedSession, RolloutKind, SessionMeta, Turn, TurnItem,
@@ -44,4 +49,7 @@ pub enum ExportError {
     Zip(#[from] zip::result::ZipError),
     #[error("session not found: {0}")]
     NotFound(String),
+    /// [CAT-255] 读/写 Codex `state_<N>.sqlite`(threads 表)失败。
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }

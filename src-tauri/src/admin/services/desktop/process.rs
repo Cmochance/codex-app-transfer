@@ -648,6 +648,24 @@ pub fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
     open_codex_app(platform)
 }
 
+/// [CAT-255] 退出 Codex.app 并阻塞到退出确认 + launchd grace —— 给「必须在 Codex
+/// 关闭时做」的维护操作(如就地改它独占的 `state_<N>.sqlite`)用。返回调用前 Codex
+/// 是否在运行,供调用方决定维护完是否需要重启。退出失败回 `Err`(调用方据此中止、
+/// **绝不在 Codex 可能运行时写它的 DB**)。
+pub fn quit_codex_app_blocking(platform: &str) -> Result<bool, String> {
+    let was_running = is_codex_app_running(platform);
+    quit_codex_app_with_retries(platform)?;
+    if was_running {
+        std::thread::sleep(POST_QUIT_LAUNCHD_GRACE);
+    }
+    Ok(was_running)
+}
+
+/// [CAT-255] 启动 Codex.app —— `quit_codex_app_blocking` 维护完后重新拉起用。
+pub fn launch_codex_app(platform: &str) -> Result<(), String> {
+    open_codex_app(platform)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

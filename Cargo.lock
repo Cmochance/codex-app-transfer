@@ -956,6 +956,7 @@ name = "codex-app-transfer-conversation-export"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

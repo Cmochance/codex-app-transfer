@@ -7,6 +7,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { exportConfig, importConfig, type Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
+import { useSessionImport } from '@/composables/useSessionImport'
 import { clearAllConversations } from '@/api/codex'
 import { useMcpRecovery } from '@/composables/useMcpRecovery'
 import { getAppVersion, checkAppUpdate, installAppUpdate, openExternalUrl } from '@/api/system'
@@ -83,6 +84,30 @@ async function onClearSessionHistory() {
   } finally {
     clearingSessions.value = false
   }
+}
+
+// CAT-255:导入/恢复其他工具留下的隔离会话(第三方 model_provider)。
+const sessionImport = useSessionImport()
+const restoreOpen = ref(false)
+const restoreProvider = ref('')
+// 「导入」按钮:扫第三方 → 有则确认弹窗[关闭Codex]导入成 openai
+function onImportSessions() {
+  void sessionImport.importFromSettings()
+}
+// 「恢复」按钮:先扫(刷新记录)→ 有记录的 provider 才开下拉弹窗
+async function onRestoreSessions() {
+  await sessionImport.detect()
+  if (sessionImport.providers.value.length === 0) {
+    toast(t('settings.sessionRestoreEmpty'))
+    return
+  }
+  restoreProvider.value = sessionImport.providers.value[0]
+  restoreOpen.value = true
+}
+// 弹窗里选好 provider、点「关闭Codex」→ 写回 → 关弹窗
+async function onRestoreConfirm() {
+  await sessionImport.restore(restoreProvider.value)
+  restoreOpen.value = false
 }
 
 onMounted(() => {
@@ -644,8 +669,22 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       >
         <AppButton
           size="sm"
+          variant="secondary"
+          :label="t('settings.sessionRestoreBtn')"
+          :disabled="sessionImport.busy.value"
+          @click="onRestoreSessions"
+        />
+        <AppButton
+          size="sm"
+          variant="secondary"
+          :label="t('settings.sessionImportBtn')"
+          :disabled="sessionImport.busy.value"
+          @click="onImportSessions"
+        />
+        <AppButton
+          size="sm"
           variant="danger"
-          :label="t('settings.sessionHistoryClear')"
+          :label="t('settings.sessionClearBtn')"
           :disabled="clearingSessions"
           @click="onClearSessionHistory"
         />
@@ -765,6 +804,30 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
             :label="t('settings.installUpdate')"
             :disabled="installing"
             @click="confirmInstall"
+          />
+        </div>
+      </div>
+    </AppModal>
+
+    <!-- CAT-255:恢复会话到其他工具 —— 下拉选 model_provider,确认即关 Codex 写回再重启 -->
+    <AppModal
+      v-if="restoreOpen"
+      :title="t('settings.sessionRestoreTitle')"
+      @close="restoreOpen = false"
+    >
+      <div class="chrome-dl">
+        <p class="chrome-dl__desc">{{ t('settings.sessionRestoreMessage') }}</p>
+        <AppSelect
+          v-model="restoreProvider"
+          :options="sessionImport.providers.value.map((p) => ({ value: p, label: p }))"
+        />
+        <div class="chrome-dl__actions">
+          <AppButton variant="ghost" :label="t('common.cancel')" @click="restoreOpen = false" />
+          <AppButton
+            variant="primary"
+            :label="t('settings.sessionImportConfirmBtn')"
+            :disabled="sessionImport.busy.value"
+            @click="onRestoreConfirm"
           />
         </div>
       </div>

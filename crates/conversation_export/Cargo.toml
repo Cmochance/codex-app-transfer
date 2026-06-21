@@ -19,6 +19,9 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 trash = "5"
 # [MOC-214] 检测到 Codex 冷压缩 rollout(.jsonl.zst)时一次性 warn(检测哨)。
 tracing = "0.1"
+# [CAT-255] 读/写 Codex `~/.codex/state_<N>.sqlite`(threads 表)做隔离会话导入/恢复。
+# bundled = 静态编译 SQLite,无需系统 libsqlite3(与 crates/adapters 同款)。
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

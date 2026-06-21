@@ -7,6 +7,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAppearance } from '@/composables/useAppearance'
 import { useFont } from '@/composables/useFont'
 import { useMcpRecovery } from '@/composables/useMcpRecovery'
+import { useSessionImport } from '@/composables/useSessionImport'
 import { setLocale } from '@/i18n'
 
 // 字体偏好(localStorage)启动即应用 — 顶层调用触发模块级 applyFamily/applySize
@@ -26,6 +27,13 @@ onMounted(async () => {
   const mcp = useMcpRecovery()
   await mcp.refresh()
   if (mcp.pending.value > 0) mcp.openModal()
+
+  // CAT-255:启动检测其他工具(cc-switch 等)留下的隔离会话(第三方 model_provider),
+  // 有则弹窗问是否导入(确认即关 Codex→归一→重启)。放在最后,避免导入重启 Codex 跟
+  // 上面的 hydrate 抢节奏。
+  const si = useSessionImport()
+  const foreign = await si.detect()
+  if (foreign > 0) await si.promptImport(foreign)
 })
 </script>
 
