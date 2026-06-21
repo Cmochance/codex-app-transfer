@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // Codex Desktop 主题注入页 — 移植旧 app.js renderTheme + bindThemeEvents(#264 / MOC-102)。
-// 主题 grid + 选中/隐藏/删除/上传(1:1 crop)+ 徽章派生(绝不暴露 raw CDP 502)+ 重启对话框。
+// 主题 grid + 选中/隐藏/删除/上传(16:9 crop)+ 徽章派生(绝不暴露 raw CDP 502)+ 重启对话框。
 import { computed, onMounted, ref, watch } from 'vue'
 import { i18nState, t, tFmt } from '@/i18n'
 import { useSettingsStore } from '@/stores/settings'
@@ -16,14 +16,17 @@ import {
   themeDeleteCustom,
   restartCodexApp,
   type ThemeEntry,
+  type PaletteOverride,
 } from '@/api/desktop'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import ThemeCropModal from '@/components/codex/ThemeCropModal.vue'
+import ThemePaletteModal from '@/components/codex/ThemePaletteModal.vue'
 import IconChevronLeft from '~icons/lucide/chevron-left'
 import IconRefreshCw from '~icons/lucide/refresh-cw'
 import IconPlus from '~icons/lucide/plus'
+import IconPalette from '~icons/lucide/palette'
 
 const store = useSettingsStore()
 const { show: toast } = useToast()
@@ -32,6 +35,16 @@ const themes = ref<ThemeEntry[]>([])
 const badge = ref('')
 const cropSrc = ref<string | null>(null)
 const showRestart = ref(false)
+// [MOC-272] 正在编辑调色盘的主题(null = 未开);预制(非 custom)供「复用调色盘」选取。
+const paletteTarget = ref<ThemeEntry | null>(null)
+const presets = computed(() => themes.value.filter((th) => th.id !== 'custom'))
+// 当前编辑主题已持久化的 raw override(传给编辑器做 merge,保留未触碰的既有覆盖)。
+const paletteOverride = computed<PaletteOverride | undefined>(() => {
+  const id = paletteTarget.value?.id
+  const m = store.settings.themePaletteOverrides
+  if (!id || !m || typeof m !== 'object') return undefined
+  return ((m as Record<string, unknown>)[id] as PaletteOverride) || undefined
+})
 
 // 背景全图 on-demand 下载:正在下载的主题 id + 进度(0-100),给缩略图渲染白蒙版 + 进度环。
 const downloadingId = ref<string | null>(null)
@@ -300,7 +313,7 @@ async function onDelete(themeId: string, isCustom: boolean) {
   }
 }
 
-// 上传 / 替换:file picker → readAsDataURL → 打开 1:1 crop 弹窗。
+// 上传 / 替换:file picker → readAsDataURL → 打开 16:9 crop 弹窗。
 function openUpload() {
   const input = document.createElement('input')
   input.type = 'file'
@@ -338,9 +351,56 @@ async function onCropConfirm(dataUri: string) {
     toast(t('theme.uploadOk'))
     await loadThemes()
     await pickTheme('custom')
+    // [MOC-272] 上传后引导设调色盘(可复用预制 或 自定义);取消 = 保持中性默认。
+    const custom = themes.value.find((th) => th.id === 'custom')
+    if (custom) paletteTarget.value = custom
   } catch (e) {
     toast(`${t('theme.uploadFailed')}: ${errMsg(e)}`, 'error')
   }
+}
+
+// [MOC-272] 调色盘:存 / 还原都落 settings.themePaletteOverrides + 若该主题正注入则重注入生效。
+function currentOverrides(): Record<string, unknown> {
+  const cur = store.settings.themePaletteOverrides
+  return cur && typeof cur === 'object' ? { ...(cur as Record<string, unknown>) } : {}
+}
+// palette 改动只需重刷 CSS,bg 已缓存 → 走 themeApply(不必 applyWithProgress 的下载进度轮询)。
+async function reinjectIfActive(themeId: string) {
+  if (enabledModel.value && selectedId.value === themeId) {
+    try {
+      await themeApply(themeId)
+    } catch {
+      await promptRestart()
+    }
+  }
+}
+// save / reset 共用:改 overrides map → 落盘 → 重拉列表 → 该主题正注入则重注入。
+async function persistOverrides(
+  themeId: string,
+  mutate: (map: Record<string, unknown>) => void,
+  okMsg: string,
+) {
+  paletteTarget.value = null
+  try {
+    const map = currentOverrides()
+    mutate(map)
+    await store.save({ themePaletteOverrides: map })
+    await loadThemes()
+    await reinjectIfActive(themeId)
+    toast(okMsg)
+  } catch (e) {
+    toast(`${t('theme.saveFailed')}: ${errMsg(e)}`, 'error')
+  }
+}
+async function onPaletteSave(override: PaletteOverride) {
+  const target = paletteTarget.value
+  if (!target) return
+  await persistOverrides(target.id, (map) => (map[target.id] = override), t('theme.paletteSaved'))
+}
+async function onPaletteReset() {
+  const target = paletteTarget.value
+  if (!target) return
+  await persistOverrides(target.id, (map) => delete map[target.id], t('theme.paletteResetDone'))
 }
 
 async function onRestoreHidden() {
@@ -425,6 +485,9 @@ async function onRestartChoice(choice: 'now' | 'later') {
             @click.stop="openUpload"
             >{{ t('theme.replace') }}</span
           >
+          <span class="card-pal" :title="t('theme.paletteEdit')" @click.stop="paletteTarget = th">
+            <IconPalette />
+          </span>
           <span
             class="card-del"
             :title="th.id === 'custom' ? t('common.delete') : t('theme.hide')"
@@ -474,6 +537,16 @@ async function onRestartChoice(choice: 'now' | 'later') {
     </section>
 
     <ThemeCropModal v-if="cropSrc" :src="cropSrc" @confirm="onCropConfirm" @cancel="cropSrc = null" />
+
+    <ThemePaletteModal
+      v-if="paletteTarget"
+      :entry="paletteTarget"
+      :presets="presets"
+      :override="paletteOverride"
+      @save="onPaletteSave"
+      @reset="onPaletteReset"
+      @close="paletteTarget = null"
+    />
 
     <AppModal v-if="showRestart" :title="t('theme.savedTitle')" @close="onRestartChoice('later')">
       <p class="restart-body">{{ t('theme.savedPendingRestart') }}</p>
@@ -670,7 +743,7 @@ async function onRestartChoice(choice: 'now' | 'later') {
 .card-replace {
   position: absolute;
   top: 6px;
-  right: 34px;
+  right: 60px;
   z-index: 3;
   background: rgba(0, 0, 0, 0.55);
   color: #fff;
@@ -678,6 +751,25 @@ async function onRestartChoice(choice: 'now' | 'later') {
   padding: 1px 7px;
   border-radius: var(--radius-sm);
   cursor: pointer;
+}
+.card-pal {
+  position: absolute;
+  top: 6px;
+  right: 34px;
+  z-index: 3;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+}
+.card-pal svg {
+  width: 12px;
+  height: 12px;
 }
 .card-del {
   position: absolute;

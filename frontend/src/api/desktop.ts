@@ -6,12 +6,32 @@ import { api } from './http'
 // ───────────────────────────────────────────────────────────────────────────
 // Theme(Codex Desktop 皮肤注入,/api/desktop/theme/*)
 // ───────────────────────────────────────────────────────────────────────────
+// [MOC-272] 精选关键色调色板(后端 effective_curated_palette;编辑器回显 + 编辑)。
+// 颜色为 `#rrggbb`;accent "" = 跟随 Codex 原生蓝;scrim null = 跟随基底(滑块给默认起点)。
+export interface CuratedPalette {
+  accent: string
+  ink: string
+  baseColor: string
+  surface: string
+  scrim: number | null
+}
 export interface ThemeEntry {
   id: string
   displayNameZh: string
   displayNameEn: string
   hasMascot: boolean
   previewDataUri: string
+  palette: CuratedPalette
+}
+
+// [MOC-272] 用户对某主题的 palette override(精选关键色,字段可空 = 不覆盖)。
+// 持久化在 settings.themePaletteOverrides[themeId];删除整个 themeId = 还原初始。
+export interface PaletteOverride {
+  accent?: string
+  ink?: string
+  baseColor?: string
+  surface?: string
+  scrim?: number
 }
 
 // ⚠️ serde externally-tagged(PascalCase,**绝不能改 camelCase**,PR#265 踩过):

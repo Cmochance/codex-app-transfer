@@ -114,6 +114,151 @@ pub struct ThemeMeta {
     pub palette: Palette,
 }
 
+// ---- [MOC-272] 调色板用户覆盖(palette override)----
+// 精选关键色:accent / ink / base_color / surface(→ 派生 glass 玻璃层)/ scrim(0-100 蒙版深浅)。
+// 持久化在 config `settings.themePaletteOverrides[themeId]`(前端经通用 settings save 写、apply 时读)。
+// 颜色一律 `#rrggbb`(取色器输出),render 前 sanitize 丢弃非法值 → 天然防 CSS 注入(无反引号)。
+
+/// 用户对某主题调色板的覆盖(精选关键色)。字段可空 = 不覆盖、回落编译期基底;
+/// 删除整个 themeId 的 override = 还原初始调色板。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteOverride {
+    pub accent: Option<String>,
+    pub ink: Option<String>,
+    pub base_color: Option<String>,
+    pub surface: Option<String>,
+    /// 蒙版(scrim)深浅 0-100,生成黑色三层渐变;None = 用基底 scrim。
+    pub scrim: Option<u8>,
+}
+
+impl PaletteOverride {
+    /// 丢弃非法 `#rrggbb` 颜色 + clamp scrim;全空返 None(= 无有效覆盖)。
+    fn sanitized(self) -> Option<PaletteOverride> {
+        let keep = |c: Option<String>| c.filter(|s| is_hex_color(s));
+        let ov = PaletteOverride {
+            accent: keep(self.accent),
+            ink: keep(self.ink),
+            base_color: keep(self.base_color),
+            surface: keep(self.surface),
+            scrim: self.scrim.map(|v| v.min(100)),
+        };
+        let empty = ov.accent.is_none()
+            && ov.ink.is_none()
+            && ov.base_color.is_none()
+            && ov.surface.is_none()
+            && ov.scrim.is_none();
+        if empty {
+            None
+        } else {
+            Some(ov)
+        }
+    }
+}
+
+/// 前端调色盘编辑器回显用:某主题**有效**精选调色板(覆盖优先,否则基底,转成取色器要的 `#rrggbb`)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CuratedPalette {
+    /// "" = 不覆盖强调色(跟随 Codex 原生蓝)。
+    pub accent: String,
+    pub ink: String,
+    pub base_color: String,
+    pub surface: String,
+    /// None = 跟随基底 scrim(编辑器滑块给默认起点)。
+    pub scrim: Option<u8>,
+}
+
+fn is_hex_color(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn hex_to_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim();
+    if !is_hex_color(s) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&s[1..3], 16).ok()?,
+        u8::from_str_radix(&s[3..5], 16).ok()?,
+        u8::from_str_radix(&s[5..7], 16).ok()?,
+    ))
+}
+fn rgba(r: u8, g: u8, b: u8, a: f32) -> String {
+    format!("rgba({r},{g},{b},{a:.3})")
+}
+/// 基底的 `rgba(r,g,b,a)` / `rgb(...)` / `#rrggbb` 取 RGB 转 `#rrggbb`(编辑器回显;丢 alpha)。
+fn color_to_hex(s: &str) -> String {
+    let s = s.trim();
+    if is_hex_color(s) {
+        return s.to_lowercase();
+    }
+    if let Some(inner) = s.strip_prefix("rgba(").or_else(|| s.strip_prefix("rgb(")) {
+        let nums: Vec<u8> = inner
+            .trim_end_matches(')')
+            .split(',')
+            .take(3)
+            .filter_map(|p| {
+                p.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .map(|f| f.round().clamp(0.0, 255.0) as u8)
+            })
+            .collect();
+        if nums.len() == 3 {
+            return format!("#{:02x}{:02x}{:02x}", nums[0], nums[1], nums[2]);
+        }
+    }
+    "#000000".to_string()
+}
+
+/// 从 config Value 解析 + sanitize 一个 palette override。
+pub fn parse_override(v: &serde_json::Value) -> Option<PaletteOverride> {
+    serde_json::from_value::<PaletteOverride>(v.clone())
+        .ok()?
+        .sanitized()
+}
+
+/// 读 config 里某主题的 palette override(已 sanitize)。无 / 非法 → None。
+pub fn palette_override_for(theme_id: &str) -> Option<PaletteOverride> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    parse_override(
+        cfg.get("settings")?
+            .get("themePaletteOverrides")?
+            .get(theme_id)?,
+    )
+}
+
+/// 从 `rgba(r,g,b,a)` 取 alpha(把基底 scrim 反推成编辑器 0-100 用)。
+fn rgba_alpha(s: &str) -> Option<f32> {
+    let inner = s.trim().strip_prefix("rgba(")?.trim_end_matches(')');
+    inner.split(',').nth(3)?.trim().parse::<f32>().ok()
+}
+
+/// 基底 + override → 有效精选调色板(纯函数无 IO,供 `theme/list` 一次 load 后逐主题 map)。
+pub fn curated_from(base: &Palette, ov: Option<&PaletteOverride>) -> CuratedPalette {
+    CuratedPalette {
+        // accent 保留空串语义("" = 原生蓝),不走 color_to_hex(那会变 #000000)。
+        accent: ov
+            .and_then(|o| o.accent.clone())
+            .unwrap_or_else(|| base.accent.to_string()),
+        ink: ov
+            .and_then(|o| o.ink.clone())
+            .unwrap_or_else(|| color_to_hex(base.ink)),
+        base_color: ov
+            .and_then(|o| o.base_color.clone())
+            .unwrap_or_else(|| color_to_hex(base.base_color)),
+        surface: ov
+            .and_then(|o| o.surface.clone())
+            .unwrap_or_else(|| color_to_hex(base.surface)),
+        // scrim:override 优先;否则从基底 scrim_bot alpha 反推 0-100(我方公式 bot = f*0.62)→
+        // 让「复用预制」也能带上该预制的蒙版深浅(/code-review #4)。
+        scrim: ov.and_then(|o| o.scrim).or_else(|| {
+            rgba_alpha(base.scrim_bot).map(|a| ((a / 0.62) * 100.0).round().clamp(0.0, 100.0) as u8)
+        }),
+    }
+}
+
 /// 自定义主题资源目录:`~/.codex-app-transfer/themes/custom/`。
 pub fn custom_theme_dir() -> Option<std::path::PathBuf> {
     codex_app_transfer_registry::paths::resolve_home()
@@ -133,24 +278,37 @@ pub fn custom_theme_exists() -> bool {
     custom_bg_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// User 上传图 bytes(JPG / PNG)→ **中心 crop 方形**(safety net:正常路径前端
-/// `openCropModal` 已 1:1 crop,这里 crop 已是方图时 no-op;兜底直接 POST raw
-/// image 不走 modal 的场景)→ resize 到 max 2048(节约 disk + base64 体积)→
-/// JPEG 90% 写 `bg.jpg`;同步生成 640px preview 写 `preview.jpg`。写入用 .tmp
-/// + rename 原子化避免半截文件。
+/// User 上传图 bytes(JPG / PNG)→ **16:9 中心裁切**(正常路径前端已 16:9,这里对齐;raw POST
+/// 非 16:9 图归一化,/code-review #6)→ 等比缩到宽 ≤2048(**只缩不放**,小图保原分辨率避免糊,
+/// /code-review #5)→ JPEG 90% 写 `bg.jpg`;同步生成 16:9 preview 写 `preview.jpg`。写入用
+/// .tmp + rename 原子化避免半截文件。
 pub fn save_custom_theme(image_bytes: &[u8]) -> Result<(), String> {
     use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView};
 
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| format!("无法解析图片(请用 JPG 或 PNG): {e}"))?;
-    let (w, h) = img.dimensions();
-    let side = w.min(h);
-    let x = (w - side) / 2;
-    let y = (h - side) / 2;
-    let cropped = img.crop_imm(x, y, side, side);
 
-    let bg = cropped.resize(2048, 2048, FilterType::Lanczos3);
-    let preview = cropped.resize(640, 640, FilterType::Lanczos3);
+    // 16:9 中心裁切:太宽裁宽、太高裁高。
+    const RATIO: f32 = 16.0 / 9.0;
+    let (w, h) = img.dimensions();
+    let (cw, ch) = if w as f32 / h as f32 > RATIO {
+        (((h as f32) * RATIO).round() as u32, h)
+    } else {
+        (w, ((w as f32) / RATIO).round() as u32)
+    };
+    let cropped = img.crop_imm((w - cw) / 2, (h - ch) / 2, cw.max(1), ch.max(1));
+
+    // 只缩不放:宽 >2048 才缩(resize 保比例 fit 2048×2048 → 16:9 得 2048×1152);否则保原图。
+    let bg = if cw > 2048 {
+        cropped.resize(2048, 2048, FilterType::Lanczos3)
+    } else {
+        cropped.clone()
+    };
+    let preview = if cw > 640 {
+        cropped.resize(640, 640, FilterType::Lanczos3)
+    } else {
+        cropped.clone()
+    };
 
     let dir = custom_theme_dir().ok_or_else(|| "无法解析 home 目录".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
@@ -562,7 +720,7 @@ pub fn all_themes() -> Vec<ThemeMeta> {
             display_name_en: "Custom",
             has_mascot: false,
             bg_fit: "cover",
-            bg_position: "center top",
+            bg_position: "center",
             palette: NEUTRAL_PALETTE,
         });
     }
@@ -1220,41 +1378,92 @@ html button[data-testid="composer-send-button"]:not(:disabled) svg,html .compose
 ::selection{background:color-mix(in srgb,var(--cl-accent) 30%,transparent);}"#;
 
 /// Fill [`CODEX_CSS_TEMPLATE`] from a theme's [`Palette`] + background data URI.
-fn render_theme_css(meta: Option<&ThemeMeta>, bg: &str) -> String {
+fn render_theme_css(meta: Option<&ThemeMeta>, bg: &str, ov: Option<&PaletteOverride>) -> String {
     let (p, pos, fit) = match meta {
         Some(m) => (&m.palette, m.bg_position, m.bg_fit),
         None => (&NEUTRAL_PALETTE, "center top", "cover"),
     };
-    let accent_block = if p.accent.is_empty() {
+    // [MOC-272] 精选关键色:override 优先,否则基底常量。非精选角色(ink2-4 / border* / blur /
+    // hover / selection)恒用基底。颜色已 sanitize 为 `#rrggbb`,无反引号 → 安全嵌入 CSS。
+    let ink = ov
+        .and_then(|o| o.ink.as_deref())
+        .unwrap_or(p.ink)
+        .to_string();
+    let base_color = ov
+        .and_then(|o| o.base_color.as_deref())
+        .unwrap_or(p.base_color)
+        .to_string();
+    // accent:override 设则 accent/soft/focus 同色(启用 accent block);否则用基底三件。
+    let (accent, accent_soft, focus) = match ov.and_then(|o| o.accent.as_deref()) {
+        Some(a) => (a.to_string(), a.to_string(), a.to_string()),
+        None => (
+            p.accent.to_string(),
+            p.accent_soft.to_string(),
+            p.focus.to_string(),
+        ),
+    };
+    // surface:override(hex)派生 surface + 3 层 glass(沿用 NEUTRAL 的 alpha 梯度,玻璃层一致);否则基底。
+    let (surface, glass, glass_soft, glass_strong) =
+        match ov.and_then(|o| o.surface.as_deref()).and_then(hex_to_rgb) {
+            Some((r, g, b)) => (
+                rgba(r, g, b, 0.50),
+                rgba(r, g, b, 0.60),
+                rgba(r, g, b, 0.52),
+                rgba(r, g, b, 0.78),
+            ),
+            None => (
+                p.surface.to_string(),
+                p.glass.to_string(),
+                p.glass_soft.to_string(),
+                p.glass_strong.to_string(),
+            ),
+        };
+    // scrim:override(0-100)→ 黑色三层渐变(深浅);否则基底三件。
+    let (scrim_top, scrim_mid, scrim_bot) = match ov.and_then(|o| o.scrim) {
+        Some(v) => {
+            let f = (v.min(100) as f32) / 100.0;
+            (
+                rgba(0, 0, 0, f * 0.26),
+                rgba(0, 0, 0, f * 0.40),
+                rgba(0, 0, 0, f * 0.62),
+            )
+        }
+        None => (
+            p.scrim_top.to_string(),
+            p.scrim_mid.to_string(),
+            p.scrim_bot.to_string(),
+        ),
+    };
+    let accent_block = if accent.is_empty() {
         String::new()
     } else {
         CODEX_ACCENT_BLOCK
-            .replace("__ACCENT_SOFT__", p.accent_soft)
-            .replace("__FOCUS__", p.focus)
-            .replace("__ACCENT__", p.accent)
+            .replace("__ACCENT_SOFT__", &accent_soft)
+            .replace("__FOCUS__", &focus)
+            .replace("__ACCENT__", &accent)
     };
     CODEX_CSS_TEMPLATE
         .replace("__HERO__", bg)
-        .replace("__BASECOLOR__", p.base_color)
+        .replace("__BASECOLOR__", &base_color)
         .replace("__POS__", pos)
         .replace("__FIT__", fit)
         .replace("__INK2__", p.ink2)
         .replace("__INK3__", p.ink3)
         .replace("__INK4__", p.ink4)
-        .replace("__INK__", p.ink)
-        .replace("__SURFACE__", p.surface)
-        .replace("__GLASS_STRONG__", p.glass_strong)
-        .replace("__GLASS_SOFT__", p.glass_soft)
-        .replace("__GLASS__", p.glass)
+        .replace("__INK__", &ink)
+        .replace("__SURFACE__", &surface)
+        .replace("__GLASS_STRONG__", &glass_strong)
+        .replace("__GLASS_SOFT__", &glass_soft)
+        .replace("__GLASS__", &glass)
         .replace("__BORDER_STRONG__", p.border_strong)
         .replace("__BORDER_SOFT__", p.border_soft)
         .replace("__BORDER__", p.border)
         .replace("__BLUR__", p.blur)
         .replace("__HOVER__", p.hover)
         .replace("__SELECTION__", p.selection)
-        .replace("__SCRIM_TOP__", p.scrim_top)
-        .replace("__SCRIM_MID__", p.scrim_mid)
-        .replace("__SCRIM_BOT__", p.scrim_bot)
+        .replace("__SCRIM_TOP__", &scrim_top)
+        .replace("__SCRIM_MID__", &scrim_mid)
+        .replace("__SCRIM_BOT__", &scrim_bot)
         .replace("__ACCENT_BLOCK__", &accent_block)
 }
 
@@ -1263,7 +1472,10 @@ fn render_theme_css(meta: Option<&ThemeMeta>, bg: &str) -> String {
 fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
     let metas = all_themes();
     let meta = metas.iter().find(|m| m.id == theme_id);
-    let css = render_theme_css(meta, &assets.bg_data_uri);
+    // [MOC-272] 注入时读该主题的用户 palette override(config settings.themePaletteOverrides),
+    // 合并到基底再渲 CSS。无 override → 完全用编译期基底(= 还原初始)。
+    let ov = palette_override_for(theme_id);
+    let css = render_theme_css(meta, &assets.bg_data_uri, ov.as_ref());
 
     let mascot_block = match &assets.mascot_data_uri {
         Some(m) => format!(
@@ -1491,9 +1703,60 @@ mod tests {
             assert!(script.contains(accent), "{id} missing its accent {accent}");
         }
         // accent-less custom theme omits the accent block (keeps native blue)
-        let custom_css = render_theme_css(None, "data:image/jpeg;base64,AA==");
+        let custom_css = render_theme_css(None, "data:image/jpeg;base64,AA==", None);
         assert!(!custom_css.contains("composer-send-button"));
         assert!(custom_css.contains("--cl-surface"));
+    }
+
+    #[test]
+    fn render_applies_palette_override() {
+        // [MOC-272] override 的精选关键色合并进 CSS。
+        let metas = all_themes();
+        let carton = metas.iter().find(|m| m.id == "carton").unwrap();
+        let ov = PaletteOverride {
+            accent: Some("#abcdef".into()),
+            ink: Some("#123456".into()),
+            base_color: None,
+            surface: Some("#0a0b0c".into()),
+            scrim: Some(50),
+        };
+        let css = render_theme_css(Some(carton), "data:,x", Some(&ov));
+        assert!(
+            css.contains("--cl-accent:#abcdef"),
+            "override accent applied"
+        );
+        assert!(css.contains("#123456"), "override ink applied");
+        // surface(#0a0b0c = 10,11,12)派生玻璃层(带 alpha 梯度)。
+        assert!(
+            css.contains("rgba(10,11,12,0.50"),
+            "override surface→glass derived"
+        );
+        // scrim=50 → 黑色半透明渐变(非基底 carton 的彩色 scrim)。
+        assert!(
+            css.contains("rgba(0,0,0,"),
+            "override scrim → black gradient"
+        );
+    }
+
+    #[test]
+    fn palette_override_sanitize_drops_invalid_and_empty() {
+        // [MOC-272] 非法 hex 丢弃、scrim clamp、全空 → None(= 还原)。
+        let ov = PaletteOverride {
+            accent: Some("red".into()),
+            ink: Some("#aabbcc".into()),
+            base_color: None,
+            surface: None,
+            scrim: Some(200),
+        }
+        .sanitized()
+        .unwrap();
+        assert!(ov.accent.is_none(), "invalid hex 'red' dropped");
+        assert_eq!(ov.ink.as_deref(), Some("#aabbcc"));
+        assert_eq!(ov.scrim, Some(100), "scrim clamped to 100");
+        assert!(
+            PaletteOverride::default().sanitized().is_none(),
+            "empty → None"
+        );
     }
 
     #[test]
