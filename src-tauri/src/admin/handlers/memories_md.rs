@@ -1,9 +1,9 @@
-//! `/api/codex/memories-md/*` — Codex CLI `~/.codex/memories/MEMORY.md` 受管块管理.
+//! `/api/codex/memories-md/*` — Codex CLI `~/.codex/memories/MEMORY.md` 的 raw 全文编辑 +
+//! history / backup / restore + 路径管理(Memories tab)。
 //!
-//! 跟 agents_md.rs 6 endpoints 完全对称, 差异只在 target_path + block_type。
-//! MEMORY.md 是 209k+ 层次化 markdown(`# Task Group → ## Task → ### subsections`),
-//! 跟 Claude Code MEMORY.md 索引模式一致 — app 通过 marker 区物理隔离,
-//! 永远不动用户长期积累的 209k 用户区。
+//! [MOC-261 二-2] 旧 marker「受管块」模式(status/preview/apply/rollback/clear + 未路由 history)
+//! 已删:改为整文件 raw 编辑 —— 用户在文本框里看得见 / 改得动整份 MEMORY.md,写盘前 snapshot 进
+//! history(`~/.codex-app-transfer/managed-history/memories.json`),app 不再做 marker 区物理隔离。
 
 use std::fs;
 use std::path::PathBuf;
