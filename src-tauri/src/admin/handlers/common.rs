@@ -143,9 +143,10 @@ pub async fn instance_show_window() -> Json<Value> {
     Json(json!({"success": true}))
 }
 
-// [MOC-261 二-5] 旧综合状态聚合端点 /api/status(common::status)已删:前端零引用、
-// 无内部调用方,被 /api/proxy/status + providers list + /api/desktop/* 分端点取代;
-// desktopHealth 能力未丢(desktop.rs 仍暴露)。共享 helper 全保留。
+// [MOC-261 二-5] 旧综合状态聚合端点 /api/status(common::status)已删:前端零引用、无内部调用方。
+// 它原是「检查 transfer 配置是否正确写入 Codex config」配置健康诊断(desktop_health 那套)的唯一消费方,
+// 该功能 UI 早已移除 → desktop_health + 4 个 helper(snapshot.rs)一并按死代码级联删除,无任何留存实现。
+// 仍被 apply 等用的 read_codex_toml_root_string 等共享 helper 保留。
 
 // ── /api/version ─────────────────────────────────────────────────────
 
