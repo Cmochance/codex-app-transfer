@@ -10,6 +10,8 @@
 use std::sync::OnceLock;
 
 use tauri::AppHandle;
+#[cfg(target_os = "macos")]
+use tauri::Manager;
 
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
@@ -28,7 +30,25 @@ pub fn apply(hidden: bool) {
         } else {
             tauri::ActivationPolicy::Regular
         };
+        // [MOC-271] **核心修复(bug1)**:`.accessory` 模式下 macOS **不会自动**把 app 的窗口带到前台
+        // —— 切到 `.accessory` 后若只做窗口级 `show()/set_focus()`,窗口会掉到其它 app 后面(「开 hideDock
+        // 当场掉后面」;别的隐藏-Dock 软件没这问题,是我们少了这一步)。正解:切完**显式做 app 级激活**
+        // (`activate_macos_app` = NSRunningApplication.activate(.activateAllWindows))把 app + 窗口一起带到
+        // 前台。保持 `.accessory`(Dock 仍隐藏),不切 `.regular`、不置顶。
+        // 参考 artlasovsky「Fine-Tuning macOS App Activation Behavior」:accessory app 靠显式 activate +
+        // makeKeyAndOrderFront(Tauri `set_focus` 内部即此)即可正常到前。
+        let was_visible = app
+            .get_webview_window("main")
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
         let _ = app.set_activation_policy(policy);
+        if was_visible {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            crate::activate_macos_app();
+        }
     }
     #[cfg(not(target_os = "macos"))]
     let _ = hidden;
