@@ -25,8 +25,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[allow(deprecated)]
-use super::constants::USER_AGENT;
 use super::constants::{detect_user_agent, CLOUD_CODE_BASE_URL, X_GOOG_API_CLIENT};
 
 #[derive(Debug, Error)]
@@ -861,6 +859,9 @@ mod tests {
     /// substring,改 exact set 风险高)。**未来 fix matcher 时这个测试会 fail —
     /// 那是 desired**,届时改测试用 expected exact-set 行为而不是 revert fix。
     #[test]
+    // 名字末尾 `_KNOWN_BRITTLE` 大写是**有意**的脆弱性标记(见上方 doc:锁定当前 buggy
+    // substring 行为给 future maintainer),不改成 snake_case。
+    #[allow(non_snake_case)]
     fn pick_tier_free_tier_substring_match_KNOWN_BRITTLE() {
         let cases = [
             // 正常 case

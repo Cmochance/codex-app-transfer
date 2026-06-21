@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::Query, response::Html, routing::get, Router};
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 
 use super::super::constants::{
     ANTIGRAVITY_CALLBACK_PORT, ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET,
-    ANTIGRAVITY_SCOPES, AUTH_ENDPOINT, REDIRECT_PATH, TOKEN_ENDPOINT,
+    ANTIGRAVITY_SCOPES, AUTH_ENDPOINT, TOKEN_ENDPOINT,
 };
 use super::super::flow::{FlowError, OauthFlowConfig};
 use super::super::token::OauthToken;

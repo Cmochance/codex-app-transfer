@@ -120,10 +120,10 @@ pub enum ConfigMutation<T> {
     Unchanged(T),
 }
 
-/// thread-local 守卫:进入 [`with_config_write`] 闭包时设 true,退出时还原。
-/// 用于检测 closure 内套调 with_config_write 的 reentrant deadlock —— std
-/// Mutex 同线程 re-lock 永久 hang(无 panic 无 timeout,UI 静默冻结)。本守卫
-/// 让 reentrant 立刻 panic 报告位置,silent hang → loud panic。
+// thread-local 守卫:进入 [`with_config_write`] 闭包时设 true,退出时还原。
+// 用于检测 closure 内套调 with_config_write 的 reentrant deadlock —— std
+// Mutex 同线程 re-lock 永久 hang(无 panic 无 timeout,UI 静默冻结)。本守卫
+// 让 reentrant 立刻 panic 报告位置,silent hang → loud panic。
 thread_local! {
     static IN_WITH_CONFIG_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
