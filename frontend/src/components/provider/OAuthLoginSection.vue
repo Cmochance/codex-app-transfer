@@ -14,7 +14,10 @@ import {
 } from '@/api/oauth'
 import AppButton from '@/components/ui/AppButton.vue'
 
-const props = defineProps<{ kind: OAuthKind }>()
+// providerId:仅 trae 这类「按 provider 条目隔离多账号」的 kind 需要(= 当前编辑的
+// provider id)。trae 登录 login-first:未保存(无 id)时登录写 pending,保存 provider 时
+// 由父表单 claim 绑定到新 id —— 无需先保存。其余 kind(zai/gemini/...)忽略 providerId。
+const props = defineProps<{ kind: OAuthKind; providerId?: string }>()
 const emit = defineEmits<{ change: [loggedIn: boolean] }>()
 const { show: toast } = useToast()
 
@@ -27,7 +30,7 @@ function errMsg(e: unknown): string {
 }
 async function refresh() {
   try {
-    status.value = await oauthStatus(props.kind)
+    status.value = await oauthStatus(props.kind, props.providerId)
     emit('change', !!status.value?.loggedIn)
   } catch {
     status.value = { loggedIn: false }
@@ -43,7 +46,10 @@ async function onLogin() {
     // 长阻塞:浏览器授权完成/取消才返回。部分上游(zai/bigmodel/google)登录失败时
     // 返回 HTTP 200 {loggedIn:false, error},api() 不抛 → 需显式读出 error 提示,
     // 否则失败看起来像无操作。
-    const res = (await oauthLogin(props.kind)) as { loggedIn?: boolean; error?: string } | null
+    const res = (await oauthLogin(props.kind, props.providerId)) as {
+      loggedIn?: boolean
+      error?: string
+    } | null
     if (res && res.loggedIn === false && res.error && !cancelled) {
       toast(res.error, 'error')
     }
@@ -64,7 +70,7 @@ async function onCancel() {
 }
 async function onLogout() {
   try {
-    await oauthLogout(props.kind)
+    await oauthLogout(props.kind, props.providerId)
     await refresh()
   } catch (e) {
     toast(errMsg(e), 'error')

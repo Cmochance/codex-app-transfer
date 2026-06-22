@@ -32,6 +32,7 @@ pub mod settings;
 pub mod skills_md;
 pub mod theme;
 pub mod trace_viewer;
+pub mod trae_oauth;
 pub mod update;
 pub mod usage;
 pub mod zai_oauth;

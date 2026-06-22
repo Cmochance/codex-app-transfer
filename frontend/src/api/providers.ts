@@ -35,6 +35,9 @@ const ICON_MAP: Record<string, IconSpec> = {
   anyrouter: { logo: 'assets/providers/anyrouter.png' },
   // OpenCode Go(opencode.ai)官方 favicon(深底白 O logo);无其它 provider 字符串含 opencode,无歧义
   opencode: { logo: 'assets/providers/opencode.svg' },
+  // Trae(字节 TRAE SOLO CN);id/baseUrl 含 trae,无其它 provider 含此串,无歧义。
+  // Phase 1 用 bootstrap 图标兜底(真实 logo 留 polish follow-up)。
+  trae: { icon: 'bi-lightning-charge-fill' },
 }
 
 // 逐字移植 computeIcon: 拼 id+name+baseUrl+apiFormat → normalize(_/空格→-)→ 子串匹配 ICON_MAP

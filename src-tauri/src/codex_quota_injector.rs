@@ -953,6 +953,42 @@ fn active_glm_provider() -> Option<(String, String)> {
     Some((host, api_key.to_string()))
 }
 
+/// [CAT-257] 活动 provider 是 Trae(authScheme=trae_oauth/trae 或 host 含 trae.cn/trae.ai)
+/// → `(provider id, api_host)`(含 scheme)。token 不在这里取——由 [`fetch_trae_quota`] 按
+/// provider id 走 `ensure_valid_trae_token`(含 refresh)。否则 None。
+fn active_trae_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+    let auth_scheme = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+    // host 匹配带点边界(`x == d || x.ends_with(".d")`),否则 `nottrae.cn` 会误判(review [2])。
+    let is_trae = matches!(auth_scheme, "trae_oauth" | "trae")
+        || host_of(base_url)
+            .map(|h| {
+                ["trae.cn", "trae.ai"]
+                    .iter()
+                    .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+            })
+            .unwrap_or(false);
+    if !is_trae {
+        return None;
+    }
+    // host 钉死从 edition config 取(不信任用户 baseUrl;与登录/forward 一致)。当前仅 CN。
+    let api_host = codex_app_transfer_gemini_oauth::TraeEdition::Cn
+        .config()
+        .api_host
+        .to_string();
+    Some((id, api_host))
+}
+
 /// [MOC-211] MiMo Token Plan 的额度源接线规格:host `xiaomimimo.com` + 路径含 `token-plan`
 /// (区分按量 MiMo `api.xiaomimimo.com`,它无订阅套餐额度);session cookie 存 `mimoCookie`。
 const MIMO_SOURCE_SPEC: crate::web_session_quota::QuotaSourceSpec =
@@ -1204,6 +1240,65 @@ async fn fetch_glm_quota(
         // 网络 / 5xx / 429 / 解析瞬时失败:仅同账号(指纹一致)留旧缓存 + 刷新时间戳;切了账号不回旧值。
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] GLM quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// [CAT-257] 取 Trae 额度(authScheme/host gate + 账号指纹 + 45s 缓存)。非 Trae provider /
+/// 未登录 / refresh 失效 → 清缓存 + None。token 走 `ensure_valid_trae_token`(临期自动续期 +
+/// 落盘),失败按 [`crate::trae_quota::QuotaError`] 分类(Auth=清缓存 / Transient=同账号留旧)。
+async fn fetch_trae_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::trae_quota::{fetch_trae_quota_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((provider_id, api_host)) = active_trae_provider() else {
+        *cache = None;
+        return None;
+    };
+    let http = http.as_ref()?;
+    // 取/刷新有效 token(ensure_valid 临期续期 + 落盘);未登录 / refresh 失效 → 清缓存。
+    let cred = match codex_app_transfer_gemini_oauth::ensure_valid_trae_token(http, &provider_id)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(provider_id, error = %e, "[Quota] Trae 无有效 token(未登录/refresh 失效)→ 清额度缓存");
+            *cache = None;
+            return None;
+        }
+    };
+    // 指纹按 (provider id, user_id):切账号(user_id 变)即失效;**不按 token**——token 每次
+    // 续期都变,按 token 会让续期后紧跟的瞬时失败误清缓存(review [7])。同账号续期 = 同 user_id。
+    let fp = quota_fingerprint(&[&provider_id, cred.user_id.as_deref().unwrap_or("")]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    match fetch_trae_quota_summary(http, &api_host, &cred.token).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] Trae quota 鉴权失败 → 清额度缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] Trae quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
             match cache.as_mut() {
                 Some((cfp, q, at)) if *cfp == fp => {
                     *at = std::time::Instant::now();
@@ -1549,6 +1644,7 @@ pub async fn run_quota_daemon() {
     let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut trae_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1583,6 +1679,7 @@ pub async fn run_quota_daemon() {
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
         let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
+        let trae = fetch_trae_quota(&quota_http, &mut trae_cache).await;
         // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
         let quota = antigravity
             .or(glm)
@@ -1592,6 +1689,7 @@ pub async fn run_quota_daemon() {
             .or(deepseek)
             .or(anyrouter)
             .or(moonshot)
+            .or(trae)
             .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));

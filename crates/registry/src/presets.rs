@@ -46,7 +46,9 @@ mod tests {
         // (2026-06-13 加智谱 GLM Coding preset:Coding Plan 端点 + Claude Code UA 伪装)
         // (2026-06-16 加 zai-login / bigmodel-login OAuth preset:GLM Coding Plan 账号登录,MOC-252)
         // (2026-06-22 加 OpenCode Go preset:opencode.ai/zen/go 编程模型订阅,openai_chat)
-        assert_eq!(builtin_presets().len(), 17);
+        // (2026-06-22 加 Trae（国内版）OAuth preset:字节 TRAE SOLO CN 账号登录 + 额度,CAT-257;
+        //  Phase 1 仅 login+quota,模型路由 Phase 2)
+        assert_eq!(builtin_presets().len(), 18);
     }
 
     #[test]
