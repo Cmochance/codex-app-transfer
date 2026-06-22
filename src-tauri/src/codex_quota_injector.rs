@@ -969,9 +969,14 @@ fn active_trae_provider() -> Option<(String, String)> {
     let id = p.get("id").and_then(|v| v.as_str())?.to_string();
     let auth_scheme = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
     let base_url = p.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+    // host 匹配带点边界(`x == d || x.ends_with(".d")`),否则 `nottrae.cn` 会误判(review [2])。
     let is_trae = matches!(auth_scheme, "trae_oauth" | "trae")
         || host_of(base_url)
-            .map(|h| h.ends_with("trae.cn") || h.ends_with("trae.ai"))
+            .map(|h| {
+                ["trae.cn", "trae.ai"]
+                    .iter()
+                    .any(|d| h == *d || h.ends_with(&format!(".{d}")))
+            })
             .unwrap_or(false);
     if !is_trae {
         return None;
@@ -1274,8 +1279,9 @@ async fn fetch_trae_quota(
             return None;
         }
     };
-    // 指纹按 (provider id, token):切账号 / 续期换 token 即失效重取。
-    let fp = quota_fingerprint(&[&provider_id, &cred.token]);
+    // 指纹按 (provider id, user_id):切账号(user_id 变)即失效;**不按 token**——token 每次
+    // 续期都变,按 token 会让续期后紧跟的瞬时失败误清缓存(review [7])。同账号续期 = 同 user_id。
+    let fp = quota_fingerprint(&[&provider_id, cred.user_id.as_deref().unwrap_or("")]);
     if let Some((cfp, q, at)) = cache.as_ref() {
         if *cfp == fp && at.elapsed() < QUOTA_TTL {
             return Some(q.clone());

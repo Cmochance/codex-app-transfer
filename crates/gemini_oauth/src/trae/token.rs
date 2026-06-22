@@ -143,7 +143,12 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), TokenEr
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    // 唯一 temp 名(pid + 进程内递增计数):login handler 与 quota 守护进程的续期可能
+    // **并发**写同一 `<id>.json`,固定 temp 名会让二者 create_new 撞 / 互删对方的 temp
+    // (review [8])。各写各的唯一 temp,最后 rename 到正式路径(rename 原子)。
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{nonce}", std::process::id()));
     let json = serde_json::to_vec_pretty(value)?;
 
     #[cfg(unix)]

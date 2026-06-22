@@ -38,6 +38,11 @@ pub use token::{TraeCredential, TraeCredentialStore};
 /// access token 续期提前量(临期 2 分钟内即刷)。
 const REFRESH_SKEW_MS: i64 = 120_000;
 
+/// 服务端**未回 token 过期时刻**(`token_expire_at_ms == 0`)时的兜底有效期:
+/// 从 `obtained_at_ms` 起算 50 分钟。避免「0 当永不过期 → 永久禁用续期 → token 实际
+/// 过期后每次 401」(review [5])。正常响应带 TokenExpireAt 时不走这条。
+const ASSUMED_TOKEN_TTL_MS: i64 = 50 * 60 * 1000;
+
 /// Trae 登录链路统一错误。
 #[derive(Debug, Error)]
 pub enum TraeError {
@@ -104,6 +109,13 @@ pub async fn run_trae_login(
     // best-effort 拉 email(失败不致命)
     let email = fetch_user_email(http, &config, &result.token).await;
 
+    // [review] email fetch 有网络往返,取消可能在此期间到达 —— 落盘前**再查一次**,
+    // 被取消 / 被新登录抢占绝不写盘(否则 UI 报已取消但盘上留 ghost 凭证,违反保证)。
+    if is_cancelled(&cancel_guard) {
+        tracing::info!(provider_id, "Trae 拉 email 后检测到取消,中止(不落盘)");
+        return Err(FlowError::Cancelled.into());
+    }
+
     let cred = TraeCredential {
         edition,
         token: result.token,
@@ -148,14 +160,21 @@ pub async fn ensure_valid_trae_token(
     let cred = store.load()?.ok_or(TraeError::NotLoggedIn)?;
     let now = flow::unix_now_ms();
 
-    // 还在有效期内(留 skew)→ 直接用
-    if cred.token_expire_at_ms == 0 || now + REFRESH_SKEW_MS < cred.token_expire_at_ms {
+    // 有效期:未知 expiry(0)用 obtained + 兜底 TTL,而非「0 = 永不过期」(review [5])。
+    let effective_expire = if cred.token_expire_at_ms > 0 {
+        cred.token_expire_at_ms
+    } else {
+        cred.obtained_at_ms + ASSUMED_TOKEN_TTL_MS
+    };
+    if now + REFRESH_SKEW_MS < effective_expire {
         return Ok(cred);
     }
 
-    // refresh token 已过期 → 必须重登
+    // refresh token 已过期 → 删凭证(否则 status_handler 直读盘面永显已登录,review [3])
+    // + NotLoggedIn,UI 走重新登录。
     if cred.refresh_expire_at_ms != 0 && now >= cred.refresh_expire_at_ms {
-        tracing::info!(provider_id, "Trae refresh token 已过期,需重新登录");
+        tracing::info!(provider_id, "Trae refresh token 已过期,删凭证 + 需重新登录");
+        let _ = store.delete();
         return Err(TraeError::NotLoggedIn);
     }
 
@@ -171,9 +190,17 @@ pub async fn ensure_valid_trae_token(
     .await
     {
         Ok(r) => r,
+        // 瞬时错(网络 / 5xx / 429 / parse):旧 token 可能仍有效(skew 内),返回旧凭证让
+        // quota 用旧 token,下个 tick 再试续期 —— 不删、不 NotLoggedIn,避免一次网络抖动
+        // 就让额度行消失(review [4],对齐 quota pipeline 的 transient 容忍)。
+        Err(e) if is_transient_refresh_error(&e) => {
+            tracing::warn!(provider_id, error = %e, "Trae 续期瞬时失败,沿用旧凭证(下个周期重试)");
+            return Ok(cred);
+        }
+        // 明确鉴权失败(refresh 被拒 / 4xx / 业务拒)→ 删凭证 + NotLoggedIn(review [3][4])
         Err(e) => {
-            // 续期失败(refresh 被拒等)→ 当未登录,UI 重登
-            tracing::warn!(provider_id, error = %e, "Trae 续期失败,需重新登录");
+            tracing::warn!(provider_id, error = %e, "Trae 续期被拒(鉴权),删凭证 + 需重新登录");
+            let _ = store.delete();
             return Err(TraeError::NotLoggedIn);
         }
     };
@@ -186,7 +213,12 @@ pub async fn ensure_valid_trae_token(
         } else {
             refreshed.refresh_token
         },
-        token_expire_at_ms: refreshed.token_expire_at_ms,
+        // expiry 空(0)保留旧值,别用 0 覆盖已知 expiry(否则下次走兜底/永久禁刷,review [5])
+        token_expire_at_ms: if refreshed.token_expire_at_ms == 0 {
+            cred.token_expire_at_ms
+        } else {
+            refreshed.token_expire_at_ms
+        },
         refresh_expire_at_ms: if refreshed.refresh_expire_at_ms == 0 {
             cred.refresh_expire_at_ms
         } else {
@@ -201,6 +233,16 @@ pub async fn ensure_valid_trae_token(
         return Err(e.into());
     }
     Ok(updated)
+}
+
+/// refresh 失败是否瞬时(可沿用旧凭证重试)。网络 / 5xx / 429 / parse = 瞬时;
+/// 4xx / 业务拒 / 缺字段 = 明确鉴权失败(删凭证重登)。
+fn is_transient_refresh_error(e: &TraeError) -> bool {
+    match e {
+        TraeError::Http(_) | TraeError::Parse(_) => true,
+        TraeError::Status { status, .. } => *status >= 500 || *status == 429,
+        _ => false,
+    }
 }
 
 /// best-effort 拉账号 email/标识(GetUserInfo)。失败返 `None`(不阻断登录)。
@@ -248,6 +290,34 @@ mod tests {
         assert!(!is_cancelled(&Some(rx.clone())));
         tx.send(true).unwrap();
         assert!(is_cancelled(&Some(rx)));
+    }
+
+    #[test]
+    fn transient_refresh_error_classification() {
+        // 瞬时:网络 / 5xx / 429 / parse → 沿用旧凭证重试
+        assert!(is_transient_refresh_error(&TraeError::Parse("x".into())));
+        assert!(is_transient_refresh_error(&TraeError::Status {
+            status: 503,
+            body: String::new()
+        }));
+        assert!(is_transient_refresh_error(&TraeError::Status {
+            status: 429,
+            body: String::new()
+        }));
+        // 明确鉴权失败:4xx / 业务拒 / 缺字段 → 删凭证重登
+        assert!(!is_transient_refresh_error(&TraeError::Status {
+            status: 401,
+            body: String::new()
+        }));
+        assert!(!is_transient_refresh_error(&TraeError::Status {
+            status: 403,
+            body: String::new()
+        }));
+        assert!(!is_transient_refresh_error(&TraeError::Business {
+            code: "RefreshTokenInvalid".into(),
+            msg: String::new()
+        }));
+        assert!(!is_transient_refresh_error(&TraeError::NotLoggedIn));
     }
 
     #[tokio::test]
