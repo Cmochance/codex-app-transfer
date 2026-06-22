@@ -3,18 +3,18 @@
 //! `POST https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage`,鉴权
 //! `Authorization: Cloud-IDE-JWT <token>`,body `{"require_usage": true}`。
 //!
-//! 响应结构(逆向自 `out/...solo-lite.js` 的 `ICubeUsageService`,字段名按 JS 取):
+//! 响应结构(**真机实测** CN 2026-06-22):
 //! ```json
 //! { "Result": { "user_entitlement_pack_list": [
-//!     { "entitlement_base_info": { "product_type": "Pro",
-//!         "quota": { "premium_model_fast_request_limit": 1000 }, "expire_time": ... },
-//!       "usage": { "premium_model_fast_amount": 137, "pay_go_amount": 0 } } ] } }
+//!     { "display_desc": "免费",
+//!       "entitlement_base_info": { "product_type": 0, "user_id": "...", "expire_time": ...,
+//!         "quota": { "enable_solo_agent": true, "solo_agent_parallel_limit": 2, ... } },
+//!       "usage": {} } ] } }
 //! ```
-//! `premium_model_fast_request_limit == -1` 表无限;剩余 = `max(limit - used, 0)`。
+//! **免费档无消耗型额度** —— `quota` 是功能开关、`usage` 空,只显套餐名(`display_desc`)。
+//! 付费档(best-effort,无样本验证)若带 `quota.premium_model_fast_request_limit` +
+//! `usage.premium_model_fast_amount` 则额外显「Premium 快速请求」bar + 计数(`-1`=无限)。
 //! 国际 SaaS 变体走 `quota_snapshots.{chat,completions,premium_interactions}`,也兜一层。
-//!
-//! ⚠️ 额度响应正文实测抓包时被 ttnet 绕过未取到,parser 按 JS 字段逆向 + 做容错;
-//! 真机登录后以实际响应校准(见 CAT-257 verify)。
 
 use crate::provider_quota::{ProviderQuota, QuotaStat, RollingWindows};
 
@@ -81,7 +81,13 @@ pub fn parse_trae_quota(json: &serde_json::Value) -> ProviderQuota {
     ProviderQuota::default()
 }
 
-/// 主路径:`user_entitlement_pack_list`。
+/// 主路径:`user_entitlement_pack_list`(真机实测结构,CN 2026-06-22)。
+///
+/// 每 pack:`display_desc`(套餐名,如「免费」)、`entitlement_base_info.{product_type,
+/// expire_time, user_id, quota}`、`usage`。免费档 `quota` 是功能开关
+/// (`enable_solo_*`/`solo_agent_parallel_limit`)、`usage` 空 —— **无消耗型额度**,只显套餐名。
+/// 付费档(best-effort)若带 `quota.premium_model_fast_request_limit` +
+/// `usage.premium_model_fast_amount` 则额外显「Premium 快速请求」bar + 计数。
 fn parse_pack_list(root: &serde_json::Value) -> Option<ProviderQuota> {
     let packs = root
         .get("user_entitlement_pack_list")
@@ -93,12 +99,26 @@ fn parse_pack_list(root: &serde_json::Value) -> Option<ProviderQuota> {
     let mut unlimited = false;
     let mut total_limit: i64 = 0;
     let mut total_used: i64 = 0;
-    let mut product_type: Option<String> = None;
+    let mut saw_premium = false;
+    let mut plan: Option<String> = None; // display_desc(人类可读套餐名)
     let mut expire: Option<String> = None;
-    let mut saw_any = false;
 
     for pack in packs {
         let base = pack.get("entitlement_base_info");
+        // 套餐名:优先 pack.display_desc(「免费」),兜底 base.product_type 数字。
+        if plan.is_none() {
+            plan = pack
+                .get("display_desc")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    base.and_then(|b| b.get("product_type"))
+                        .and_then(|p| p.as_i64())
+                        .map(|n| format!("type {n}"))
+                });
+        }
+        // Premium 消耗(付费档才有;免费档无此字段)。
         let limit = base
             .and_then(|b| b.get("quota"))
             .and_then(|q| q.get("premium_model_fast_request_limit"))
@@ -109,7 +129,7 @@ fn parse_pack_list(root: &serde_json::Value) -> Option<ProviderQuota> {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
         if let Some(limit) = limit {
-            saw_any = true;
+            saw_premium = true;
             if limit < 0 {
                 unlimited = true;
             } else {
@@ -117,27 +137,19 @@ fn parse_pack_list(root: &serde_json::Value) -> Option<ProviderQuota> {
             }
             total_used += used;
         }
-        if product_type.is_none() {
-            product_type = base
-                .and_then(|b| b.get("product_type"))
-                .and_then(|p| p.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty());
-        }
         if expire.is_none() {
-            expire = base.and_then(|b| b.get("expire_time")).and_then(to_rfc3339);
+            expire = pack
+                .get("expire_time")
+                .or_else(|| base.and_then(|b| b.get("expire_time")))
+                .and_then(to_rfc3339);
         }
-    }
-
-    if !saw_any {
-        return None;
     }
 
     let mut stats: Vec<QuotaStat> = Vec::new();
-    if let Some(pt) = product_type {
+    if let Some(p) = plan {
         stats.push(QuotaStat {
             label: "套餐".to_string(),
-            value: pt,
+            value: p,
         });
     }
 
@@ -157,6 +169,11 @@ fn parse_pack_list(root: &serde_json::Value) -> Option<ProviderQuota> {
         });
     }
 
+    // 有套餐名 或 有 premium 额度才算有内容(免费档至少显套餐名)。
+    if stats.is_empty() && rolling.is_empty() {
+        let _ = saw_premium;
+        return None;
+    }
     Some(ProviderQuota { rolling, stats })
 }
 
@@ -246,21 +263,45 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 真机实测:CN 免费档(2026-06-22)—— quota 是功能开关、usage 空、无消耗型额度,
+    /// 只显套餐名(display_desc「免费」)。
     #[test]
-    fn parses_pack_list_limited() {
+    fn free_tier_shows_plan_only() {
         let j = json!({"Result":{"user_entitlement_pack_list":[
-            {"entitlement_base_info":{"product_type":"Pro",
+            {"display_desc":"免费",
+             "entitlement_base_info":{
+                "product_type":0,"user_id":"2767898365400680","expire_time":1782835199i64,
+                "quota":{"enable_solo_agent":true,"enable_solo_coder":true,"solo_agent_parallel_limit":2,"no_bonus_quota":true}},
+             "usage":{}}
+        ]}});
+        let q = parse_trae_quota(&j);
+        assert!(q.has_any(), "免费档至少显套餐名");
+        assert!(q.rolling.is_empty(), "免费档无消耗型 bar");
+        assert!(
+            q.stats
+                .iter()
+                .any(|s| s.label == "套餐" && s.value == "免费"),
+            "应显 套餐:免费"
+        );
+        // 没有 premium_model_fast_request_limit → 不显 Premium 快速请求
+        assert!(!q.stats.iter().any(|s| s.label == "Premium 快速请求"));
+    }
+
+    /// 付费档(best-effort,display_desc 作套餐名):带 premium 计数 → bar + X/Y。
+    #[test]
+    fn paid_tier_shows_premium_count() {
+        let j = json!({"Result":{"user_entitlement_pack_list":[
+            {"display_desc":"Pro",
+             "entitlement_base_info":{
                 "quota":{"premium_model_fast_request_limit":1000},
                 "expire_time":1781448954156i64},
              "usage":{"premium_model_fast_amount":137}}
         ]}});
         let q = parse_trae_quota(&j);
         assert!(q.has_any());
-        // 月槽 bar:剩余 863/1000 = 86.3%
         let bar = q.rolling.monthly.as_ref().expect("月槽 bar");
         assert_eq!(bar.label, "Premium 快速请求");
         assert!((bar.remaining_percent - 86.3).abs() < 1e-6, "剩 863/1000");
-        // stat:套餐 + X/Y
         assert!(q
             .stats
             .iter()
@@ -274,7 +315,8 @@ mod tests {
     #[test]
     fn unlimited_shows_stat_no_bar() {
         let j = json!({"Result":{"user_entitlement_pack_list":[
-            {"entitlement_base_info":{"product_type":"Ultra",
+            {"display_desc":"Ultra",
+             "entitlement_base_info":{
                 "quota":{"premium_model_fast_request_limit":-1}},
              "usage":{"premium_model_fast_amount":5000}}
         ]}});

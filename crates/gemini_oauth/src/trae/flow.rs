@@ -370,7 +370,8 @@ pub(crate) fn parse_token_result(text: &str) -> Result<TraeTokenResult, TraeErro
         });
     }
     let result = env.get("Result").ok_or(TraeError::MissingField("Result"))?;
-    // 调试:打 Result 顶层 key(不打值)—— 真机校准 user_id/region 字段名用(实测 UserID 拿不到)。
+    // 实测 ExchangeToken Result 不带 user_id(只 Token/RefreshToken/expiry),user_id 改由
+    // 额度端点取(见 mod.rs::fetch_account_user_id)。保留 debug 级 key 日志便于将来排障。
     if let Some(obj) = result.as_object() {
         let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
         tracing::debug!(result_keys = ?keys, "[Trae] ExchangeToken Result keys");

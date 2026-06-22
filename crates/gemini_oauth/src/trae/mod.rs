@@ -124,15 +124,19 @@ pub async fn run_trae_login(
         return Err(FlowError::Cancelled.into());
     }
 
-    // best-effort 拉 email(失败不致命)
-    let email = fetch_user_email(http, &config, &result.token).await;
+    // best-effort 取 user_id:ExchangeToken 不带 → 用额度端点(GetUserInfo 对此 token 永远
+    // 401)。email 暂不可得(无可用端点),留空。失败不致命。
+    let user_id = match result.user_id.clone() {
+        Some(u) => Some(u),
+        None => fetch_account_user_id(http, &config, &result.token).await,
+    };
 
-    // [review] email fetch 有网络往返,取消可能在此期间到达 —— 落盘前**再查一次**,
-    // 被取消 / 被新登录抢占绝不写盘(否则 UI 报已取消但盘上留 ghost 凭证,违反保证)。
+    // [review] 上面有网络往返,取消可能在此期间到达 —— 落盘前**再查一次**,被取消 /
+    // 被新登录抢占绝不写盘(否则 UI 报已取消但盘上留 ghost 凭证,违反保证)。
     if is_cancelled(&cancel_guard) {
         tracing::info!(
             provider_id = id_label,
-            "Trae 拉 email 后检测到取消,中止(不落盘)"
+            "Trae 取账号信息后检测到取消,中止(不落盘)"
         );
         return Err(FlowError::Cancelled.into());
     }
@@ -143,8 +147,8 @@ pub async fn run_trae_login(
         refresh_token: result.refresh_token,
         token_expire_at_ms: result.token_expire_at_ms,
         refresh_expire_at_ms: result.refresh_expire_at_ms,
-        user_id: result.user_id,
-        email,
+        user_id,
+        email: None,
         ai_region: result.ai_region,
         fingerprint,
         keypair,
@@ -169,7 +173,7 @@ pub async fn run_trae_login(
     match save_path {
         Ok(path) => tracing::info!(
             provider_id = id_label,
-            email = cred.email.as_deref().unwrap_or(""),
+            user_id = cred.user_id.as_deref().unwrap_or(""),
             path = %path,
             pending = provider_id.is_none(),
             "Trae 账号登录完成,凭证已落盘"
@@ -298,61 +302,45 @@ fn is_transient_refresh_error(e: &TraeError) -> bool {
     }
 }
 
-/// best-effort 拉账号 email/标识(GetUserInfo)。失败返 `None`(不阻断登录)。
-async fn fetch_user_email(
+/// best-effort 取账号 `user_id`:用额度端点 `ide_user_ent_usage`(Cloud-IDE-JWT 可用),
+/// 从 `user_entitlement_pack_list[].entitlement_base_info.user_id` 取。失败返 `None`。
+///
+/// **不用 GetUserInfo**:实测对 ExchangeToken 拿到的这个 token,GetUserInfo 无论
+/// `x-icube-token` 还是 `Cloud-IDE-JWT` 都返 401「user not logged in」(它需另一类
+/// web session,非本 API token),故 email 暂不可得;user_id 走额度端点。
+async fn fetch_account_user_id(
     http: &reqwest::Client,
     config: &TraeProviderConfig,
     token: &str,
 ) -> Option<String> {
-    let url = format!("{}{}", config.api_host, constants::USERINFO_PATH);
-    let resp = match http
+    let url = format!("{}{}", config.api_host, constants::QUOTA_PATH);
+    let resp = http
         .post(&url)
+        .header("Authorization", format!("Cloud-IDE-JWT {token}"))
         .header("Content-Type", "application/json")
-        .header("x-icube-token", token)
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({ "require_usage": true }))
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(error = %e, "[Trae] GetUserInfo 请求失败(email 留空)");
-            return None;
-        }
-    };
-    let status = resp.status();
-    let v: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(status = %status, error = %e, "[Trae] GetUserInfo 解析失败");
-            return None;
-        }
-    };
-    let result = v.get("Result").unwrap_or(&v);
-    // 调试:打 GetUserInfo 顶层 key(不打值)—— 真机校准 email/ScreenName 字段名用。
-    if let Some(obj) = result.as_object() {
-        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-        tracing::debug!(status = %status, result_keys = ?keys, "[Trae] GetUserInfo Result keys");
-    }
-    if !status.is_success() {
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::debug!(status = %resp.status(), "[Trae] 取 user_id(额度端点)非 2xx");
         return None;
     }
-    for key in [
-        "NonPlainTextEmail",
-        "Email",
-        "email",
-        "ScreenName",
-        "screen_name",
-        "UserName",
-        "user_name",
-        "Name",
-    ] {
-        if let Some(s) = result.get(key).and_then(|x| x.as_str()) {
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let root = v.get("Result").unwrap_or(&v);
+    root.get("user_entitlement_pack_list")
+        .and_then(|p| p.as_array())?
+        .iter()
+        .find_map(|pack| {
+            pack.get("entitlement_base_info")
+                .and_then(|b| b.get("user_id"))
+                .and_then(|u| match u {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
+        })
+        .filter(|s| !s.is_empty())
 }
 
 fn is_cancelled(cancel: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
