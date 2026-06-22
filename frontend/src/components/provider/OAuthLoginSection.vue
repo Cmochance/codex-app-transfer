@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // OAuth 账号登录区(替代 API Key):未登录显示「登录」(POST 开浏览器授权,长阻塞),
 // 登录中显示「登录中…+取消」,已登录显示邮箱 + 「登出」。状态变化 emit 给父表单。
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import {
@@ -15,7 +15,8 @@ import {
 import AppButton from '@/components/ui/AppButton.vue'
 
 // providerId:仅 trae 这类「按 provider 条目隔离多账号」的 kind 需要(= 当前编辑的
-// provider id)。新建未保存时为空 → 先提示保存。其余 kind(zai/gemini/...)忽略。
+// provider id)。trae 登录 login-first:未保存(无 id)时登录写 pending,保存 provider 时
+// 由父表单 claim 绑定到新 id —— 无需先保存。其余 kind(zai/gemini/...)忽略 providerId。
 const props = defineProps<{ kind: OAuthKind; providerId?: string }>()
 const emit = defineEmits<{ change: [loggedIn: boolean] }>()
 const { show: toast } = useToast()
@@ -24,19 +25,10 @@ const status = ref<OAuthStatus | null>(null)
 const logging = ref(false)
 let cancelled = false
 
-// 需要 providerId 的 kind(trae):provider 未保存(无 id)时不能登录,先提示保存。
-const needsProviderId = computed(() => props.kind === 'trae')
-const ready = computed(() => !needsProviderId.value || !!props.providerId)
-
 function errMsg(e: unknown): string {
   return (e as Error)?.message || String(e)
 }
 async function refresh() {
-  if (!ready.value) {
-    status.value = { loggedIn: false }
-    emit('change', false)
-    return
-  }
   try {
     status.value = await oauthStatus(props.kind, props.providerId)
     emit('change', !!status.value?.loggedIn)
@@ -88,10 +80,7 @@ async function onLogout() {
 
 <template>
   <div class="oauth">
-    <template v-if="!ready">
-      <span class="oauth__msg">{{ t('oauth.saveProviderFirst') }}</span>
-    </template>
-    <template v-else-if="logging">
+    <template v-if="logging">
       <span class="oauth__msg">{{ t('oauth.loggingIn') }}</span>
       <AppButton size="sm" variant="secondary" :label="t('common.cancel')" @click="onCancel" />
     </template>

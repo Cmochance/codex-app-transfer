@@ -370,28 +370,30 @@ pub(crate) fn parse_token_result(text: &str) -> Result<TraeTokenResult, TraeErro
         });
     }
     let result = env.get("Result").ok_or(TraeError::MissingField("Result"))?;
+    // 调试:打 Result 顶层 key(不打值)—— 真机校准 user_id/region 字段名用(实测 UserID 拿不到)。
+    if let Some(obj) = result.as_object() {
+        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        tracing::debug!(result_keys = ?keys, "[Trae] ExchangeToken Result keys");
+    }
     let token = result
         .get("Token")
         .and_then(|t| t.as_str())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or(TraeError::MissingField("Result.Token"))?;
-    let refresh_token = result
-        .get("RefreshToken")
-        .and_then(|t| t.as_str())
-        .map(|t| t.trim().to_string())
-        .unwrap_or_default();
-    let token_expire_at_ms = result.get("TokenExpireAt").map(to_ms).unwrap_or(0);
-    let refresh_expire_at_ms = result.get("RefreshExpireAt").map(to_ms).unwrap_or(0);
-    let user_id = result
-        .get("UserID")
-        .and_then(json_to_string)
+    let refresh_token = first_str(result, &["RefreshToken", "refresh_token"]).unwrap_or_default();
+    let token_expire_at_ms = first_field(result, &["TokenExpireAt", "token_expire_at"])
+        .map(to_ms)
+        .unwrap_or(0);
+    let refresh_expire_at_ms = first_field(result, &["RefreshExpireAt", "refresh_expire_at"])
+        .map(to_ms)
+        .unwrap_or(0);
+    // 字段名容错:实测 ExchangeToken Result 不带 UserID(可能在别名 / GetUserInfo),多名兜底。
+    let user_id = ["UserID", "UserId", "user_id", "Uid", "uid"]
+        .iter()
+        .find_map(|k| result.get(*k).and_then(json_to_string))
         .filter(|s| !s.is_empty());
-    let ai_region = result
-        .get("AIRegion")
-        .and_then(|r| r.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty());
+    let ai_region = first_str(result, &["AIRegion", "AiRegion", "ai_region", "region"]);
     Ok(TraeTokenResult {
         token,
         refresh_token,
@@ -430,6 +432,19 @@ fn json_to_string(v: &serde_json::Value) -> Option<String> {
         serde_json::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
+}
+
+/// 多名兜底:返回第一个存在的 key 对应的 value。
+fn first_field<'a>(obj: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
+    keys.iter().find_map(|k| obj.get(*k))
+}
+
+/// 多名兜底取非空字符串。
+fn first_str(obj: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn uuid_v4() -> Result<String, super::crypto::CryptoError> {

@@ -11,13 +11,19 @@
 //! 每账号一套独立 [`device::DeviceFingerprint`] + [`crypto::DeviceKeyPair`],首登生成、
 //! 固定复用、切 provider 整包切换 —— 同设备多账号不共用指纹。
 //!
+//! ## login-first(先登录后保存)
+//!
+//! `run_trae_login` 的 `provider_id` 可空:**未保存** provider 上登录写
+//! [`token::TraePendingStore`],用户保存拿到 id 后由 [`claim_pending_for_provider`] 迁成
+//! `trae/<id>.json`(对齐 GLM 的「先登录后保存」UX)。
+//!
 //! ## 端到端([`run_trae_login`])
 //!
-//! 1. 取/生成本账号的指纹 + keypair(同 provider id 再登复用,保持设备连续)
-//! 2. [`flow::run_trae_oauth_flow_with_cancel`] — loopback 授权 → AuthCode → 首次
-//!    ExchangeToken(无签名)→ JWT + RefreshToken
+//! 1. 取/生成本账号的指纹 + keypair(同 provider id 再登复用,保持设备连续;无 id 则新生成)
+//! 2. [`flow::run_trae_oauth_flow_with_cancel`] — loopback 授权(内置 webview 加载授权页)
+//!    → AuthCode → 首次 ExchangeToken(无签名)→ JWT + RefreshToken
 //! 3. best-effort 拉 email(GetUserInfo)
-//! 4. 组装 [`token::TraeCredential`] 落盘 `~/.codex-app-transfer/trae/<id>.json`
+//! 4. 组装 [`token::TraeCredential`] 落 `trae/<id>.json`(有 id)或 pending(无 id)
 //!
 //! [`ensure_valid_trae_token`] 在 token 临期时用 RefreshToken + DeviceProof 签名续期。
 
@@ -33,7 +39,7 @@ use super::flow::{FlowError, OauthFlowConfig};
 pub use constants::{TraeEdition, TraeProviderConfig};
 pub use crypto::{CryptoError, DeviceKeyPair};
 pub use device::{DeviceFingerprint, DeviceInfo};
-pub use token::{TraeCredential, TraeCredentialStore};
+pub use token::{TraeCredential, TraeCredentialStore, TraePendingStore};
 
 /// access token 续期提前量(临期 2 分钟内即刷)。
 const REFRESH_SKEW_MS: i64 = 120_000;
@@ -68,22 +74,31 @@ pub enum TraeError {
 
 /// 跑完整 Trae 账号登录,成功后**已落盘** [`TraeCredential`] 并返回。
 ///
-/// `provider_id`:当前 provider 条目 id —— 决定凭证文件 + 指纹隔离单元。
-/// 同 id 再登复用既有指纹/keypair(设备连续);不同 id = 不同设备身份。
-/// `cancel`:可选取消信号,贯穿全程,OAuth 后落盘前再查,被取消绝不写盘。
+/// `provider_id`:
+/// - `Some(id)`:**已保存** provider 上登录 —— 直接写 `trae/<id>.json`,复用该 id 既有
+///   指纹/keypair(设备连续)。
+/// - `None`:**未保存** provider 上登录(login-first)—— 本次新生成一套指纹,落 pending
+///   ([`TraePendingStore`]);用户保存 provider 拿到 id 后由 [`claim_pending_for_provider`]
+///   迁成 `trae/<id>.json`。
+///
+/// `cancel`:可选取消信号,贯穿全程,OAuth 后 + 落盘前都再查,被取消绝不写盘。
 pub async fn run_trae_login(
     http: &reqwest::Client,
     edition: TraeEdition,
-    provider_id: &str,
+    provider_id: Option<&str>,
     flow_config: &OauthFlowConfig,
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<TraeCredential, TraeError> {
     let config = edition.config();
-    let store = TraeCredentialStore::for_provider_id(provider_id)?;
+    let id_label = provider_id.unwrap_or("(pending)");
 
-    // 同 provider id 复用既有指纹/keypair(设备连续);首登则新生成一套独立指纹。
-    let (fingerprint, keypair) = match store.load()? {
-        Some(existing) => (existing.fingerprint, existing.keypair),
+    // 有 id:复用该 id 既有指纹(设备连续);无 id(login-first)或首登:新生成一套独立指纹。
+    let existing = match provider_id {
+        Some(id) => TraeCredentialStore::for_provider_id(id)?.load()?,
+        None => None,
+    };
+    let (fingerprint, keypair) = match existing {
+        Some(c) => (c.fingerprint, c.keypair),
         None => (DeviceFingerprint::generate()?, DeviceKeyPair::generate()?),
     };
 
@@ -102,7 +117,10 @@ pub async fn run_trae_login(
 
     // OAuth 后若已取消(关窗 / 新登录抢占),立即中止不落盘
     if is_cancelled(&cancel_guard) {
-        tracing::info!(provider_id, "Trae OAuth 后检测到取消,中止(不落盘)");
+        tracing::info!(
+            provider_id = id_label,
+            "Trae OAuth 后检测到取消,中止(不落盘)"
+        );
         return Err(FlowError::Cancelled.into());
     }
 
@@ -112,7 +130,10 @@ pub async fn run_trae_login(
     // [review] email fetch 有网络往返,取消可能在此期间到达 —— 落盘前**再查一次**,
     // 被取消 / 被新登录抢占绝不写盘(否则 UI 报已取消但盘上留 ghost 凭证,违反保证)。
     if is_cancelled(&cancel_guard) {
-        tracing::info!(provider_id, "Trae 拉 email 后检测到取消,中止(不落盘)");
+        tracing::info!(
+            provider_id = id_label,
+            "Trae 拉 email 后检测到取消,中止(不落盘)"
+        );
         return Err(FlowError::Cancelled.into());
     }
 
@@ -129,22 +150,54 @@ pub async fn run_trae_login(
         keypair,
         obtained_at_ms: flow::unix_now_ms(),
     };
-    if let Err(e) = store.save(&cred) {
-        tracing::error!(
-            error = %e,
-            provider_id,
-            path = %store.path().display(),
-            "Trae 凭证落盘失败 — 重启后会被当未登录"
-        );
-        return Err(e.into());
+
+    // 有 id → 直接写 provider 文件;无 id → 写 pending(保存 provider 时再 claim 绑定)。
+    let save_path = match provider_id {
+        Some(id) => {
+            let store = TraeCredentialStore::for_provider_id(id)?;
+            store
+                .save(&cred)
+                .map(|_| store.path().display().to_string())
+        }
+        None => {
+            let pending = TraePendingStore::for_pending()?;
+            pending
+                .save(&cred)
+                .map(|_| pending.path().display().to_string())
+        }
+    };
+    match save_path {
+        Ok(path) => tracing::info!(
+            provider_id = id_label,
+            email = cred.email.as_deref().unwrap_or(""),
+            path = %path,
+            pending = provider_id.is_none(),
+            "Trae 账号登录完成,凭证已落盘"
+        ),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                provider_id = id_label,
+                "Trae 凭证落盘失败 — 重启后会被当未登录"
+            );
+            return Err(e.into());
+        }
     }
-    tracing::info!(
-        provider_id,
-        email = cred.email.as_deref().unwrap_or(""),
-        path = %store.path().display(),
-        "Trae 账号登录完成,凭证已落盘"
-    );
     Ok(cred)
+}
+
+/// 把 login-first 落下的 pending 凭证绑定到刚保存的 provider id(迁成 `trae/<id>.json`
+/// 并删 pending)。返回 `Ok(true)`=有 pending 已绑定,`Ok(false)`=无 pending(无需操作)。
+/// 前端在保存 Trae provider 拿到新 id 后调用。
+pub fn claim_pending_for_provider(provider_id: &str) -> Result<bool, TraeError> {
+    let pending = TraePendingStore::for_pending()?;
+    let Some(cred) = pending.load()? else {
+        return Ok(false);
+    };
+    TraeCredentialStore::for_provider_id(provider_id)?.save(&cred)?;
+    pending.delete()?;
+    tracing::info!(provider_id, "Trae pending 凭证已绑定到 provider");
+    Ok(true)
 }
 
 /// 取一个**有效**的 access token:加载凭证,临期 / 已过期则用 RefreshToken 续期并
@@ -252,20 +305,47 @@ async fn fetch_user_email(
     token: &str,
 ) -> Option<String> {
     let url = format!("{}{}", config.api_host, constants::USERINFO_PATH);
-    let resp = http
+    let resp = match http
         .post(&url)
         .header("Content-Type", "application/json")
         .header("x-icube-token", token)
         .json(&serde_json::json!({}))
         .send()
         .await
-        .ok()?;
-    if !resp.status().is_success() {
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "[Trae] GetUserInfo 请求失败(email 留空)");
+            return None;
+        }
+    };
+    let status = resp.status();
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(status = %status, error = %e, "[Trae] GetUserInfo 解析失败");
+            return None;
+        }
+    };
+    let result = v.get("Result").unwrap_or(&v);
+    // 调试:打 GetUserInfo 顶层 key(不打值)—— 真机校准 email/ScreenName 字段名用。
+    if let Some(obj) = result.as_object() {
+        let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        tracing::debug!(status = %status, result_keys = ?keys, "[Trae] GetUserInfo Result keys");
+    }
+    if !status.is_success() {
         return None;
     }
-    let v: serde_json::Value = resp.json().await.ok()?;
-    let result = v.get("Result").unwrap_or(&v);
-    for key in ["NonPlainTextEmail", "Email", "ScreenName", "UserName"] {
+    for key in [
+        "NonPlainTextEmail",
+        "Email",
+        "email",
+        "ScreenName",
+        "screen_name",
+        "UserName",
+        "user_name",
+        "Name",
+    ] {
         if let Some(s) = result.get(key).and_then(|x| x.as_str()) {
             if !s.is_empty() {
                 return Some(s.to_string());

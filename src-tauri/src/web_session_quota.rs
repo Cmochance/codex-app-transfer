@@ -26,6 +26,55 @@ pub fn init(handle: AppHandle) {
     let _ = APP_HANDLE.set(handle);
 }
 
+/// 开一个内置 webview 登录窗加载 `url`(供 OAuth 类登录复用,非 cookie 抓取场景)。
+/// 窗口创建走主线程(macOS 必须)。同名窗已存在则先关再开。
+pub async fn open_external_login_window(
+    label: &'static str,
+    title: &'static str,
+    url: &str,
+    inner_size: (f64, f64),
+) -> Result<(), String> {
+    let app = APP_HANDLE.get().ok_or("AppHandle 未初始化")?.clone();
+    if app.get_webview_window(label).is_some() {
+        close_win(&app, label);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let app_build = app.clone();
+    let url_owned = url.to_string();
+    app.run_on_main_thread(move || {
+        let res = (|| -> Result<(), String> {
+            let parsed: tauri::Url = url_owned
+                .parse()
+                .map_err(|e| format!("URL 解析失败: {e}"))?;
+            WebviewWindowBuilder::new(&app_build, label, WebviewUrl::External(parsed))
+                .title(title)
+                .inner_size(inner_size.0, inner_size.1)
+                .build()
+                .map_err(|e| format!("创建登录窗口失败: {e}"))?;
+            Ok(())
+        })();
+        let _ = tx.send(res);
+    })
+    .map_err(|e| format!("主线程派发失败: {e}"))?;
+    rx.await.map_err(|e| format!("窗口创建回传失败: {e}"))?
+}
+
+/// 关内置登录窗(主线程 destroy)。供其它模块复用。
+pub fn close_external_login_window(label: &'static str) {
+    if let Some(app) = APP_HANDLE.get() {
+        close_win(app, label);
+    }
+}
+
+/// 内置登录窗是否还开着(用户手动关窗检测)。
+pub fn external_login_window_open(label: &'static str) -> bool {
+    APP_HANDLE
+        .get()
+        .map(|a| a.get_webview_window(label).is_some())
+        .unwrap_or(false)
+}
+
 const POLL_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 登录窗「抓到 session」的判定信号。

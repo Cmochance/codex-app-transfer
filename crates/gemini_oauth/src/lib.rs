@@ -72,6 +72,7 @@ pub use zai::{
 // Trae(字节 TRAE SOLO CN / Work CN 账号登录)provider re-exports(parallel module,
 // loopback OAuth2 + PKCE + 设备密钥签名 refresh + 按 provider id 多账号指纹隔离)
 pub use trae::{
-    ensure_valid_trae_token, run_trae_login, DeviceFingerprint, DeviceKeyPair, TraeCredential,
-    TraeCredentialStore, TraeEdition, TraeError, TraeProviderConfig,
+    claim_pending_for_provider, ensure_valid_trae_token, run_trae_login, DeviceFingerprint,
+    DeviceKeyPair, TraeCredential, TraeCredentialStore, TraeEdition, TraeError, TraePendingStore,
+    TraeProviderConfig,
 };

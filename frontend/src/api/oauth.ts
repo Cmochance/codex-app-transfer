@@ -51,3 +51,9 @@ export function oauthLogout(kind: OAuthKind, providerId?: string) {
   const { base, query } = endpoint(kind, providerId)
   return api('DELETE', `${base}/logout${query}`)
 }
+
+// login-first 收尾(仅 trae):保存 provider 拿到新 id 后,把登录时落下的 pending 凭证绑定到该 id。
+export function oauthClaimPending(kind: OAuthKind, providerId: string) {
+  const { base, query } = endpoint(kind, providerId)
+  return api<{ claimed: boolean }>('POST', `${base}/claim${query}`)
+}

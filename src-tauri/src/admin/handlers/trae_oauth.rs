@@ -1,19 +1,23 @@
 //! `/api/trae-oauth/*` admin handlers — Trae(字节 TRAE SOLO CN / Work CN 账号登录)
 //! OAuth 登录 / 状态 / 注销。
 //!
-//! 跟 [`super::zai_oauth`] **并行**,但两点不同:
-//! 1. **按 provider id keying**(多账号):路由用 `?providerId=<id>` 而非 `?provider=`,
-//!    每个 provider 条目一套独立凭证 + 设备指纹(同设备多账号隔离)。
-//! 2. `run_trae_login` 内含 loopback OAuth2 + PKCE + 首次 ExchangeToken + 落盘整条链,
-//!    login_handler 只 cancel-aware 调一次然后报结果。
+//! 跟 [`super::zai_oauth`] **并行**,但几点不同:
+//! 1. **按 provider id keying**(多账号):`?providerId=<id>` 区分;每条目一套独立凭证 +
+//!    设备指纹(同设备多账号隔离)。
+//! 2. **login-first**:`providerId` 可空 —— 未保存 provider 上登录写 pending,保存后由
+//!    `claim` 绑定到新 id(对齐 GLM 的「先登录后保存」)。
+//! 3. **内置 webview 登录**:复用 [`crate::web_session_quota`] 的 `WebviewWindowBuilder`
+//!    开内置登录窗加载 authorize URL(不开外部浏览器,对齐 MiMo/OpenCode),loopback 收
+//!    callback;用户关窗 = 取消。
 //!
 //! 当前只支持 CN edition([`TraeEdition::Cn`]);国际版留 fast-follow。
 //!
-//! ## 路由
+//! ## 路由(providerId 可空 = 未保存 provider 走 pending)
 //! - `POST   /api/trae-oauth/login?providerId=<id>`
 //! - `GET    /api/trae-oauth/status?providerId=<id>`
 //! - `DELETE /api/trae-oauth/login/cancel`
 //! - `DELETE /api/trae-oauth/logout?providerId=<id>`
+//! - `POST   /api/trae-oauth/claim?providerId=<id>`(保存后绑定 pending → provider)
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -24,8 +28,11 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use codex_app_transfer_gemini_oauth::{
-    run_trae_login, OauthFlowConfig, TraeCredentialStore, TraeEdition, TraeError,
+    claim_pending_for_provider, run_trae_login, OauthFlowConfig, TraeCredentialStore, TraeEdition,
+    TraeError, TraePendingStore,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -33,6 +40,10 @@ use tokio::sync::watch;
 
 use super::super::state::AdminState;
 use super::common::err;
+use crate::web_session_quota;
+
+/// 内置登录 webview 窗口 label。
+const TRAE_LOGIN_WIN: &str = "trae-oauth-login";
 
 // ── providerId query 解析 ────────────────────────────────────────────
 
@@ -42,7 +53,8 @@ struct ProviderIdQuery {
     provider_id: String,
 }
 
-/// 取并校验 `?providerId=<id>`(非空)。返回 trim 后的 id;空 → `None`(call site 400)。
+/// 取 `?providerId=<id>`:有值返 `Some(trim)`;空 → `None`(= 未保存 provider,走 pending,
+/// **不是错误**)。
 fn parse_provider_id(q: &ProviderIdQuery) -> Option<String> {
     let id = q.provider_id.trim();
     if id.is_empty() {
@@ -177,6 +189,8 @@ pub fn routes() -> Router<AdminState> {
         .route("/api/trae-oauth/login", post(login_handler))
         .route("/api/trae-oauth/login/cancel", delete(cancel_login_handler))
         .route("/api/trae-oauth/logout", delete(logout_handler))
+        // login-first:保存 provider 后把 pending 凭证绑定到新 id
+        .route("/api/trae-oauth/claim", post(claim_handler))
 }
 
 async fn cancel_login_handler() -> impl IntoResponse {
@@ -199,24 +213,21 @@ async fn cancel_login_handler() -> impl IntoResponse {
 }
 
 async fn status_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
-    let Some(provider_id) = parse_provider_id(&q) else {
-        return err(StatusCode::BAD_REQUEST, "providerId 不能为空".to_string()).into_response();
+    let provider_id = parse_provider_id(&q);
+    // 有 id → 查 trae/<id>.json;无 id(未保存 provider)→ 查 pending(login-first 后已落 pending)。
+    let loaded = match &provider_id {
+        Some(id) => TraeCredentialStore::for_provider_id(id).and_then(|s| s.load()),
+        None => TraePendingStore::for_pending().and_then(|s| s.load()),
     };
-    let store = match TraeCredentialStore::for_provider_id(&provider_id) {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("home directory unavailable: {e}"),
-            )
-            .into_response()
+    match loaded {
+        Ok(None) => {
+            Json(json!({ "loggedIn": false, "providerId": provider_id, "pending": provider_id.is_none() }))
+                .into_response()
         }
-    };
-    match store.load() {
-        Ok(None) => Json(json!({ "loggedIn": false, "providerId": provider_id })).into_response(),
         Ok(Some(cred)) => Json(json!({
             "loggedIn": true,
             "providerId": provider_id,
+            "pending": provider_id.is_none(),
             "email": cred.email,
             "userId": cred.user_id,
             "aiRegion": cred.ai_region,
@@ -232,9 +243,12 @@ async fn status_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
 }
 
 async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
-    let Some(provider_id) = parse_provider_id(&q) else {
-        return err(StatusCode::BAD_REQUEST, "providerId 不能为空".to_string()).into_response();
-    };
+    // provider_id 可空:有 id = 已保存 provider(直接写 trae/<id>.json);无 id = 未保存
+    // provider 上 login-first(写 pending,保存时再 claim)。
+    let provider_id = parse_provider_id(&q);
+    let id_label = provider_id
+        .clone()
+        .unwrap_or_else(|| "(pending)".to_string());
     let my_epoch = next_epoch();
     let _done_guard = LoginDoneGuard { epoch: my_epoch };
 
@@ -244,11 +258,27 @@ async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
     };
 
     let mut config = OauthFlowConfig::default();
+    // 复用 transfer 内置 webview(对齐 MiMo/OpenCode),不开外部浏览器:auto_open_browser=false,
+    // 在 on_auth_url 回调里开内置登录窗加载 authorize URL,loopback 照常收 callback。
+    config.auto_open_browser = false;
     config.on_auth_url = Some(Arc::new(|url: &str| {
         tracing::info!(
             auth_url = url,
-            "trae OAuth auth URL 已生成 — 自动打开浏览器中"
+            "trae OAuth auth URL 已生成 — 内置 webview 打开中"
         );
+        let url = url.to_string();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = web_session_quota::open_external_login_window(
+                TRAE_LOGIN_WIN,
+                "Trae 登录",
+                &url,
+                (520.0, 720.0),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "[Trae] 打开内置登录窗失败");
+            }
+        });
     }));
 
     // 注册 cancel sender + 抢占语义(新登录抢占任何 in-flight)
@@ -261,21 +291,47 @@ async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
         }
     }
 
+    // 用户手动关登录窗 = 取消:登录结束前轮询窗口,曾开过又关掉则触发 cancel。
+    let login_done = Arc::new(AtomicBool::new(false));
+    {
+        let done = login_done.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut seen_open = false;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                if done.load(Ordering::Relaxed) {
+                    break; // 登录已结束(成功/失败/超时),停止监视
+                }
+                if web_session_quota::external_login_window_open(TRAE_LOGIN_WIN) {
+                    seen_open = true;
+                } else if seen_open {
+                    tracing::info!("[Trae] 登录窗被用户关闭 → 取消登录");
+                    cancel_in_flight_login();
+                    break;
+                }
+            }
+        });
+    }
+
     // 当前只支持 CN edition
     let result = run_trae_login(
         http,
         TraeEdition::Cn,
-        &provider_id,
+        provider_id.as_deref(),
         &config,
         Some(cancel_rx),
     )
     .await;
+    login_done.store(true, Ordering::Relaxed);
+    web_session_quota::close_external_login_window(TRAE_LOGIN_WIN);
     cleanup_slot(my_epoch);
 
+    let pending = provider_id.is_none();
     match result {
         Ok(cred) => Json(json!({
             "loggedIn": true,
             "providerId": provider_id,
+            "pending": pending,
             "email": cred.email,
             "userId": cred.user_id,
             "aiRegion": cred.ai_region,
@@ -283,12 +339,15 @@ async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
         }))
         .into_response(),
         Err(TraeError::Flow(codex_app_transfer_gemini_oauth::FlowError::Cancelled)) => {
-            tracing::info!(provider_id, "trae OAuth login cancelled — 不落盘");
+            tracing::info!(
+                provider_id = id_label,
+                "trae OAuth login cancelled — 不落盘"
+            );
             Json(json!({"loggedIn": false, "cancelled": true, "providerId": provider_id}))
                 .into_response()
         }
         Err(e) => {
-            tracing::warn!(provider_id, error = %e, "trae OAuth login 失败");
+            tracing::warn!(provider_id = id_label, error = %e, "trae OAuth login 失败");
             Json(json!({"loggedIn": false, "providerId": provider_id, "error": e.to_string()}))
                 .into_response()
         }
@@ -296,20 +355,13 @@ async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
 }
 
 async fn logout_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
-    let Some(provider_id) = parse_provider_id(&q) else {
-        return err(StatusCode::BAD_REQUEST, "providerId 不能为空".to_string()).into_response();
+    let provider_id = parse_provider_id(&q);
+    // 有 id → 删 trae/<id>.json;无 id → 删 pending。
+    let deleted = match &provider_id {
+        Some(id) => TraeCredentialStore::for_provider_id(id).and_then(|s| s.delete()),
+        None => TraePendingStore::for_pending().and_then(|s| s.delete()),
     };
-    let store = match TraeCredentialStore::for_provider_id(&provider_id) {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("home directory unavailable: {e}"),
-            )
-            .into_response()
-        }
-    };
-    if let Err(e) = store.delete() {
+    if let Err(e) = deleted {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("trae credential delete failed: {e}"),
@@ -317,6 +369,26 @@ async fn logout_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
         .into_response();
     }
     Json(json!({ "loggedIn": false, "providerId": provider_id })).into_response()
+}
+
+/// login-first 收尾:保存 provider 拿到 id 后,把 pending 凭证绑定到该 id。
+async fn claim_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
+    let Some(provider_id) = parse_provider_id(&q) else {
+        return err(StatusCode::BAD_REQUEST, "claim 需要 providerId".to_string()).into_response();
+    };
+    match claim_pending_for_provider(&provider_id) {
+        Ok(claimed) => {
+            if claimed {
+                tracing::info!(provider_id, "trae pending 凭证已绑定到 provider");
+            }
+            Json(json!({ "claimed": claimed, "providerId": provider_id })).into_response()
+        }
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("trae claim pending failed: {e}"),
+        )
+        .into_response(),
+    }
 }
 
 fn cleanup_slot(my_epoch: u64) {

@@ -15,7 +15,7 @@ import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import IconEye from '~icons/lucide/eye'
 import IconEyeOff from '~icons/lucide/eye-off'
 import OAuthLoginSection from '@/components/provider/OAuthLoginSection.vue'
-import type { OAuthKind } from '@/api/oauth'
+import { oauthClaimPending, type OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
 
 // editId 为空 = 添加;非空 = 编辑(从 store 取数据 + 拉 secret 回填)
@@ -486,8 +486,16 @@ async function save() {
   saving.value = true
   error.value = ''
   try {
-    if (props.editId) await providersApi.updateProvider(props.editId, payload)
-    else await providersApi.addProvider(payload)
+    if (props.editId) {
+      await providersApi.updateProvider(props.editId, payload)
+    } else {
+      const res = (await providersApi.addProvider(payload)) as { provider?: { id?: string } }
+      // trae login-first:登录写的是 pending 凭证,保存拿到新 id 后绑定过去(claim)。
+      const newId = res?.provider?.id
+      if (oauthKind.value === 'trae' && newId) {
+        await oauthClaimPending('trae', newId).catch(() => {})
+      }
+    }
     await store.load().catch(() => {})
     emit('saved')
     emit('close')

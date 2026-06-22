@@ -116,6 +116,48 @@ impl TraeCredentialStore {
     }
 }
 
+/// **登录后保存**(login-first)的中间凭证句柄:`<home>/.codex-app-transfer/trae/_pending.json`。
+///
+/// 在**尚未保存的 provider**(无 id)上点登录时,登录产出的完整 [`TraeCredential`](含本次
+/// 新生成的设备指纹)先落 pending;用户保存 provider 拿到 id 后,由
+/// [`claim_pending_for_provider`](super::claim_pending_for_provider) 把 pending 迁成
+/// `trae/<id>.json` 并删 pending。单槽(同一时刻只一个 in-flight 新登录,UI 串行)。
+pub struct TraePendingStore {
+    path: PathBuf,
+}
+
+impl TraePendingStore {
+    pub fn for_pending() -> Result<Self, TokenError> {
+        let home =
+            codex_app_transfer_registry::paths::resolve_home().ok_or(TokenError::HomeNotSet)?;
+        let path = home
+            .join(".codex-app-transfer")
+            .join("trae")
+            .join("_pending.json");
+        Ok(Self { path })
+    }
+
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Option<TraeCredential>, TokenError> {
+        read_json_opt(&self.path)
+    }
+
+    pub fn save(&self, cred: &TraeCredential) -> Result<(), TokenError> {
+        write_json_atomic(&self.path, cred)
+    }
+
+    pub fn delete(&self) -> Result<(), TokenError> {
+        delete_file_idempotent(&self.path)
+    }
+}
+
 /// 把 provider id 清洗成安全文件名片段(只留 `[A-Za-z0-9._-]`,其余换 `_`)。
 /// 防 `../`、路径分隔符等注入到文件路径。
 fn sanitize_id(id: &str) -> String {

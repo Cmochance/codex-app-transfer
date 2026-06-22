@@ -876,7 +876,6 @@ export default {
   "oauth.loggedInAs": "Logged in: {email}",
   "oauth.notLoggedIn": "Not logged in",
   "oauth.loginFailed": "Login failed",
-  "oauth.saveProviderFirst": "Save this provider first, then log in",
   "providerForm.apiFormat": "Protocol Format",
   "providerForm.authScheme": "Auth Scheme",
   "providerForm.modelMapSection": "Model mapping",
