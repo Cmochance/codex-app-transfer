@@ -1003,6 +1003,7 @@ export default {
   "oauth.loggedInAs": "已登录:{email}",
   "oauth.notLoggedIn": "未登录",
   "oauth.loginFailed": "登录失败",
+  "oauth.saveProviderFirst": "请先保存该 provider,再登录",
   "providerForm.apiFormat": "协议格式",
   "providerForm.authScheme": "鉴权方式",
   "providerForm.modelMapSection": "模型映射",

@@ -36,6 +36,7 @@ pub mod constants;
 pub mod flow;
 pub mod service;
 pub mod token;
+pub mod trae;
 pub mod zai;
 
 pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};
@@ -66,4 +67,11 @@ pub use antigravity::{
 pub use zai::{
     resume_zai_login, run_zai_login, ZaiCredential, ZaiCredentialStore, ZaiError, ZaiPendingStore,
     ZaiPendingTokens, ZaiProvider, ZaiProviderConfig,
+};
+
+// Trae(字节 TRAE SOLO CN / Work CN 账号登录)provider re-exports(parallel module,
+// loopback OAuth2 + PKCE + 设备密钥签名 refresh + 按 provider id 多账号指纹隔离)
+pub use trae::{
+    ensure_valid_trae_token, run_trae_login, DeviceFingerprint, DeviceKeyPair, TraeCredential,
+    TraeCredentialStore, TraeEdition, TraeError, TraeProviderConfig,
 };

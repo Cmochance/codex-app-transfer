@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // OAuth 账号登录区(替代 API Key):未登录显示「登录」(POST 开浏览器授权,长阻塞),
 // 登录中显示「登录中…+取消」,已登录显示邮箱 + 「登出」。状态变化 emit 给父表单。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import {
@@ -14,7 +14,9 @@ import {
 } from '@/api/oauth'
 import AppButton from '@/components/ui/AppButton.vue'
 
-const props = defineProps<{ kind: OAuthKind }>()
+// providerId:仅 trae 这类「按 provider 条目隔离多账号」的 kind 需要(= 当前编辑的
+// provider id)。新建未保存时为空 → 先提示保存。其余 kind(zai/gemini/...)忽略。
+const props = defineProps<{ kind: OAuthKind; providerId?: string }>()
 const emit = defineEmits<{ change: [loggedIn: boolean] }>()
 const { show: toast } = useToast()
 
@@ -22,12 +24,21 @@ const status = ref<OAuthStatus | null>(null)
 const logging = ref(false)
 let cancelled = false
 
+// 需要 providerId 的 kind(trae):provider 未保存(无 id)时不能登录,先提示保存。
+const needsProviderId = computed(() => props.kind === 'trae')
+const ready = computed(() => !needsProviderId.value || !!props.providerId)
+
 function errMsg(e: unknown): string {
   return (e as Error)?.message || String(e)
 }
 async function refresh() {
+  if (!ready.value) {
+    status.value = { loggedIn: false }
+    emit('change', false)
+    return
+  }
   try {
-    status.value = await oauthStatus(props.kind)
+    status.value = await oauthStatus(props.kind, props.providerId)
     emit('change', !!status.value?.loggedIn)
   } catch {
     status.value = { loggedIn: false }
@@ -43,7 +54,10 @@ async function onLogin() {
     // 长阻塞:浏览器授权完成/取消才返回。部分上游(zai/bigmodel/google)登录失败时
     // 返回 HTTP 200 {loggedIn:false, error},api() 不抛 → 需显式读出 error 提示,
     // 否则失败看起来像无操作。
-    const res = (await oauthLogin(props.kind)) as { loggedIn?: boolean; error?: string } | null
+    const res = (await oauthLogin(props.kind, props.providerId)) as {
+      loggedIn?: boolean
+      error?: string
+    } | null
     if (res && res.loggedIn === false && res.error && !cancelled) {
       toast(res.error, 'error')
     }
@@ -64,7 +78,7 @@ async function onCancel() {
 }
 async function onLogout() {
   try {
-    await oauthLogout(props.kind)
+    await oauthLogout(props.kind, props.providerId)
     await refresh()
   } catch (e) {
     toast(errMsg(e), 'error')
@@ -74,7 +88,10 @@ async function onLogout() {
 
 <template>
   <div class="oauth">
-    <template v-if="logging">
+    <template v-if="!ready">
+      <span class="oauth__msg">{{ t('oauth.saveProviderFirst') }}</span>
+    </template>
+    <template v-else-if="logging">
       <span class="oauth__msg">{{ t('oauth.loggingIn') }}</span>
       <AppButton size="sm" variant="secondary" :label="t('common.cancel')" @click="onCancel" />
     </template>

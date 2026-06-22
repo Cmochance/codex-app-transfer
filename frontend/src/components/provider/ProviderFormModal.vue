@@ -165,6 +165,7 @@ const OAUTH_KIND_BY_AUTH: Record<string, OAuthKind> = {
   gemini_cli_oauth: 'gemini',
   google_oauth_antigravity: 'antigravity',
   antigravity_oauth: 'antigravity',
+  trae_oauth: 'trae',
 }
 const oauthKind = computed<OAuthKind | null>(() => OAUTH_KIND_BY_AUTH[form.authScheme] ?? null)
 // grok-web 不是 OAuth, 走粘贴 grok.com SSO cookie。
@@ -519,7 +520,11 @@ async function save() {
         <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
       <SettingsRow v-if="oauthKind" :title="t('providerForm.account')">
-        <OAuthLoginSection :key="oauthKind" :kind="oauthKind!" />
+        <OAuthLoginSection
+          :key="oauthKind"
+          :kind="oauthKind!"
+          :provider-id="props.editId ?? undefined"
+        />
       </SettingsRow>
       <SettingsRow v-else-if="isGrokWeb" :title="t('providerForm.grokCookie')">
         <AppInput v-model="form.grokSso" :placeholder="t('providerForm.grokCookiePlaceholder')" />

@@ -27,6 +27,7 @@ mod single_instance;
 mod system_proxy;
 mod telemetry_bridge;
 mod trace_viewer;
+mod trae_quota;
 mod web_session_quota;
 #[cfg(target_os = "windows")]
 mod windows_msix;
@@ -681,6 +682,21 @@ fn main() {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         handlers::zai_oauth::wait_for_login_epoch_complete(target_epoch),
+                    )
+                    .await
+                });
+            }
+            // [CAT-257] 同理取消 in-flight Trae OAuth login:防退出期间后台 OAuth task 残留 +
+            // 落盘 ghost 凭证(与 zai/antigravity 同语义)
+            let trae_outcome = handlers::trae_oauth::cancel_in_flight_login();
+            if let (true, Some(target_epoch)) =
+                (trae_outcome.cancelled, trae_outcome.cancelled_epoch)
+            {
+                tracing::info!(target_epoch, "app exit: cancelled in-flight trae OAuth login");
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::trae_oauth::wait_for_login_epoch_complete(target_epoch),
                     )
                     .await
                 });

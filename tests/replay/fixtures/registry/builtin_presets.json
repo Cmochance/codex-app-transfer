@@ -567,5 +567,28 @@
     "requestOptions": {},
     "extraHeaders": {},
     "isBuiltin": true
+  },
+  {
+    "id": "trae-cn",
+    "name": "Trae（国内版）",
+    "gray": true,
+    "baseUrl": "https://api.trae.cn",
+    "docsUrl": "https://docs.trae.cn/",
+    "authScheme": "trae_oauth",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "default": "Doubao_1_6"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录（OAuth）免 API key —— 用 Trae 账号授权一次，每个 provider 条目独立设备指纹隔离（同设备多账号互不关联），走你的 Trae 订阅额度。"
+      },
+      {
+        "type": "warning",
+        "text": "当前仅支持登录 + 额度查看；模型路由开发中（Trae 为字节跳动私有协议，非标准 OpenAI/Anthropic 端点，Phase 2 接入）。"
+      }
+    ],
+    "isBuiltin": true
   }
 ]
