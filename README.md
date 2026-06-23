@@ -32,19 +32,30 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 ## 界面预览
 
+> 展示截图较多,统一收进下方折叠分组(默认折叠,点开查看;GitHub Markdown 不支持标签页,故用可折叠分组实现「整体展示区」)。
+
+<details>
+<summary><b>主界面</b> — 仪表盘 / 供应商 / 设置 / 日志</summary>
+
 | 仪表盘 | 供应商 |
 |---|---|
 | ![Board](img/Board.png) | ![Providers](img/Providers.png) |
 | **设置** | **日志** |
 | ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
 
-### Codex APP 实际接入
+</details>
+
+<details>
+<summary><b>Codex APP 实际接入</b></summary>
 
 启用任意供应商后,Codex APP 模型选择器会显示「<provider> / <real-model>」形式的真实模型名,对话过程中工具循环 / `previous_response_id` 历史回放 / thinking 模式 reasoning_content 注入全部由本地代理透明处理:
 
 ![Codex APP 实际对话](img/codex-cli-real-chat.png)
 
-### Codex Desktop 背景主题(可选)
+</details>
+
+<details>
+<summary><b>Codex Desktop 背景主题</b>(可选,11 套二次元主题)</summary>
 
 为 Codex Desktop(Electron 客户端)注入背景图 + 半透明玻璃面板 CSS,内置 11 套二次元主题(每套按背景图独立配色)+ 自定义上传。不修改 Codex 的 binary,基于 Chromium DevTools Protocol 运行时注入。开关为持久化状态标记:开启时落盘保存并即时注入(best-effort),若当前 Codex 未经本工具启动 / 调试端口不可用,则弹确认提示是否重启 Codex 让主题生效;关闭时落盘清除偏好并 best-effort 即时 CDP 清除已注入主题(回原生 UI),与开启对称 —— 同样在调试端口不可用时清除失败,则保留至 Codex 下次重启移除。
 
@@ -56,11 +67,27 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 第 6 套 Carton 自带右下角漂浮立绘(随鼠标动)。**自定义背景**:Theme 页 → "+ 添加自定义" → 选 JPG/PNG → 16:9 crop 弹窗自由选截取区域(拖拽 + 滚轮缩放)→ 应用。Codex 启动时如已开启 toggle 会自动注入已选主题,不需手动操作。
 
-### Codex 内用量显示(可选)
+</details>
+
+<details>
+<summary><b>Codex 内用量显示</b>(可选)</summary>
 
 在 Codex Desktop 顶栏「Toggle pinned summary」弹窗底部注入独立「Usage」分区:5 小时 / 每周 / 月度套餐额度(白名单 provider:antigravity gemini 系 + GLM Coding Plan + 小米 MiMo Token Plan + **OpenCode Go** + **Kimi Code**)、余额 / 已用额度数值(DeepSeek / Kimi 月之暗面 / anyrouter)、上下文用量、实时 Tokens 速率与累计、缓存命中率。其中**上下文**行可展开 Claude 风格的 by-source 明细下拉(按发往上游的内容分类:工具调用与输出 / 推理 / 开发者指令 / 对话消息 / 工具定义 / 系统提示),数据按对话持久化、启动即用。详见下方「能做什么」。
 
 ![Codex 内用量显示](img/codex-usage-breakdown.jpg)
+
+</details>
+
+<details>
+<summary><b>Codex 草稿暂存 Stash</b>(可选)</summary>
+
+输入框旁「暂存 / 恢复」按钮 + Usage 面板下方「Stash」列表:把预输入的文字 + 图片先暂存、腾出输入框去回复上一轮,随后选择性恢复到输入框或直接发送(多条时点恢复唤起下拉选)。
+
+| Stash 面板(支持图片) | 快捷恢复下拉 |
+|---|---|
+| ![Stash 面板](img/codex-stash-panel.png) | ![快捷恢复下拉](img/codex-stash-dropdown.png) |
+
+</details>
 
 ## 能做什么
 
@@ -94,6 +121,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - **注入的 system prompts 跟随界面语言**:本项目对非 OpenAI provider 注入的 `apply_patch` chat-path 规则 + autocompact 总结提示词,跟设置里 `语言 / Language` 一致(中文用户 → 中文 prompt,避免模型中英混杂思考);V4A 关键字(`*** Begin Patch` / `@@ <header>` 等)+ Codex CLI 错误消息原文保英文(parser / matcher 不接受翻译)
 - **Codex Desktop 主题(可选,默认关)**:Theme 页内置 11 套动漫主题(`carton` 含浮动看板娘,其余 `changli` / `azurlane` / `nailin` / `zani` / `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`),每套按背景图独立调出暗玻璃 + 强调色。通过 CDP 向 Codex Desktop 注入设计令牌覆盖(`--color-token-*` + 运行时 `--color-*` 层)+ 背景图,覆盖聊天 / 设置页 / 折叠侧栏 / 弹层等各视图。开关跟 Plugin Unlock 独立,page reload 自动重应用;关闭开关落盘清除偏好 + best-effort 即时 CDP 清除已注入主题(回原生 UI),仅清除失败(调试端口不可用)才保留至 Codex 下次重启移除
 - **Codex 内用量显示(可选,默认关)**(MOC-204):设置 → 「Codex 内显示用量信息」,在 Codex Desktop 顶栏「Toggle pinned summary」弹窗(含 Environment / Sources 等分区)底部注入独立「Usage」用量分区,最多 4 行:① **5 小时额度 / 每周额度 / 套餐用量**:仅白名单 provider 显示:**antigravity gemini 系**数据来自 `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` 双窗口**剩余**额度(remainingFraction×100);**GLM Coding Plan**(`bigmodel.cn`/`z.ai` coding 系)数据来自 `monitor/usage/quota/limit` 端点(apiKey 直接鉴权,不带 Bearer),返回 5h / 每周 TOKENS_LIMIT,已用% → 剩余% = 100-已用;**小米 MiMo Token Plan**(`platform.xiaomimimo.com`)显示月度套餐剩余%进度条,需在 provider 编辑页点「登录小米账号」按钮——套餐用量只在小米控制台、走 httpOnly session cookie,app 内嵌 webview 登录后抓取 cookie 存本地,daemon 带该 cookie 查询 `/api/v1/tokenPlan/usage`;**DeepSeek**(`api.deepseek.com`)显示余额 ¥X 数值条目,调官方 `/user/balance` 接口、与推理同一把 API key(Bearer);**Kimi(月之暗面 / Moonshot PAYG,`api.moonshot.cn`/`.ai`)**显示余额数值条目(可用 / 现金 / 赠金,按 host 记 ¥/$),调官方 `/v1/users/me/balance`、与推理同一把 key(Bearer)——**订阅制 `kimi-code`(`api.kimi.com/coding`)现经控制台 session 显示套餐用量**:用量只在 kimi.com 控制台、鉴权用 localStorage 的 `access_token`(非 API key),需在 provider 编辑页点「登录 Kimi」内嵌 webview 登录后注入 JS 经 cookie 桥抓出 token,daemon 带它当 Bearer 调 connect-RPC `kimi.gateway.membership.v2.MembershipService/GetSubscriptionStat` 取 subscriptionBalance / rate-limit;**OpenCode Go**(`opencode.ai/zen/go/v1`)显示 **5 小时 / 每周 / 每月**三档套餐用量剩余%:用量只在 opencode.ai 控制台(无 API),需在 provider 编辑页点「登录 OpenCode」内嵌 webview 登录抓 session cookie + workspace id,daemon 带它查 `/workspace/<id>/go` 页 SSR HTML 解析三档 usagePercent;**anyrouter**(`api.anyrouter.top`)显示已用额度 $X 数值条目,调 `/v1/dashboard/billing/usage`、与推理同一把 key(Bearer;账户余额受上游反爬限制仅展示已用量)。白名单均按 baseUrl host 判定。≤10% 红色预警 + 重置时刻;仅活动 provider 命中白名单时显示额度行,其余不显。② **上下文**:注入脚本直接从 Codex React fiber 读 `contextUsage.usedTokens / contextWindow`,有历史对话即立即显示(不需新对话);满窗口 = contextWindow÷0.95(加回 Codex 隐藏的 5% reserve);1M 模型显「1M」而非「1000k」。③ **Tokens(实时速率·累计)**:速率由 MutationObserver 监测 Codex 流式文本增量估算(2s 滑窗,CJK 感知);累计量来自 Codex rollout 文件。④ **缓存命中率**:来自 rollout 的 cached_input/input。**③④ + 速率均按活动对话隔离(MOC-230)**:注入脚本从 React fiber 读当前 `conversationId`,daemon 按该 id 取对应 rollout(== 文件名 uuid,非「最近修改」的文件),切对话即跟随、不串号;读不到 id / 无对应 rollout 显「—」(绝不显示别的对话数据)。「Usage」标题可折叠(chevron + localStorage 持久)。注入走 CDP 周期推送,页面刷新 / 重启后自动重挂;需通过本应用启动 Codex,若 Codex 已在运行需重启生效
+- **Codex 内草稿暂存(可选,默认关)**:设置 →「Codex 内启用草稿暂存」,在输入框旁注入「暂存 / 恢复」按钮对,并在 Usage 面板下方注入可折叠「Stash」分区。解决「预输入内容 vs 临时插话」冲突:把当前输入框草稿先暂存(push 按钮)腾出输入框去补一句,随后选择性恢复到输入框(pop 按钮——1 条直接恢复,多条唤起下拉选)或在 Stash 面板里对每条 恢复 / 发送 / 删除。恢复采用 swap 语义——输入框非空时先把当前内容暂存,不丢草稿。比 Codex 原生 steer(预存后只能按队列顺序自动发送)更灵活。状态存于 renderer localStorage 的全局列表(跨 Codex 重载存活)。注入走 CDP 周期推送,页面刷新 / 重启后自动重挂;需通过本应用启动 Codex。
 - **系统代理(梯子)连通性检测**(MOC-114):仪表盘「网络代理」卡实时显示系统代理是否活跃(已连接 / 未连接 / 自动配置 PAC / 检测中);relay 真实账号模式下「自动解锁 Codex Plugins」开关在账号有效且代理可达两条件同时满足时才激活,避免梯子没开时 plugins 静默全 502 却显示"已登录"的误导态。探测仅对代理端口做短超时 TCP 连通测试,不访问 chatgpt.com。
 - **内置联网抓取工具(web_fetch,MOC-144)**:设置页 → 「内置联网抓取工具」选 `auto`(推荐,**MOC-215 起默认 `auto`、开箱即用**;**MOC-256 起:系统无 Chrome / 未下载内置 shell 的新装默认改为 `off`**,避免运行时 web_fetch 升 headless 时静默下载 ~86MB chrome-headless-shell —— 有 Chrome 的新装用户无需手动开启即可用 web_fetch / web_search,无 Chrome 用户手动选 auto/headless 时经门控确认下载;web_fetch 走 curl/wreq 不需 Chrome,web_search 仍受 Chrome 就绪 gate 保护、不静默下载) / `curl` / `wreq` / `headless`(**独立于** Codex 沙箱联网开关),transfer 自动往 Codex 注册 `web_fetch` MCP 工具,Codex 模型可直接调该工具抓取网页 —— `curl` 走标准 HTTP、`wreq` 绕 Cloudflare TLS 挑战、`headless` 驱动无头 Chrome 取 JS 渲染后 DOM(在设置页选 `headless` / `auto` 时先查 Chrome 就绪:系统 Chrome `--version` 自检通过、或已下载内置 chrome-headless-shell,即直接启用不重复下载;都没有才弹窗确认按需下载 chrome-headless-shell ~86 MB。若配了系统代理但当前连不上,会自动降级到 `wreq` 并提示)。三档之外,`web_fetch` 还能跟随 **HTML meta refresh / JS `location` 跳转**(重定向到目标 URL 重抓,防循环最多 3 跳)——curl/wreq/headless 只处理 HTTP 3xx,不跟这类客户端重定向;绕 Twitter/Substack 等封锁的"占位跳转页"会自动跟随到真实内容页(MOC-139)。**`auto` 档(MOC-161)**:按页面难度自动从 curl 升级到 wreq 再到 headless,对每个域名记住上次成功档位(下次从该档起步省试错);系统代理不可达时自动压制至 curl(wreq / headless 依赖代理);首次用 headless 档同样弹窗确认 Chrome 下载。切档即时生效(无需重启);**改"开/关"状态后需重启 Codex Desktop** 才会让联网工具(web_fetch / web_search / read_url_local)在 Codex 里出现 / 消失(MOC-235 起该 MCP server 始终注册以托管 `read_tool_artifact`,关闭联网档只是不再暴露这几个联网工具,不再卸载整个 server)。抓到的 HTML 会自动转成 markdown 返给模型(更省 token、更干净;非 HTML 响应原样透传),headless 用 networkIdle 等渲染落定再取(MOC-145)。headless 抓取启用反检测 stealth(抹 `navigator.webdriver`、伪造 `window.chrome`/插件/WebGL、UA 去 `HeadlessChrome` 标记),可过被动指纹 / 简单 JS 挑战类 Cloudflare;交互式 Turnstile/DataDome 托管挑战仍过不了(MOC-152)。headless 遇 CF JS 挑战页会**原地等其自动解出**再读(而非立即把挑战页当正文返回),并**按域名持久化浏览器 profile** 复用 CF 放行 cookie —— 同一站点二次抓取跳过重复挑战、更快(MOC-156)。抓到的页转 markdown 前先做**正文抽取**(readability 算法剥 nav/页眉/页脚/侧栏/广告,只留正文,大页正文不再被截断挤掉;非文章页自动回退整页);图片 / 视频 / 音频 / PDF 等**二进制资源**与超 16 MB 大文件不下载、直接返提示(不再吐乱码 / 防 OOM)(MOC-152)。`web_fetch` **默认直接返回抓取到的完整正文**(当前轮全文进 LLM 上下文、adapter 层自动把历史轮的 tool 输出压缩以防撑爆;MOC-190)—— 不再分页、不再按 `offset` 翻页、不再按 `query` 相关性选块,精确信息(代码 / schema / 版本 / 数字)不丢。若较早抓取的某 URL 正文在对话历史里被折叠 / 压缩、需要回看完整原文,用 **`read_url_local(url)`** 从进程内缓存取回,不必重新联网(缓存 15 min)。**更进一步,任意工具(shell / 飞书等 MCP / 其它)的大输出在历史里被压成 `[Tool output stored outside model context]` 摘要时,摘要会给出 `Artifact ID`,模型可调 `read_tool_artifact(artifact_id)` 取回该输出原文** —— 读 proxy 压缩时落盘的共享 `tool_artifacts.db`(SQLite WAL,跨进程读),不必为回看历史而重跑工具;取回内容仅当前轮可见、下一轮再被自动折叠不长期占上下文;超 90k 字符的大输出分页返回(每块低于 proxy keep-full 上限,末尾提示用 `offset` 逐块读完整)(MOC-235)。这些工具(`web_fetch` / `web_search` / `read_url_local` / `read_tool_artifact`)均声明 `readOnlyHint`(只读),Codex 的 auto-review guardian 据此**跳过审批**(`requires_mcp_tool_approval` 命中只读直接放行),联网调用不再逐次触发风险审批往返、消除审批延迟(MOC-172)。
 - **内置 web_search 搜索工具(MOC-12)**:启用「内置联网抓取工具」(非 off)且本机 Chrome 就绪后,transfer 往 Codex 注册 `web_search` 工具 —— 模型给关键词即返回结构化结果列表(标题 + 真实 URL + 摘要),配合 `web_fetch` 组成**两段式联网**:先 `web_search` 找信息源、再 `web_fetch` 抓正文,免去模型瞎猜 URL。**为什么需要**:Codex 默认每轮发的 OpenAI server-side `web_search` 在第三方 chat provider(MiniMax / DeepSeek / GLM / Kimi 等)上游不被支持、被协议层 drop,模型只能退化到自己抓搜索引擎页 / 猜 URL(真机实测成功率仅 ~17%)。本工具走 **DuckDuckGo + Bing 双引擎并行检索、按 URL 归一化去重后交错合并**(免 key、对数据中心 / VPN 出口 IP 友好;两家索引互补、单次覆盖面较单源明显更全,MOC-215;此前 Bing 仅在 DDG 失败时兜底 MOC-186),且**内部固定 headless** 浏览器代搜 —— DDG / Bing 对纯 HTTP 请求反爬拦截(无论 TLS 指纹多真),必须真浏览器跑 JS;并行抓取故 wall-time ≈ 单家而非求和,任一引擎被拦 / 无结果时另一家仍可用。`web_search` 内部固定 headless,但其**暴露 / 调用只要求本机 Chrome 就绪**(系统装了 Chrome / Edge / Chromium,或已下载内置 chrome-headless-shell)—— 与 web_fetch 档位解耦:系统有 Chrome 的用户在任意非 off 档(含 curl / wreq)都能用 search 且不触发下载;两者皆无则不暴露、调用返回提示引导去 headless 档完成首次下载(MOC-190)。结果自动过滤广告;反爬拦截 / 无结果时返回明确提示(不静默吐空)。**翻页(MOC-215)**:`web_search` 只返第 1 页(约一二十条,不一次扩抓多页以免 headless 延迟过高);模型需要更多 / 不同来源时用独立工具 **`web_search_more`(同 query, page=2/3…)** 取下一批(走 Bing `first=` 深页),结果尾部附诱导提示引导模型主动翻页而非用同一 query 重复搜 —— 工具参数对数字字符串(模型常把 `page` 传成 `"2"`)做宽容解析,避免翻页静默退回第 1 页。DDG HTML 解析模式借鉴 `duckduckgo_search`(Python)上游。

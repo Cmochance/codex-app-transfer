@@ -56,7 +56,7 @@ const INSTALL_SCRIPT: &str = r##"
   // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
   // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
   // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
-  var VERSION = 3; // [MOC-231] 加 breakdown caret/下拉 + convId 守卫 → bump,升级后免重启 Codex 即覆盖旧注入
+  var VERSION = 4; // 加「Stash 面板在场时让位坐到其前」的占位协调 → bump,升级后免重启 Codex 即覆盖旧注入
   if (window.__catQuotaInstalled) {
     if (window.__catQuotaVersion === VERSION) return;
     try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
@@ -582,9 +582,15 @@ const INSTALL_SCRIPT: &str = r##"
       node.id = 'cat-quota-entry';
       scroller.appendChild(node);
       fresh = true;
+    }
+    // 末尾归位:React 后续追加 section 会把条目挤到中间(appendChild/insertBefore 对已存在
+    // 节点是移动)。默认恒在 scroller 末尾;但若 Stash 面板(cat-stash-entry,codex_stash_injector)
+    // 在场,本额度条目须坐到它**之前**(「Usage 在 Stash 上面」),否则两个注入器每 tick 争抢
+    // lastElementChild。稳定不动时不写,避免自触发 observer churn。
+    var __stash = document.getElementById('cat-stash-entry');
+    if (__stash && __stash.parentElement === scroller) {
+      if (node.nextElementSibling !== __stash) scroller.insertBefore(node, __stash);
     } else if (node !== scroller.lastElementChild) {
-      // React 后续往 scroller 追加 section 会把条目挤到中间;appendChild
-      // 对已存在节点是移动,保持条目恒在弹窗末尾
       scroller.appendChild(node);
     }
     // 内容只在数据变化(或节点新建)时重建,避免 observer 高频 re-render churn
@@ -1850,7 +1856,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
                                                      // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
         assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
-        assert!(INSTALL_SCRIPT.contains("var VERSION = 3"));
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 4")); // bump:Stash 面板在场时让位占位协调
     }
 
     #[test]
