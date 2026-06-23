@@ -256,6 +256,10 @@ Usually means `response.id` / `response.model` weren't returned in the shape Cod
 
 In relay mode (keep the ChatGPT login + route the model to a third party), v2.2.0–v2.2.1 required the model request's ChatGPT JWT to **byte-match** the local `~/.codex/auth.json` before forwarding. Any mismatch (token rotation / a different `CODEX_HOME` / not actually logged into ChatGPT) made the model request return 401 `missing or invalid gateway api key` → Codex's WS hung until the idle timeout → the chat froze (MOC-189 / #427). **Fixed**: the gateway now relies only on localhost binding + the `cas_` fallback, so third-party chat no longer depends on ChatGPT token state. A broken GPT JWT now only affects `/backend-api/*` (plugins/account), not the third-party conversation.
 
+### Intermittent `missing or invalid gateway api key` / sporadic 401 in apikey mode
+
+In apikey mode the gateway key (`cas_` prefix) is written to both the proxy config and Codex's `auth.json` (`OPENAI_API_KEY`). When the proxy restarts but the Codex Desktop process does not, the two sides can briefly diverge (proxy holds the new key, Desktop still sends the old one), causing intermittent 401s (#546). **Fixed**: gateway validation now falls back to `cas_` format matching — any incoming token with the `cas_` prefix is accepted regardless of whether the two copies agree. The gateway's purpose is to prevent unrelated programs from accidentally connecting to the proxy (real security is in local file permissions); the `cas_` prefix is enough to distinguish "a Codex configured by transfer" from "an unrelated external request" (#546).
+
 ### Upstream 400: `thinking is enabled but reasoning_content is missing`
 
 Kimi / DeepSeek with thinking enabled require historical assistant messages with `tool_call` to carry `reasoning_content`. This tool **auto-fills a default empty string since v1.0.1** and maps reasoning items from Responses input to the corresponding assistant message.

@@ -208,6 +208,14 @@ impl StaticResolver {
         if token == expected {
             return Ok(());
         }
+        // [MOC-546] gateway 宽松化:精确匹配失败后,若 token 仍符合 cas_ 格式则放行。
+        // gateway 定位为防误调用而非防攻击(真安全在本地文件权限),cas_ 格式校验足以
+        // 区分"被 transfer 配置过的 Codex"与"不相干的外部请求"。消除 gateway key 双写
+        // (proxy config ↔ auth.json)不一致导致的间歇性 401(Refs #546):无论双写怎么
+        // 漂移,两边都是 cas_ 格式,格式兜底恒放行。与 MOC-189 relay JWT 形状校验同思路。
+        if is_cas_gateway_key(token) {
+            return Ok(());
+        }
         // [MOC-189] relay 模式活动 `~/.codex/auth.json` 是真实 chatgpt,Codex 的**模型请求**
         // 发的是 chatgpt access_token(JWT,**不是** cas_ gateway key);放行让 `decide_provider`
         // 按 active_provider 转发到第三方 provider(用 provider 自己的 key,GPT JWT 不出本机、
@@ -380,6 +388,18 @@ fn is_chatgpt_access_token(token: &str) -> bool {
         .is_some_and(|s| !s.trim().is_empty())
 }
 
+/// 判断 token 是否是 cas_ 格式的 gateway key。用于 check_gateway 的格式兜底:
+/// gateway 定位为防误调用而非防攻击(真安全在本地文件权限),cas_ 格式校验足以区分
+/// "被 transfer 配置过的 Codex"与"外部误连"。容忍双写不一致的旧 key 版本(Refs #546)。
+/// 格式与 conversation_export::redact 的 `cas_[A-Za-z0-9_-]{12,}` 正则一致。
+fn is_cas_gateway_key(token: &str) -> bool {
+    let rest = token.strip_prefix("cas_").unwrap_or("");
+    rest.len() >= 12
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// 让裸 Resolver 可装进 `Arc<dyn ProviderResolver>`(给 ProxyState 共享用).
 pub type SharedResolver = Arc<dyn ProviderResolver>;
 
@@ -548,6 +568,33 @@ mod tests {
         assert_eq!(res.provider_id, "openai");
         assert_eq!(res.api_key, "sk-1");
         assert_eq!(res.rewritten_model, None);
+    }
+
+    #[test]
+    fn ok_when_cas_format_but_different_value() {
+        let r = StaticResolver::new(
+            Some("cas_real_key_here".into()),
+            vec![provider("openai", "https://up", "sk-1")],
+            Some("openai".into()),
+        );
+        // proxy 持有 cas_real_key,incoming 发不同的 cas_ key (模拟双写不一致)
+        let p = parts_with(&[("authorization", "Bearer cas_different_key")]);
+        let res = r.resolve(&p, b"{}").unwrap();
+        assert_eq!(res.provider_id, "openai");
+        assert_eq!(res.api_key, "sk-1");
+    }
+
+    #[test]
+    fn unauthorized_when_non_cas_non_jwt() {
+        let r = StaticResolver::new(
+            Some("cas_real_key_here".into()),
+            vec![provider("openai", "https://up", "sk-1")],
+            Some("openai".into()),
+        );
+        // 随机非 cas_ 非 JWT 字符串 -> 拒绝 (挡住外部误连)
+        let p = parts_with(&[("authorization", "Bearer sk-fake-token")]);
+        let err = r.resolve(&p, b"{}").unwrap_err();
+        assert!(matches!(err, ResolveError::Unauthorized));
     }
 
     /// 构造一个 ChatGPT access_token(JWT,payload 含 chatgpt_account_id)用于测试。
