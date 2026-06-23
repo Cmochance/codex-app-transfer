@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 8; // review r5:写校验保留空行(sameText)+ 发送提交成功才消费 + push 等图清空
+  var VERSION = 9; // review r6:写校验保留前导/尾随空行 + push 遇文件附件中止(保草稿不孤儿化)
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -120,11 +120,11 @@ const INSTALL_SCRIPT: &str = r##"
     for (var i = 0; i < ch.length; i++) lines.push(blockText(ch[i]));
     return lines.join('\n');
   }
-  // 写入校验比较:两侧都用块级规范文本(captureText)比对,**保留空行**(只去尾部空白/尾换行,
-  // 不折叠内部 `\n`)。不能折叠连续换行 —— 否则把 `a\n\nb` 写成 `a\nb`(丢空行)也判通过、照样消费/
-  // 发送被破坏的草稿(见 review)。容忍尾部空白差异以免误判失败。
+  // 写入校验比较:两侧都用块级规范文本(captureText)比对,**保留全部空行(含前导/尾随)**:只归一
+  // `\r` + 去各行尾的水平空白(空格/Tab,用户多半无意、PM 可能规整),**绝不折叠或裁剪任何 `\n`**。
+  // 折叠/裁剪换行会让 `a\n\nb`→`a\nb`、或丢前导空行也判通过 → 消费/发送被破坏草稿(见 review r5/r6)。
   function sameText(a, b) {
-    function f(s) { return (s == null ? '' : String(s)).replace(/\r/g, '').replace(/[ \t]+$/gm, '').replace(/\n+$/, '').replace(/^\n+/, ''); }
+    function f(s) { return (s == null ? '' : String(s)).replace(/\r/g, '').replace(/[ \t]+$/gm, ''); }
     return f(a) === f(b);
   }
   function fiberOf(el) { if (!el) return null; for (var k in el) { if (k.indexOf('__reactFiber$') === 0) return el[k]; } return null; }
@@ -248,6 +248,14 @@ const INSTALL_SCRIPT: &str = r##"
   // imageAttachments 更全 —— **也能挡住文件**:文件不在 stash 范围(curEntry 不存、clearImages
   // 不清,见 CAT-260),但 send 不该把残留文件一起发出(见 review),所以清空判定必须把它算进去。
   function hasAttachments() { return !!document.querySelector('[data-composer-attachments-row]'); }
+  // composer 是否挂着**非图片(文件)**附件。附件 chip 是 `.composer-attachment-surface`;图片 chip
+  // 内有 `<img>`,文件 chip 没有(CDP 实证图片 chip 含 img)。文件不可序列化/恢复(CAT-260):
+  // push 遇到文件应中止、保草稿,别只存文字把文件孤儿化(见 review)。
+  function hasFileAttachment() {
+    var chips = document.querySelectorAll('[data-composer-attachments-row] .composer-attachment-surface');
+    for (var i = 0; i < chips.length; i++) { if (!chips[i].querySelector('img')) return true; }
+    return false;
+  }
   // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存),纯文本也走它(等旧附件清空):
   // 1) 先等当前附件(图片**和**文件)全部清空(clearImages 异步;否则旧图仍在 React 态、或残留
   //    文件,submit 会把它们一起发出,见 review)——附件行消失才 2);文件清不掉 → 超时安全中止。
@@ -336,6 +344,9 @@ const INSTALL_SCRIPT: &str = r##"
     if (__busy) return;            // restore/send 异步进行中,别动 composer(见 review)
     var t = captureText(), imgs = readImages();
     if ((!t || !t.trim()) && !imgs.length) return;
+    // 含文件附件:中止 push,保草稿不动 —— 文件无法暂存/恢复(CAT-260),只存文字会把文件孤儿化、
+    // 被下一条原生发送带走(见 review)。提示用户先移除文件。
+    if (hasFileAttachment()) { notify('草稿含文件附件,暂不支持暂存(请先移除文件)'); return; }
     var entry = { id: uid(), text: t || '', ts: Date.now(), images: imgs };
     var arr = load().slice(); arr.push(entry);
     if (!save(arr)) {
