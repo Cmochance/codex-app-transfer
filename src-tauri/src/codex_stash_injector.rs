@@ -34,7 +34,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 1;
+  var VERSION = 2; // 加图片暂存/恢复(合成 paste)+ 配额降级 → bump,升级免重启覆盖
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -52,16 +52,26 @@ const INSTALL_SCRIPT: &str = r##"
       var s = localStorage.getItem(KEY); var a = s ? JSON.parse(s) : [];
       if (!Array.isArray(a)) return [];
       return a.filter(function (x) { return x && x.id != null; }).map(function (x) {
-        return { id: String(x.id), text: x.text == null ? '' : String(x.text), ts: x.ts || 0 };
+        return {
+          id: String(x.id),
+          text: x.text == null ? '' : String(x.text),
+          ts: x.ts || 0,
+          // 图片附件:{src:dataURL, filename}(可序列化;只留带 data: 前缀的)。文件附件注入侧无法
+          // 干净恢复(setComposerStateField 不可达 / 合成 drop 无 fs path),不纳入,见 followup CAT-260。
+          images: Array.isArray(x.images) ? x.images
+            .filter(function (im) { return im && typeof im.src === 'string' && im.src.indexOf('data:') === 0; })
+            .map(function (im) { return { src: im.src, filename: String(im.filename || 'image.png') }; }) : []
+        };
       });
     } catch (e) { return []; }
   }
-  function save(a) { try { localStorage.setItem(KEY, JSON.stringify(a)); } catch (e) {} }
+  // save 返回是否成功:图片 dataURL 较大,localStorage 配额(~5-10MB)可能溢出,caller 据此降级
+  // (绝不在保存失败时清空 composer 丢内容)。
+  function save(a) { try { localStorage.setItem(KEY, JSON.stringify(a)); return true; } catch (e) { return false; } }
   // id 用「ms + 会话内单调序号 + 随机」:序号保证同毫秒/同 random 也不碰撞(碰撞会让
   // filter(x=>x.id!==id) 误删两条)。
   var __seq = 0;
   function uid() { return Date.now().toString(36) + '-' + (++__seq).toString(36) + Math.random().toString(36).slice(2, 6); }
-  function add(text) { var a = load(); a.push({ id: uid(), text: text, ts: Date.now() }); save(a); }
   function findItem(arr, id) { for (var i = 0; i < arr.length; i++) { if (arr[i].id === id) return arr[i]; } return null; }
 
   // ── composer 操作(.ProseMirror,选择子均 CDP 实证)──
@@ -101,35 +111,125 @@ const INSTALL_SCRIPT: &str = r##"
     return false;
   }
 
+  // ── 图片附件(CDP 实证:附件行上方 fiber props 持有 imageAttachments + onRemoveImage)──
+  // 从附件行 / composer 往上爬 fiber,拿持有 imageAttachments 数组的 props。无附件时附件行不渲染
+  // → 返回 null(视作无图)。
+  function composerAtt() {
+    var anchor = document.querySelector('[data-composer-attachments-row]') || composerEl();
+    if (!anchor) return null;
+    var el = anchor, f = null; while (el && !(f = fiberOf(el))) el = el.parentElement;
+    var d = 0;
+    while (f && d < 40) {
+      var p = f.memoizedProps;
+      if (p && typeof p === 'object' && Array.isArray(p.imageAttachments)) {
+        return { images: p.imageAttachments, onRemoveImage: typeof p.onRemoveImage === 'function' ? p.onRemoveImage : null };
+      }
+      f = f.return; d++;
+    }
+    return null;
+  }
+  // 读当前图片为可序列化 {src(dataURL), filename}(只留 dataURL 的,能恢复的才存)
+  function readImages() {
+    var a = composerAtt(); if (!a || !a.images) return [];
+    return a.images
+      .filter(function (im) { return im && typeof im.src === 'string' && im.src.indexOf('data:') === 0; })
+      .map(function (im) { return { src: im.src, filename: im.filename || 'image.png' }; });
+  }
+  // 清掉 composer 现有图片(逐个 onRemoveImage(id));**不动文件**(文件不在 stash 范围,见 CAT-260)
+  function clearImages() {
+    var a = composerAtt(); if (!a || !a.onRemoveImage || !a.images) return;
+    a.images.map(function (im) { return im.id; }).forEach(function (id) { try { a.onRemoveImage(id); } catch (e) {} });
+  }
+  // 把保存的图片合成 paste 回 composer(atob 解 base64→File→ClipboardEvent;fetch(dataURL) 被 CSP 挡)
+  function addImages(imgs) {
+    if (!imgs || !imgs.length) return;
+    var pm = composerEl(); if (!pm) return;
+    try { pm.focus(); } catch (e) {}
+    imgs.forEach(function (im) {
+      try {
+        var arr = im.src.split(','), mime = (arr[0].match(/:(.*?);/) || [])[1] || 'image/png';
+        var bstr = atob(arr[1] || ''), n = bstr.length, u8 = new Uint8Array(n);
+        while (n--) u8[n] = bstr.charCodeAt(n);
+        var file = new File([u8], im.filename || 'image.png', { type: mime });
+        var dt = new DataTransfer(); dt.items.add(file);
+        var ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+        Object.defineProperty(ev, 'clipboardData', { value: dt });
+        pm.dispatchEvent(ev);
+      } catch (e) {}
+    });
+  }
+  // 合成 paste 是异步落值(FileReader+persist),发送前轮询图片就位(最多 ~2.5s)再提交。
+  function waitImages(target, cb) {
+    var tries = 0;
+    var iv = setInterval(function () {
+      tries++;
+      if (readImages().length >= target || tries > 25) { clearInterval(iv); cb(); }
+    }, 100);
+  }
+  // 最小 toast(暂存失败/降级时告知;无侵入,2.5s 自removed)
+  function notify(msg) {
+    try {
+      var t = el('div', null, msg); t.id = 'cat-stash-toast';
+      t.style.cssText = 'position:fixed;left:50%;bottom:80px;transform:translateX(-50%);z-index:99999;padding:8px 14px;border-radius:8px;background:rgba(20,24,36,.92);color:#fff;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.4);pointer-events:none';
+      var old = document.getElementById('cat-stash-toast'); if (old) old.remove();
+      document.body.appendChild(t);
+      setTimeout(function () { try { t.remove(); } catch (e) {} }, 2500);
+    } catch (e) {}
+  }
+
   // ── 核心动作 ──
-  // 恢复:**先**把目标填进输入框,落值成功**才**消费该条(失败则 stash 原封不动,绝不丢草稿)。
-  // 输入框非空时把当前内容先暂存(swap)。
+  // 当前 composer 内容(文本 + 图片)打包成一条 swap 用的 entry;全空返 null
+  function curEntry() {
+    var t = composerText(), imgs = readImages();
+    if ((!t || !t.trim()) && !imgs.length) return null;
+    return { id: uid(), text: t || '', ts: Date.now(), images: imgs };
+  }
+  // 恢复:把目标(文本+图片)放进 composer;输入框非空则先把当前内容 swap 进 stash(不丢)。
+  // **先 save(配额够)再动 composer**——保存失败就安全中止,绝不出现「清了 composer 但没存上」。
   function restore(id) {
     var arr = load(); var item = findItem(arr, id); if (!item) return;
-    var cur = composerText();
-    if (!setComposer(item.text)) return;   // composer 不可用/未落值 → 不消费
+    var cur = curEntry();
     var rest = arr.filter(function (x) { return x.id !== id; });
-    if (cur && cur.trim()) rest.push({ id: uid(), text: cur, ts: Date.now() });
-    save(rest); closeMenu(); ensure();
+    if (cur) rest.push(cur);
+    if (!save(rest)) { notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
+    clearImages();                 // 清掉当前图片(已 swap 进 stash);不动文件
+    setComposer(item.text);
+    addImages(item.images || []);
+    closeMenu(); ensure();
   }
-  // 发送:先填入(失败即止,stash 不动);被挤出的当前内容 cur 无论成败都先存好(不丢);
-  // 仅在提交成功时才消费目标项,提交失败则保留目标项(此时 item.text 在输入框可重发)。
+  // 发送:同 restore 把目标放进 composer,图片就位后提交;提交成功消费该条,失败也无损
+  //(目标内容已在输入框可重发,当前内容已 swap 进 stash)。
   function sendItem(id) {
     var arr = load(); var item = findItem(arr, id); if (!item) return;
-    var cur = composerText();
-    if (!setComposer(item.text)) return;   // composer 不可用/未落值 → 全不动
-    var curEntry = cur && cur.trim() ? [{ id: uid(), text: cur, ts: Date.now() }] : [];
-    if (submitComposer()) {
-      save(arr.filter(function (x) { return x.id !== id; }).concat(curEntry)); // 成功:消费 item + 保留 cur
-    } else {
-      save(arr.concat(curEntry));          // 失败:保留 item(输入框里可重发)+ 保留 cur
-    }
-    ensure();
+    var cur = curEntry();
+    var next = arr.filter(function (x) { return x.id !== id; });
+    if (cur) next.push(cur);
+    if (!save(next)) { notify('暂存空间不足,发送已取消'); return; }
+    clearImages();
+    setComposer(item.text);
+    addImages(item.images || []);
+    var fire = function () { submitComposer(); ensure(); };
+    if ((item.images || []).length) waitImages(item.images.length, fire); else fire(); // 合成 paste 异步,等图片就位再发
   }
   function del(id) { save(load().filter(function (x) { return x.id !== id; })); ensure(); }
-  // 暂存当前输入框内容 → 清空输入框。空内容 no-op。**先清空成功才入库**,避免清空失败时
-  // 草稿既进了 stash 又留在输入框(重复)。
-  function stashCurrent() { var t = composerText(); if (!t || !t.trim()) return; if (!setComposer('')) return; add(t); ensure(); }
+  // 暂存当前(文本+图片)→ 清空输入框(**不动文件**,文件不在范围见 CAT-260)。
+  // **先 save 成功才清**,避免清了没存上丢内容;配额溢出时降级为只存文字(图片太大),不丢文字。
+  function stashCurrent() {
+    var t = composerText(), imgs = readImages();
+    if ((!t || !t.trim()) && !imgs.length) return;
+    var entry = { id: uid(), text: t || '', ts: Date.now(), images: imgs };
+    var arr = load(); arr.push(entry);
+    if (!save(arr)) {
+      if (t && t.trim()) { // 退化:只存文字,图片留在输入框不清
+        entry.images = []; var a2 = load(); a2.push(entry);
+        if (save(a2)) { setComposer(''); notify('图片过大未暂存,仅暂存了文字'); ensure(); return; }
+      }
+      notify('暂存失败:存储空间不足'); return; // 什么都没存,什么都不动
+    }
+    if (t && t.trim()) setComposer(''); // 存成功才清:文字 + 图片(文件保留)
+    clearImages();
+    ensure();
+  }
 
   // ── 样式(scoped,跟随 Codex 主题 token + 注入主题 accent)──
   function ensureStyle() {
@@ -153,6 +253,9 @@ const INSTALL_SCRIPT: &str = r##"
       '#cat-stash-entry .csact{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;cursor:pointer;color:var(--color-token-text-secondary,#8c8782);opacity:.75}' +
       '#cat-stash-entry .csact:hover{opacity:1;background:rgba(128,128,128,.16);color:var(--cl-accent,#6c83c4)}' +
       '#cat-stash-entry .csact svg{width:14px;height:14px}' +
+      // 行内图片计数 chip
+      '#cat-stash-entry .csimg{flex:0 0 auto;display:inline-flex;align-items:center;gap:3px;font-size:11px;color:var(--color-token-text-tertiary,rgba(238,241,247,.5));font-variant-numeric:tabular-nums}' +
+      '#cat-stash-entry .csimg svg{width:13px;height:13px}' +
       // composer 工具栏按钮组
       '#cat-stash-bar{display:inline-flex;align-items:center;gap:4px;margin-right:4px}' +
       '#cat-stash-bar button{position:relative;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;border:1px solid var(--color-token-border,rgba(128,128,128,.28));background:transparent;color:var(--color-token-text-secondary,#8c8782);cursor:pointer;padding:0}' +
@@ -174,7 +277,8 @@ const INSTALL_SCRIPT: &str = r##"
     pop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V11"/><path d="M8 15l4-4 4 4"/><path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2"/></svg>',
     restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14l-4-4 4-4"/><path d="M5 10h11a4 4 0 0 1 0 8h-1"/></svg>',
     send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>',
-    del: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6"/></svg>'
+    del: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6"/></svg>',
+    image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>'
   };
   function iconBtn(cls, ic, title, onClick) {
     var b = el('span', cls); b.innerHTML = ICON[ic]; b.title = title;
@@ -213,8 +317,16 @@ const INSTALL_SCRIPT: &str = r##"
     } else {
       arr.forEach(function (it) {
         var row = el('div', 'csrow');
-        var t = el('div', 'cstext', (it.text || '').replace(/\s+/g, ' ').trim()); t.title = it.text || '';
+        var nimg = (it.images || []).length;
+        var label = (it.text || '').replace(/\s+/g, ' ').trim();
+        if (!label && nimg) label = '(图片)';
+        var t = el('div', 'cstext', label); t.title = it.text || '';
         row.appendChild(t);
+        if (nimg) {
+          var chip = el('span', 'csimg'); chip.innerHTML = ICON.image;
+          chip.appendChild(el('span', null, String(nimg))); chip.title = nimg + ' 张图片';
+          row.appendChild(chip);
+        }
         row.appendChild(iconBtn('csact', 'restore', '恢复到输入框', function () { restore(it.id); }));
         row.appendChild(iconBtn('csact', 'send', '直接发送', function () { sendItem(it.id); }));
         row.appendChild(iconBtn('csact', 'del', '删除', function () { del(it.id); }));
@@ -235,7 +347,9 @@ const INSTALL_SCRIPT: &str = r##"
     // 变更),本模块 observer 监听 body childList → 若每 tick 无条件重建就是 ~60fps 自循环(空闲也跑)。
     // 用签名 guard 跳过无变化重建(对齐 quota 的 __catQuotaSig)。折叠态由 header 点击直接 toggle class,
     // 不经重建,故不入签名。
-    var sig = JSON.stringify(load());
+    // 廉价签名:条目不可变(只增删/消费),id 列表 + 各自图片数即可表征变化;**不** stringify 整个
+    // load()(图片 dataURL 可达数 MB,每 tick stringify 会很热)。
+    var sig = load().map(function (e) { return e.id + '#' + ((e.images || []).length); }).join(',');
     if (fresh || sig !== window.__catStashSig) { renderPanel(node); window.__catStashSig = sig; }
   }
 
@@ -250,7 +364,11 @@ const INSTALL_SCRIPT: &str = r##"
       var mi = el('div', 'csmi');
       var sp = document.createElement('span'); sp.innerHTML = ICON.restore; sp.style.opacity = '.7'; sp.style.flex = '0 0 auto';
       var svg = sp.firstChild; if (svg) { svg.setAttribute('width', '14'); svg.setAttribute('height', '14'); mi.appendChild(svg); }
-      mi.appendChild(el('span', 't', (it.text || '').replace(/\s+/g, ' ').trim()));
+      var lbl = (it.text || '').replace(/\s+/g, ' ').trim();
+      var ni = (it.images || []).length;
+      if (!lbl && ni) lbl = '(图片)';
+      if (ni) lbl += ' ·图' + ni;
+      mi.appendChild(el('span', 't', lbl));
       mi.title = it.text || '';
       mi.addEventListener('click', function (ev) { ev.stopPropagation(); restore(it.id); });
       m.appendChild(mi);
@@ -287,9 +405,11 @@ const INSTALL_SCRIPT: &str = r##"
     if (bar.parentElement !== host || host.firstChild !== bar) { host.insertBefore(bar, host.firstChild); }
     // 状态刷新(仅变化时写,避免自触发 observer churn)
     var arr = load();
-    var pushDisabled = !(composerText().trim());
+    // 有文字或有图片(廉价 DOM 查附件行里的 img 缩略图,避免每 tick 爬 fiber)即可暂存
+    var hasImg = !!document.querySelector('[data-composer-attachments-row] img');
+    var pushDisabled = !(composerText().trim()) && !hasImg;
     if (bar.__push.disabled !== pushDisabled) bar.__push.disabled = pushDisabled;
-    bar.__push.title = '暂存当前输入';
+    bar.__push.title = '暂存当前输入(文字 + 图片)';
     var popShow = arr.length > 0 ? '' : 'none';
     if (bar.__pop.style.display !== popShow) bar.__pop.style.display = popShow;
     bar.__pop.title = arr.length > 1 ? ('恢复暂存(' + arr.length + ' 条)') : '恢复暂存';
