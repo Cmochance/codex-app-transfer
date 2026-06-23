@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 7; // review r4:清空判定按附件行(含文件)+ restore/send 串行锁防重复提交
+  var VERSION = 8; // review r5:写校验保留空行(sameText)+ 发送提交成功才消费 + push 等图清空
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -120,9 +120,13 @@ const INSTALL_SCRIPT: &str = r##"
     for (var i = 0; i < ch.length; i++) lines.push(blockText(ch[i]));
     return lines.join('\n');
   }
-  // 文本比较归一:折叠任意连续换行为单个 + 去首尾空白,容忍 ProseMirror 把 hard break 映成
-  // paragraph(innerText 读回多一个 \n)等差异,避免成功写入却被判失败。
-  function nrm(s) { return (s == null ? '' : String(s)).replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n+|\s+$/g, ''); }
+  // 写入校验比较:两侧都用块级规范文本(captureText)比对,**保留空行**(只去尾部空白/尾换行,
+  // 不折叠内部 `\n`)。不能折叠连续换行 —— 否则把 `a\n\nb` 写成 `a\nb`(丢空行)也判通过、照样消费/
+  // 发送被破坏的草稿(见 review)。容忍尾部空白差异以免误判失败。
+  function sameText(a, b) {
+    function f(s) { return (s == null ? '' : String(s)).replace(/\r/g, '').replace(/[ \t]+$/gm, '').replace(/\n+$/, '').replace(/^\n+/, ''); }
+    return f(a) === f(b);
+  }
   function fiberOf(el) { if (!el) return null; for (var k in el) { if (k.indexOf('__reactFiber$') === 0) return el[k]; } return null; }
   // 把文本合成 text/plain paste 进 composer(ProseMirror 的 paste 路径把 \n→hard break、\n\n→段落,
   // 是多行最可靠的注入方式,与图片合成 paste 同机制)。
@@ -135,32 +139,32 @@ const INSTALL_SCRIPT: &str = r##"
     } catch (x) {}
   }
   // 设输入框内容:focus → 全选删除(CDP 实证可靠清空)→ 写入(空则只清)。**返回是否真落值**
-  // (caller 据此决定是否消费 stash,绝不在没落值时丢草稿):目标空 → 须真空;目标非空 → 归一后
-  // 须等于目标(nrm 容忍换行映射差异)。
+  // (caller 据此决定是否消费 stash,绝不在没落值时丢草稿):目标空 → 须真空;目标非空 → 块级规范
+  // 文本须与目标一致(sameText,**保留空行**;不折叠换行,否则丢空行也判通过 → 消费被破坏草稿)。
   // **写入机制实证(CDP)**:本 composer 的 Shift+Enter = 新建 `<p>` 段落(非 `<br>` hard break),
-  // 多行草稿即多个 `<p>`(innerText 段间为 `\n\n`)。text/plain 合成 paste 恰好按 `\n` 切段、重建
-  // 同构 `<p>`,**稳定且与原草稿同构**,故作首选。execCommand insertLineBreak 会插入裸 `\n` 文本、
-  // 被 ProseMirror 规整后坍缩成空格(丢换行),**不可用**;回退仅用 insertText / InputEvent。
+  // 多行草稿即多个 `<p>`。text/plain 合成 paste 恰好按 `\n` 切段、重建同构 `<p>`,**稳定、与原草稿
+  // 同构、空行不丢**,故作首选。execCommand insertLineBreak 会插入裸 `\n` 被 PM 规整成空格(丢换行),
+  // **不可用**;回退仅用 insertText / InputEvent。校验用块级 captureText(与捕获/存储同一空间)。
   function setComposer(text) {
     var e = composerEl(); if (!e) return false;
     try { e.focus(); } catch (x) {}
     try { document.execCommand('selectAll', false, null); } catch (x) {}
     try { document.execCommand('delete', false, null); } catch (x) {}
     if (text) {
-      pasteText(e, text); // 首选:多行安全(重建 <p> 段落,与 Shift+Enter 同构)
-      if (nrm(composerText()) !== nrm(text)) { // 回退 1:execCommand insertText(paste 被拦时;单行可靠)
+      pasteText(e, text); // 首选:多行安全(重建 <p> 段落,与 Shift+Enter 同构,空行保留)
+      if (!sameText(captureText(), text)) { // 回退 1:execCommand insertText(paste 被拦时;单行可靠)
         try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (x) {}
         try { document.execCommand('insertText', false, text); } catch (x) {}
       }
-      if (nrm(composerText()) !== nrm(text)) { // 回退 2:单次 InputEvent
+      if (!sameText(captureText(), text)) { // 回退 2:单次 InputEvent
         try {
           e.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: text, bubbles: true, cancelable: true }));
           e.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
         } catch (x) {}
       }
     }
-    var now = composerText() || '';
-    return text ? (now.trim() !== '' && nrm(now) === nrm(text)) : (now.trim() === '');
+    var now = captureText();
+    return text ? (now.trim() !== '' && sameText(now, text)) : (now.trim() === '');
   }
   // 提交:优先点 compose 按钮,但**运行态(按钮为 Stop)不点**——点它会停掉当前轮次;
   // 改走 fiber handleSubmit()(空闲时发送,运行时入队为 steer,符合「运行中也能发送」语义)。
@@ -315,9 +319,12 @@ const INSTALL_SCRIPT: &str = r##"
     clearImages();
     if (!setComposer(item.text)) { __busy = false; notify('写入输入框失败,发送已取消'); ensure(); return; } // 目标项仍在 stash
     // 纯文本也走 settleImages([]):**先等旧附件清空再提交**,否则上一稿的图/文件(异步未清完)会被一起
-    // 发出(见 review);有图则等目标图 paste 就位。两者均「就位后才消费 + 提交」,失败保留可重试。
+    // 发出(见 review);有图则等目标图 paste 就位。**提交成功才消费**(submitComposer 返回 false——按钮/
+    // fiber 路径变化或暂不可提交——则保留暂存,不静默吞掉,见 review);失败均保留可重试。
     settleImages(item.images || [], function (ok) {
-      if (ok) { consumeItem(id); submitComposer(); } else notify('图片未就位,已保留暂存(未发送)');
+      if (!ok) notify('图片未就位,已保留暂存(未发送)');
+      else if (submitComposer()) consumeItem(id);
+      else notify('发送失败,已保留暂存');
       __busy = false; ensure();
     });
   }
@@ -340,6 +347,13 @@ const INSTALL_SCRIPT: &str = r##"
     }
     if (t && t.trim()) setComposer(''); // 存成功才清:文字 + 图片(文件保留)
     clearImages();
+    // 刚暂存若含图:等附件真正清空再解锁(clearImages 异步;否则刚暂存的图还挂着,用户紧接着发送的
+    // 插话会把它一起带出去,见 review)。__busy 期间我方 push/restore/send 不可再入。
+    if (imgs.length) {
+      __busy = true;
+      var n = 0;
+      var iv = setInterval(function () { n++; if (!hasAttachments() || n > 25) { clearInterval(iv); __busy = false; ensure(); } }, 100);
+    }
     ensure();
   }
 
