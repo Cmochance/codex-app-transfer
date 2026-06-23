@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 5; // review r2:块级捕获保留空行 + 图片清空后再计数 + restore 也等图就位 + 只清 data: 图
+  var VERSION = 6; // review r3:清空判定数全部附件 + 纯文本也等旧图清空 + 块内 br→\n(防御)
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -101,12 +101,23 @@ const INSTALL_SCRIPT: &str = r##"
   // 这恰是 paste 期望的「每换行一个 `\n`」规范 → restore paste 重建同构块,往返幂等(CDP 实证:
   // `a\n\nb` 空行往返不丢)。**不可用 innerText**(段间 `\n\n`、空段落 `\n` 数非线性,且 paste 回去
   // 会翻倍膨胀)、**不可用 textContent**(丢全部换行 → 多行拼成一行)。
+  // 单块取文本:块内**非 trailing** `<br>` → `\n`(防御富文本粘贴/未来版本在块内产生 hard break;
+  // CDP 实证本 composer 把 `<br>`/HTML 断行规整成独立段落,正常不触发此分支);否则直接 textContent
+  // (空块 = 空行,textContent 为 ''→ blank line 保留;用 innerText 会让空块变 '\n' 破坏空行)。
+  function blockText(b) {
+    if (b.querySelector && b.querySelector('br:not(.ProseMirror-trailingBreak)')) {
+      var c = b.cloneNode(true), brs = c.querySelectorAll('br:not(.ProseMirror-trailingBreak)');
+      for (var j = 0; j < brs.length; j++) { brs[j].parentNode.replaceChild(document.createTextNode('\n'), brs[j]); }
+      return c.textContent || '';
+    }
+    return b.textContent || '';
+  }
   function captureText() {
     var e = composerEl(); if (!e) return '';
     var ch = e.children;
     if (!ch || !ch.length) return (e.innerText != null ? e.innerText : (e.textContent || ''));
     var lines = [];
-    for (var i = 0; i < ch.length; i++) lines.push(ch[i].textContent || '');
+    for (var i = 0; i < ch.length; i++) lines.push(blockText(ch[i]));
     return lines.join('\n');
   }
   // 文本比较归一:折叠任意连续换行为单个 + 去首尾空白,容忍 ProseMirror 把 hard break 映成
@@ -228,16 +239,20 @@ const INSTALL_SCRIPT: &str = r##"
       else if (tries > 25) { clearInterval(iv); cb(false); }
     }, 100);
   }
-  // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存):
-  // 1) 先等当前 data: 图片**清空到 0**(clearImages 异步;否则旧图会让 `readImages().length>=target`
-  //    被**旧附件**满足,导致带错图/空图就消费提交,见 review)——基线干净后才 2)。
-  // 2) paste 目标图;3) 等目标图就位。成功 cb(true);清空或就位超时 cb(false)(caller 据此不消费/不发)。
+  // 当前 composer 的**全部**图片附件数(不止 data:):清空判定要用它,不能用 readImages()(只数
+  // data:)—— 否则一张非 data: 旧附件会被当成「已清空」,导致带着它一起 paste+提交(见 review)。
+  function attCount() { var a = composerAtt(); return (a && a.images) ? a.images.length : 0; }
+  // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存),纯文本也走它(等旧图清空):
+  // 1) 先等当前图片(**全部**附件)清空到 0(clearImages 异步;否则旧图仍在 React 态时就 submit,
+  //    会把上一稿的图一起发出,见 review)——基线干净才 2)。
+  // 2) paste 目标图(纯文本时 imgs=[] → 无操作);3) 等目标图就位(imgs=[] 时 waitImages(0) 立即 true)。
+  // 成功 cb(true);清空或就位超时 cb(false)(caller 据此不消费/不发)。
   function settleImages(imgs, cb) {
     var n = 0;
     var iv = setInterval(function () {
       n++;
-      if (readImages().length === 0) { clearInterval(iv); addImages(imgs); waitImages(imgs.length, cb); }
-      else if (n > 25) { clearInterval(iv); cb(false); } // 旧图清空超时 = 失败,不消费
+      if (attCount() === 0) { clearInterval(iv); addImages(imgs); waitImages(imgs.length, cb); }
+      else if (n > 25) { clearInterval(iv); cb(false); } // 旧图清空超时 = 失败,不消费/不发
     }, 100);
   }
   // 最小 toast(暂存失败/降级时告知;无侵入,2.5s 自removed)
@@ -276,9 +291,8 @@ const INSTALL_SCRIPT: &str = r##"
     if (!swapInCurrent(arr)) { notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
     clearImages();                 // 清掉当前 data: 图片(已 swap 进 stash);不动非 data: / 文件
     if (!setComposer(item.text)) { notify('写入输入框失败,恢复已取消'); closeMenu(); ensure(); return; } // 目标项仍在 stash
-    var imgs = item.images || [];
-    if (!imgs.length) { consumeItem(id); closeMenu(); ensure(); return; } // 纯文本:文本已落值即消费
-    settleImages(imgs, function (ok) {                                     // 有图:图就位才消费
+    // 纯文本也走 settleImages([]):先等旧图清空再消费(避免恢复后还残留上一稿的图);有图则等 paste 就位。
+    settleImages(item.images || [], function (ok) {
       if (ok) consumeItem(id); else notify('图片未就位,已保留暂存');
       closeMenu(); ensure();
     });
@@ -291,9 +305,9 @@ const INSTALL_SCRIPT: &str = r##"
     if (!swapInCurrent(arr)) { notify('暂存空间不足,发送已取消'); return; }
     clearImages();
     if (!setComposer(item.text)) { notify('写入输入框失败,发送已取消'); ensure(); return; } // 目标项仍在 stash
-    var imgs = item.images || [];
-    if (!imgs.length) { consumeItem(id); submitComposer(); ensure(); return; } // 纯文本:消费 + 发送
-    settleImages(imgs, function (ok) {                                         // 有图:就位才消费 + 发送
+    // 纯文本也走 settleImages([]):**先等旧图清空再提交**,否则上一稿的图(异步未清完)会被一起发出
+    //(见 review);有图则等目标图 paste 就位。两者均「就位后才消费 + 提交」,失败保留可重试。
+    settleImages(item.images || [], function (ok) {
       if (ok) { consumeItem(id); submitComposer(); } else notify('图片未就位,已保留暂存(未发送)');
       ensure();
     });
