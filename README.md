@@ -32,19 +32,30 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 ## 界面预览
 
+> 展示截图较多,统一收进下方折叠分组(默认折叠,点开查看;GitHub Markdown 不支持标签页,故用可折叠分组实现「整体展示区」)。
+
+<details>
+<summary><b>主界面</b> — 仪表盘 / 供应商 / 设置 / 日志</summary>
+
 | 仪表盘 | 供应商 |
 |---|---|
 | ![Board](img/Board.png) | ![Providers](img/Providers.png) |
 | **设置** | **日志** |
 | ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
 
-### Codex APP 实际接入
+</details>
+
+<details>
+<summary><b>Codex APP 实际接入</b></summary>
 
 启用任意供应商后,Codex APP 模型选择器会显示「<provider> / <real-model>」形式的真实模型名,对话过程中工具循环 / `previous_response_id` 历史回放 / thinking 模式 reasoning_content 注入全部由本地代理透明处理:
 
 ![Codex APP 实际对话](img/codex-cli-real-chat.png)
 
-### Codex Desktop 背景主题(可选)
+</details>
+
+<details>
+<summary><b>Codex Desktop 背景主题</b>(可选,11 套二次元主题)</summary>
 
 为 Codex Desktop(Electron 客户端)注入背景图 + 半透明玻璃面板 CSS,内置 11 套二次元主题(每套按背景图独立配色)+ 自定义上传。不修改 Codex 的 binary,基于 Chromium DevTools Protocol 运行时注入。开关为持久化状态标记:开启时落盘保存并即时注入(best-effort),若当前 Codex 未经本工具启动 / 调试端口不可用,则弹确认提示是否重启 Codex 让主题生效;关闭时落盘清除偏好并 best-effort 即时 CDP 清除已注入主题(回原生 UI),与开启对称 —— 同样在调试端口不可用时清除失败,则保留至 Codex 下次重启移除。
 
@@ -56,11 +67,27 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 第 6 套 Carton 自带右下角漂浮立绘(随鼠标动)。**自定义背景**:Theme 页 → "+ 添加自定义" → 选 JPG/PNG → 16:9 crop 弹窗自由选截取区域(拖拽 + 滚轮缩放)→ 应用。Codex 启动时如已开启 toggle 会自动注入已选主题,不需手动操作。
 
-### Codex 内用量显示(可选)
+</details>
+
+<details>
+<summary><b>Codex 内用量显示</b>(可选)</summary>
 
 在 Codex Desktop 顶栏「Toggle pinned summary」弹窗底部注入独立「Usage」分区:5 小时 / 每周 / 月度套餐额度(白名单 provider:antigravity gemini 系 + GLM Coding Plan + 小米 MiMo Token Plan + **OpenCode Go** + **Kimi Code**)、余额 / 已用额度数值(DeepSeek / Kimi 月之暗面 / anyrouter)、上下文用量、实时 Tokens 速率与累计、缓存命中率。其中**上下文**行可展开 Claude 风格的 by-source 明细下拉(按发往上游的内容分类:工具调用与输出 / 推理 / 开发者指令 / 对话消息 / 工具定义 / 系统提示),数据按对话持久化、启动即用。详见下方「能做什么」。
 
 ![Codex 内用量显示](img/codex-usage-breakdown.jpg)
+
+</details>
+
+<details>
+<summary><b>Codex 草稿暂存 Stash</b>(可选)</summary>
+
+输入框旁「暂存 / 恢复」按钮 + Usage 面板下方「Stash」列表:把预输入的文字 + 图片先暂存、腾出输入框去回复上一轮,随后选择性恢复到输入框或直接发送(多条时点恢复唤起下拉选)。
+
+| Stash 面板(支持图片) | 快捷恢复下拉 |
+|---|---|
+| ![Stash 面板](img/codex-stash-panel.png) | ![快捷恢复下拉](img/codex-stash-dropdown.png) |
+
+</details>
 
 ## 能做什么
 

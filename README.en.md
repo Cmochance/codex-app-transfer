@@ -32,19 +32,30 @@ Current version **v2.4.0** (see [Changelog](CHANGELOG.md) and [Releases](https:/
 
 ## Preview
 
+> Lots of screenshots — all collapsed into the groups below (click to expand; GitHub Markdown has no tabs, so collapsible groups stand in for a unified showcase).
+
+<details>
+<summary><b>Main UI</b> — Dashboard / Providers / Settings / Logs</summary>
+
 | Dashboard | Providers |
 |---|---|
 | ![Board](img/Board.png) | ![Providers](img/Providers.png) |
 | **Settings** | **Logs** |
 | ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
 
-### Codex App in action
+</details>
+
+<details>
+<summary><b>Codex App in action</b></summary>
 
 With any provider enabled, Codex App's model picker shows `<provider> / <real-model>`-style real model names. Tool loops / `previous_response_id` history replay / thinking-mode reasoning_content injection are all handled transparently by the local proxy:
 
 ![Codex App real conversation](img/codex-cli-real-chat.png)
 
-### Codex Desktop background themes (optional)
+</details>
+
+<details>
+<summary><b>Codex Desktop background themes</b> (optional, 11 anime themes)</summary>
 
 Inject background image + frosted-glass panel CSS into Codex Desktop (the Electron client). Five built-in anime themes plus user upload. The Codex binary is not modified — runtime injection via Chromium DevTools Protocol. The toggle is a persistent preference marker: enabling it persists the setting and injects immediately (best-effort); if Codex wasn't launched via this tool (or its debug port is unavailable), a confirm dialog offers to restart Codex so the theme takes effect. Disabling it clears the saved preference and best-effort live-removes the injected theme via CDP (back to native UI), symmetric with enabling — likewise, if the debug port is unavailable the removal fails and the theme stays until the next Codex restart.
 
@@ -56,11 +67,27 @@ Inject background image + frosted-glass panel CSS into Codex Desktop (the Electr
 
 A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts to the cursor. **Custom backgrounds**: Theme page → "+ Add custom" → pick a JPG/PNG → 16:9 crop modal (drag + scroll to zoom) → apply. If the toggle is on at Codex launch, the selected theme auto-injects — no manual step needed.
 
-### Usage panel inside Codex (optional)
+</details>
+
+<details>
+<summary><b>Usage panel inside Codex</b> (optional)</summary>
 
 Injects a standalone "Usage" section at the bottom of Codex Desktop's "Toggle pinned summary" popup: 5-hour / weekly / monthly plan quota bars (whitelisted providers: antigravity gemini series + GLM Coding Plan + Xiaomi MiMo Token Plan + **OpenCode Go** + **Kimi Code**), balance / usage numeric entries (DeepSeek / Kimi Moonshot / anyrouter), context usage, real-time token rate + cumulative total, and cache hit rate. The **Context** row expands into a Claude-style by-source breakdown dropdown (classified by what is sent upstream: tool calls & output / reasoning / developer instructions / conversation messages / tool definitions / system prompt), persisted per conversation for instant load. See "What it does" below.
 
 ![Usage panel inside Codex](img/codex-usage-breakdown.jpg)
+
+</details>
+
+<details>
+<summary><b>Codex draft stash</b> (optional)</summary>
+
+Stash/restore buttons next to the composer + a "Stash" list below the Usage panel: park pre-typed text + images to free up the box for a reply, then selectively restore to the composer or send directly (with multiple entries, restore opens a picker).
+
+| Stash panel (with images) | Quick-restore dropdown |
+|---|---|
+| ![Stash panel](img/codex-stash-panel.png) | ![Quick-restore dropdown](img/codex-stash-dropdown.png) |
+
+</details>
 
 ## What it does
 
