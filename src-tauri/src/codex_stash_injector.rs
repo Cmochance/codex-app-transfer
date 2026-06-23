@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 6; // review r3:清空判定数全部附件 + 纯文本也等旧图清空 + 块内 br→\n(防御)
+  var VERSION = 7; // review r4:清空判定按附件行(含文件)+ restore/send 串行锁防重复提交
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -239,20 +239,22 @@ const INSTALL_SCRIPT: &str = r##"
       else if (tries > 25) { clearInterval(iv); cb(false); }
     }, 100);
   }
-  // 当前 composer 的**全部**图片附件数(不止 data:):清空判定要用它,不能用 readImages()(只数
-  // data:)—— 否则一张非 data: 旧附件会被当成「已清空」,导致带着它一起 paste+提交(见 review)。
-  function attCount() { var a = composerAtt(); return (a && a.images) ? a.images.length : 0; }
-  // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存),纯文本也走它(等旧图清空):
-  // 1) 先等当前图片(**全部**附件)清空到 0(clearImages 异步;否则旧图仍在 React 态时就 submit,
-  //    会把上一稿的图一起发出,见 review)——基线干净才 2)。
+  // composer 是否还挂着**任何**附件(图片或文件)。附件行 `[data-composer-attachments-row]` 是
+  // **条件渲染**的:有任意附件才在 DOM,空态整行移除(CDP 实证)。故它在场 = 还有附件。比只数
+  // imageAttachments 更全 —— **也能挡住文件**:文件不在 stash 范围(curEntry 不存、clearImages
+  // 不清,见 CAT-260),但 send 不该把残留文件一起发出(见 review),所以清空判定必须把它算进去。
+  function hasAttachments() { return !!document.querySelector('[data-composer-attachments-row]'); }
+  // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存),纯文本也走它(等旧附件清空):
+  // 1) 先等当前附件(图片**和**文件)全部清空(clearImages 异步;否则旧图仍在 React 态、或残留
+  //    文件,submit 会把它们一起发出,见 review)——附件行消失才 2);文件清不掉 → 超时安全中止。
   // 2) paste 目标图(纯文本时 imgs=[] → 无操作);3) 等目标图就位(imgs=[] 时 waitImages(0) 立即 true)。
   // 成功 cb(true);清空或就位超时 cb(false)(caller 据此不消费/不发)。
   function settleImages(imgs, cb) {
     var n = 0;
     var iv = setInterval(function () {
       n++;
-      if (attCount() === 0) { clearInterval(iv); addImages(imgs); waitImages(imgs.length, cb); }
-      else if (n > 25) { clearInterval(iv); cb(false); } // 旧图清空超时 = 失败,不消费/不发
+      if (!hasAttachments()) { clearInterval(iv); addImages(imgs); waitImages(imgs.length, cb); }
+      else if (n > 25) { clearInterval(iv); cb(false); } // 旧附件清空超时(如残留文件)= 失败,不消费/不发
     }, 100);
   }
   // 最小 toast(暂存失败/降级时告知;无侵入,2.5s 自removed)
@@ -267,6 +269,9 @@ const INSTALL_SCRIPT: &str = r##"
   }
 
   // ── 核心动作 ──
+  // restore/sendItem 共享 composer 且异步(settleImages):全局串行锁,防同条重复点 / 不同条并发 /
+  // 处理期间 push 互相 clobber composer + 重复提交(见 review)。每条路径(含早退)必复位。
+  var __busy = false;
   // 当前 composer 内容(文本 + 图片)打包成一条 swap 用的 entry;全空返 null
   function curEntry() {
     var t = captureText(), imgs = readImages();
@@ -287,29 +292,33 @@ const INSTALL_SCRIPT: &str = r##"
   // 有图时**进一步等图片真就位**才消费(写/paste 失败 → 目标项保留在 stash,绝不出现「消费了却没
   // 完整落到输入框」)。
   function restore(id) {
+    if (__busy) return;            // 处理中,忽略重复点(防 double restore/send,见 review)
     var arr = load(); var item = findItem(arr, id); if (!item) return;
-    if (!swapInCurrent(arr)) { notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
+    __busy = true;
+    if (!swapInCurrent(arr)) { __busy = false; notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
     clearImages();                 // 清掉当前 data: 图片(已 swap 进 stash);不动非 data: / 文件
-    if (!setComposer(item.text)) { notify('写入输入框失败,恢复已取消'); closeMenu(); ensure(); return; } // 目标项仍在 stash
-    // 纯文本也走 settleImages([]):先等旧图清空再消费(避免恢复后还残留上一稿的图);有图则等 paste 就位。
+    if (!setComposer(item.text)) { __busy = false; notify('写入输入框失败,恢复已取消'); closeMenu(); ensure(); return; } // 目标项仍在 stash
+    // 纯文本也走 settleImages([]):先等旧附件清空再消费(避免恢复后还残留上一稿的图/文件);有图则等 paste 就位。
     settleImages(item.images || [], function (ok) {
       if (ok) consumeItem(id); else notify('图片未就位,已保留暂存');
-      closeMenu(); ensure();
+      __busy = false; closeMenu(); ensure();
     });
   }
   // 发送:同 restore 把目标放进 composer。**仅在文本落值 + 图片就位后才消费并提交**:
   // 写失败 → 不消费、不提交;图片超时未就位 → 不消费、不提交(避免发出不带图片的消息),目标项
   // 留在 stash 可重试。失败均无损(当前内容已 swap 进 stash,目标项仍在)。
   function sendItem(id) {
+    if (__busy) return;            // 处理中,忽略重复点(防重复发送,见 review)
     var arr = load(); var item = findItem(arr, id); if (!item) return;
-    if (!swapInCurrent(arr)) { notify('暂存空间不足,发送已取消'); return; }
+    __busy = true;
+    if (!swapInCurrent(arr)) { __busy = false; notify('暂存空间不足,发送已取消'); return; }
     clearImages();
-    if (!setComposer(item.text)) { notify('写入输入框失败,发送已取消'); ensure(); return; } // 目标项仍在 stash
-    // 纯文本也走 settleImages([]):**先等旧图清空再提交**,否则上一稿的图(异步未清完)会被一起发出
-    //(见 review);有图则等目标图 paste 就位。两者均「就位后才消费 + 提交」,失败保留可重试。
+    if (!setComposer(item.text)) { __busy = false; notify('写入输入框失败,发送已取消'); ensure(); return; } // 目标项仍在 stash
+    // 纯文本也走 settleImages([]):**先等旧附件清空再提交**,否则上一稿的图/文件(异步未清完)会被一起
+    // 发出(见 review);有图则等目标图 paste 就位。两者均「就位后才消费 + 提交」,失败保留可重试。
     settleImages(item.images || [], function (ok) {
       if (ok) { consumeItem(id); submitComposer(); } else notify('图片未就位,已保留暂存(未发送)');
-      ensure();
+      __busy = false; ensure();
     });
   }
   function del(id) { save(load().filter(function (x) { return x.id !== id; })); ensure(); }
@@ -317,6 +326,7 @@ const INSTALL_SCRIPT: &str = r##"
   // **先 save 成功才清**,避免清了没存上丢内容;配额溢出时降级为只存文字(图片太大),不丢文字。
   // load() 返回只读缓存,故先 .slice() 再 push(不污染缓存)。
   function stashCurrent() {
+    if (__busy) return;            // restore/send 异步进行中,别动 composer(见 review)
     var t = captureText(), imgs = readImages();
     if ((!t || !t.trim()) && !imgs.length) return;
     var entry = { id: uid(), text: t || '', ts: Date.now(), images: imgs };
