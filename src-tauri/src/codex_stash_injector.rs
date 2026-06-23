@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 4; // review fix:保留换行(paste 重建段落)+ 图片发送前确认 + 写失败不消费 + 解析缓存
+  var VERSION = 5; // review r2:块级捕获保留空行 + 图片清空后再计数 + restore 也等图就位 + 只清 data: 图
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -96,11 +96,19 @@ const INSTALL_SCRIPT: &str = r##"
   function composerText() { var e = composerEl(); if (!e) return ''; var v = e.innerText; return (v != null ? v : (e.textContent || '')); }
   // 仅判空(textContent 即可,无需 innerText 触发 reflow):热路径用,避免每 tick reflow。
   function composerTextRaw() { var e = composerEl(); return e ? (e.textContent || '') : ''; }
-  // 暂存用的规范文本:本 composer 的 Shift+Enter = 新建段落,innerText 段间是 `\n\n`(每个换行
-  // 渲染成空行)。但 paste 把每个 `\n` 当一个段落边界 —— 若原样存 `\n\n` 再 paste 回去,换行会
-  // 翻倍膨胀(非幂等)。故规范化为「每个换行一个 `\n`」:折叠连续 `\n` 为单个 + 去尾换行。这样
-  // 存 `a\nb\nc`,paste 回去重建 3 段(innerText `a\n\nb\n\nc`),再捕获仍得 `a\nb\nc` —— 幂等且保留换行。
-  function captureText() { return composerText().replace(/\r/g, '').replace(/\n{2,}/g, '\n').replace(/\n+$/, ''); }
+  // 暂存用的规范文本:顶层块(`<p>` 等)即「行」,各块 textContent 为该行文本(本 composer 无
+  // hard break,Shift+Enter = 新块);按**单** `\n` join。空块 = 空行,故**保留用户的有意空行**。
+  // 这恰是 paste 期望的「每换行一个 `\n`」规范 → restore paste 重建同构块,往返幂等(CDP 实证:
+  // `a\n\nb` 空行往返不丢)。**不可用 innerText**(段间 `\n\n`、空段落 `\n` 数非线性,且 paste 回去
+  // 会翻倍膨胀)、**不可用 textContent**(丢全部换行 → 多行拼成一行)。
+  function captureText() {
+    var e = composerEl(); if (!e) return '';
+    var ch = e.children;
+    if (!ch || !ch.length) return (e.innerText != null ? e.innerText : (e.textContent || ''));
+    var lines = [];
+    for (var i = 0; i < ch.length; i++) lines.push(ch[i].textContent || '');
+    return lines.join('\n');
+  }
   // 文本比较归一:折叠任意连续换行为单个 + 去首尾空白,容忍 ProseMirror 把 hard break 映成
   // paragraph(innerText 读回多一个 \n)等差异,避免成功写入却被判失败。
   function nrm(s) { return (s == null ? '' : String(s)).replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n+|\s+$/g, ''); }
@@ -180,10 +188,16 @@ const INSTALL_SCRIPT: &str = r##"
       .filter(function (im) { return im && typeof im.src === 'string' && im.src.indexOf('data:') === 0; })
       .map(function (im) { return { src: im.src, filename: im.filename || 'image.png' }; });
   }
-  // 清掉 composer 现有图片(逐个 onRemoveImage(id));**不动文件**(文件不在 stash 范围,见 CAT-260)
+  // 清掉 composer 里**可序列化的(data:)**图片(那些已被 readImages 存进 stash 的);**不动**非 data:
+  // 图片(如 blob 上传)—— readImages 存不了它们,这里也不删,避免「没存上又删掉 = 丢图」(见 review)。
+  // 也**不动文件**(文件不在 stash 范围,见 CAT-260)。
   function clearImages() {
     var a = composerAtt(); if (!a || !a.onRemoveImage || !a.images) return;
-    a.images.map(function (im) { return im.id; }).forEach(function (id) { try { a.onRemoveImage(id); } catch (e) {} });
+    a.images.forEach(function (im) {
+      if (im && typeof im.src === 'string' && im.src.indexOf('data:') === 0) {
+        try { a.onRemoveImage(im.id); } catch (e) {}
+      }
+    });
   }
   // 把保存的图片合成 paste 回 composer(atob 解 base64→File→ClipboardEvent;fetch(dataURL) 被 CSP 挡)
   function addImages(imgs) {
@@ -214,6 +228,18 @@ const INSTALL_SCRIPT: &str = r##"
       else if (tries > 25) { clearInterval(iv); cb(false); }
     }, 100);
   }
+  // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存):
+  // 1) 先等当前 data: 图片**清空到 0**(clearImages 异步;否则旧图会让 `readImages().length>=target`
+  //    被**旧附件**满足,导致带错图/空图就消费提交,见 review)——基线干净后才 2)。
+  // 2) paste 目标图;3) 等目标图就位。成功 cb(true);清空或就位超时 cb(false)(caller 据此不消费/不发)。
+  function settleImages(imgs, cb) {
+    var n = 0;
+    var iv = setInterval(function () {
+      n++;
+      if (readImages().length === 0) { clearInterval(iv); addImages(imgs); waitImages(imgs.length, cb); }
+      else if (n > 25) { clearInterval(iv); cb(false); } // 旧图清空超时 = 失败,不消费
+    }, 100);
+  }
   // 最小 toast(暂存失败/降级时告知;无侵入,2.5s 自removed)
   function notify(msg) {
     try {
@@ -242,16 +268,20 @@ const INSTALL_SCRIPT: &str = r##"
   }
   function consumeItem(id) { save(load().filter(function (x) { return x.id !== id; })); }
   // 恢复:把目标(文本+图片)放进 composer;输入框非空则先把当前内容 swap 进 stash(不丢)。
-  // **先 swap-save(配额够)再动 composer**——保存失败就安全中止。**setComposer 真落值才消费目标项**:
-  // 写失败(composer 不在 / 没落值)则目标项保留在 stash,绝不出现「消费了却没填进输入框」。
+  // **先 swap-save(配额够)再动 composer**——保存失败就安全中止。**setComposer 真落值才消费目标项**;
+  // 有图时**进一步等图片真就位**才消费(写/paste 失败 → 目标项保留在 stash,绝不出现「消费了却没
+  // 完整落到输入框」)。
   function restore(id) {
     var arr = load(); var item = findItem(arr, id); if (!item) return;
     if (!swapInCurrent(arr)) { notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
-    clearImages();                 // 清掉当前图片(已 swap 进 stash);不动文件
+    clearImages();                 // 清掉当前 data: 图片(已 swap 进 stash);不动非 data: / 文件
     if (!setComposer(item.text)) { notify('写入输入框失败,恢复已取消'); closeMenu(); ensure(); return; } // 目标项仍在 stash
-    consumeItem(id);               // 文本已落值,消费目标项
-    addImages(item.images || []);
-    closeMenu(); ensure();
+    var imgs = item.images || [];
+    if (!imgs.length) { consumeItem(id); closeMenu(); ensure(); return; } // 纯文本:文本已落值即消费
+    settleImages(imgs, function (ok) {                                     // 有图:图就位才消费
+      if (ok) consumeItem(id); else notify('图片未就位,已保留暂存');
+      closeMenu(); ensure();
+    });
   }
   // 发送:同 restore 把目标放进 composer。**仅在文本落值 + 图片就位后才消费并提交**:
   // 写失败 → 不消费、不提交;图片超时未就位 → 不消费、不提交(避免发出不带图片的消息),目标项
@@ -262,14 +292,11 @@ const INSTALL_SCRIPT: &str = r##"
     clearImages();
     if (!setComposer(item.text)) { notify('写入输入框失败,发送已取消'); ensure(); return; } // 目标项仍在 stash
     var imgs = item.images || [];
-    addImages(imgs);
-    var fire = function () { consumeItem(id); submitComposer(); ensure(); }; // 确认后才消费 + 提交
-    if (imgs.length) {
-      waitImages(imgs.length, function (ok) {
-        if (ok) fire();
-        else { notify('图片未就位,已保留暂存(未发送)'); ensure(); } // 不消费、不提交
-      });
-    } else fire();
+    if (!imgs.length) { consumeItem(id); submitComposer(); ensure(); return; } // 纯文本:消费 + 发送
+    settleImages(imgs, function (ok) {                                         // 有图:就位才消费 + 发送
+      if (ok) { consumeItem(id); submitComposer(); } else notify('图片未就位,已保留暂存(未发送)');
+      ensure();
+    });
   }
   function del(id) { save(load().filter(function (x) { return x.id !== id; })); ensure(); }
   // 暂存当前(文本+图片)→ 清空输入框(**不动文件**,文件不在范围见 CAT-260)。
