@@ -587,7 +587,7 @@ export default {
   "settings.codexQuotaEnabled": "Show usage in Codex",
   "settings.codexQuotaEnabledHint": "Shows a usage panel in Codex (context, token rate/total, quota). Only when Codex is launched from this app.",
   "settings.codexStashEnabled": "Enable draft stash in Codex",
-  "settings.codexStashEnabledHint": "Adds stash/restore buttons next to the composer and a stash list below the usage panel: park pre-typed input to free up the box for a reply, then selectively restore it to the composer or send it directly. Only when Codex is launched from this app.",
+  "settings.codexStashEnabledHint": "Stash composer drafts to restore or send later. Only when Codex is launched from this app.",
   "settings.pluginUnlockForce": "Force unlock",
   "settings.pluginUnlockForced": "Force-unlock triggered",
   "settings.pluginUnlockForceFailed": "Force unlock failed",
