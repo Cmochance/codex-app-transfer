@@ -1856,7 +1856,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
                                                      // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
         assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
-        assert!(INSTALL_SCRIPT.contains("var VERSION = 3"));
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 4")); // bump:Stash 面板在场时让位占位协调
     }
 
     #[test]
