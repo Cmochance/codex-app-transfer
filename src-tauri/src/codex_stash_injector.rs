@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 9; // review r6:写校验保留前导/尾随空行 + push 遇文件附件中止(保草稿不孤儿化)
+  var VERSION = 10; // review r7:不支持附件(文件/非 data: 图)统一拦 push/restore/send + 配额溢出整体中止
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -248,13 +248,22 @@ const INSTALL_SCRIPT: &str = r##"
   // imageAttachments 更全 —— **也能挡住文件**:文件不在 stash 范围(curEntry 不存、clearImages
   // 不清,见 CAT-260),但 send 不该把残留文件一起发出(见 review),所以清空判定必须把它算进去。
   function hasAttachments() { return !!document.querySelector('[data-composer-attachments-row]'); }
-  // composer 是否挂着**非图片(文件)**附件。附件 chip 是 `.composer-attachment-surface`;图片 chip
-  // 内有 `<img>`,文件 chip 没有(CDP 实证图片 chip 含 img)。文件不可序列化/恢复(CAT-260):
-  // push 遇到文件应中止、保草稿,别只存文字把文件孤儿化(见 review)。
-  function hasFileAttachment() {
-    var chips = document.querySelectorAll('[data-composer-attachments-row] .composer-attachment-surface');
-    for (var i = 0; i < chips.length; i++) { if (!chips[i].querySelector('img')) return true; }
-    return false;
+  // 全部附件数(图片 + 文件):每个附件 = 附件行 flex 容器(`row.firstElementChild`)下的一个直接
+  // 子节点(CDP 实证:1 图→1 子、2 图→2 子)。**不能**用 `querySelectorAll('.composer-attachment-
+  // surface')` —— 该类有嵌套,每个附件命中 2 个(实证 1 图→4 命中错误)。
+  function attTotal() {
+    var row = document.querySelector('[data-composer-attachments-row]');
+    var inner = row && row.firstElementChild;
+    return inner ? inner.children.length : 0;
+  }
+  // composer 是否挂着**任何不可暂存的附件**。可序列化的只有 data: 图(readImages)。
+  // imageAttachments 总数 > data: 图数 → 有非 data: 图(blob / 上传中,readImages 存不了);
+  // 总附件数 > 图片附件数 → 有文件。任一为真 = 有不支持附件,push/restore/send 须中止保草稿
+  // (否则只存一部分、把不支持的附件孤儿化、被下一条原生发送带走,见 review r6/r7)。
+  function unsupportedAtt() {
+    var a = composerAtt();
+    var imgN = (a && a.images) ? a.images.length : 0;
+    return (imgN > readImages().length) || (attTotal() > imgN);
   }
   // 图片恢复/发送的完整时序(确保只带对的图、且写失败/未就位时不丢暂存),纯文本也走它(等旧附件清空):
   // 1) 先等当前附件(图片**和**文件)全部清空(clearImages 异步;否则旧图仍在 React 态、或残留
@@ -306,6 +315,7 @@ const INSTALL_SCRIPT: &str = r##"
   function restore(id) {
     if (__busy) return;            // 处理中,忽略重复点(防 double restore/send,见 review)
     var arr = load(); var item = findItem(arr, id); if (!item) return;
+    if (unsupportedAtt()) { notify('输入框含不支持的附件(文件/非 data: 图),无法恢复;请先移除'); return; } // swap 前拦,保草稿不拆分
     __busy = true;
     if (!swapInCurrent(arr)) { __busy = false; notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
     clearImages();                 // 清掉当前 data: 图片(已 swap 进 stash);不动非 data: / 文件
@@ -322,6 +332,7 @@ const INSTALL_SCRIPT: &str = r##"
   function sendItem(id) {
     if (__busy) return;            // 处理中,忽略重复点(防重复发送,见 review)
     var arr = load(); var item = findItem(arr, id); if (!item) return;
+    if (unsupportedAtt()) { notify('输入框含不支持的附件(文件/非 data: 图),无法发送;请先移除'); return; } // swap 前拦,保草稿不拆分
     __busy = true;
     if (!swapInCurrent(arr)) { __busy = false; notify('暂存空间不足,发送已取消'); return; }
     clearImages();
@@ -337,26 +348,24 @@ const INSTALL_SCRIPT: &str = r##"
     });
   }
   function del(id) { save(load().filter(function (x) { return x.id !== id; })); ensure(); }
-  // 暂存当前(文本+图片)→ 清空输入框(**不动文件**,文件不在范围见 CAT-260)。
-  // **先 save 成功才清**,避免清了没存上丢内容;配额溢出时降级为只存文字(图片太大),不丢文字。
+  // 暂存当前(文本+图片)→ 清空输入框。**先 save 成功才清**,避免清了没存上丢内容。
   // load() 返回只读缓存,故先 .slice() 再 push(不污染缓存)。
   function stashCurrent() {
     if (__busy) return;            // restore/send 异步进行中,别动 composer(见 review)
     var t = captureText(), imgs = readImages();
     if ((!t || !t.trim()) && !imgs.length) return;
-    // 含文件附件:中止 push,保草稿不动 —— 文件无法暂存/恢复(CAT-260),只存文字会把文件孤儿化、
-    // 被下一条原生发送带走(见 review)。提示用户先移除文件。
-    if (hasFileAttachment()) { notify('草稿含文件附件,暂不支持暂存(请先移除文件)'); return; }
+    // 含不支持的附件(文件 / 非 data: 图):中止 push,保草稿不动 —— 它们无法暂存/恢复(CAT-260),
+    // 只存一部分会把不支持的附件孤儿化、被下一条原生发送带走(见 review)。提示用户先移除。
+    if (unsupportedAtt()) { notify('草稿含不支持的附件(文件/非 data: 图),暂不支持暂存;请先移除'); return; }
     var entry = { id: uid(), text: t || '', ts: Date.now(), images: imgs };
     var arr = load().slice(); arr.push(entry);
     if (!save(arr)) {
-      if (t && t.trim()) { // 退化:只存文字,图片留在输入框不清
-        var a2 = load().slice(); a2.push({ id: entry.id, text: entry.text, ts: entry.ts, images: [] });
-        if (save(a2)) { setComposer(''); notify('图片过大未暂存,仅暂存了文字'); ensure(); return; }
-      }
-      notify('暂存失败:存储空间不足'); return; // 什么都没存,什么都不动
+      // 配额溢出(图片 dataURL 太大):**整体中止、不动 composer**,保草稿完整(文字+图片)不拆分。
+      // 不再降级为「只存文字、图片留输入框」—— 那会把草稿拆成 stash 文字 + 残留图,残留图还会被下一条
+      // 原生发送带走(见 review)。
+      notify('暂存失败:存储空间不足(图片过大?草稿保持不变)'); return;
     }
-    if (t && t.trim()) setComposer(''); // 存成功才清:文字 + 图片(文件保留)
+    if (t && t.trim()) setComposer(''); // 存成功才清:文字 + 图片
     clearImages();
     // 刚暂存若含图:等附件真正清空再解锁(clearImages 异步;否则刚暂存的图还挂着,用户紧接着发送的
     // 插话会把它一起带出去,见 review)。__busy 期间我方 push/restore/send 不可再入。
