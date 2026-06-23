@@ -13,7 +13,8 @@
 //! 幂等 `INSTALL_SCRIPT`(版本化 guard,升级即覆盖旧注入,免重启 Codex)。所有状态在 renderer
 //! 侧 localStorage(`catStash`),跨 Codex reload 存活(与 quota 的 usageCache 同机制)。
 //!
-//! 存储 schema:`localStorage['catStash'] = [{ id, text, ts }]`(全局,不按会话隔离)。
+//! 存储 schema:`localStorage['catStash'] = [{ id, text, ts, images }]`(全局,不按会话隔离;
+//! `images` 为 `[{ src(dataURL), filename }]`,可序列化)。
 //!
 //! 恢复语义(swap,不丢草稿):输入框空 → 直接填入目标项;输入框非空 → 先把当前内容暂存,
 //! 再填入目标项。恢复/发送均「消费」该条(git stash pop 模型)。
@@ -34,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 2; // 加图片暂存/恢复(合成 paste)+ 配额降级 → bump,升级免重启覆盖
+  var VERSION = 4; // review fix:保留换行(paste 重建段落)+ 图片发送前确认 + 写失败不消费 + 解析缓存
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -45,29 +46,41 @@ const INSTALL_SCRIPT: &str = r##"
 
   // ── 存储(全局 localStorage,跨 reload 存活)──
   var KEY = 'catStash';
+  // 解析缓存:load() 会 JSON.parse 整个 blob(含图片 dataURL,可达数 MB)。热路径(ensureBar /
+  // ensurePanel 每 tick + 每次打字经 observer→rAF 调 ensure)若每次都重解析就会在敲键时反复
+  // parse 数 MB → 卡顿。用一个会话内单调写计数 __rev 做缓存:仅在 save() 后失效一次,其余调用
+  // 直接返回上次解析结果(纯内存,连 localStorage 都不读)。单渲染进程、所有写都走 save(),故
+  // 缓存与磁盘一致;reload 后 __rev 归 0、首个 load() 重新解析一次。
+  // **不可变契约**:load() 返回的数组视为只读,mutate 它的 caller(stashCurrent)须先 .slice()。
+  var __rev = 0, __loadRev = -1, __loadVal = [];
   // load 时逐项规整:id/text 强制 string、ts 兜底,屏蔽 schema 漂移或外部写入的非字符串值
   // (否则 renderPanel 的 it.text.replace 会 throw 进而整个面板/按钮静默消失)。
   function load() {
+    if (__loadRev === __rev) return __loadVal; // 缓存命中:无写发生,直接复用上次解析结果
+    var out = [];
     try {
       var s = localStorage.getItem(KEY); var a = s ? JSON.parse(s) : [];
-      if (!Array.isArray(a)) return [];
-      return a.filter(function (x) { return x && x.id != null; }).map(function (x) {
-        return {
-          id: String(x.id),
-          text: x.text == null ? '' : String(x.text),
-          ts: x.ts || 0,
-          // 图片附件:{src:dataURL, filename}(可序列化;只留带 data: 前缀的)。文件附件注入侧无法
-          // 干净恢复(setComposerStateField 不可达 / 合成 drop 无 fs path),不纳入,见 followup CAT-260。
-          images: Array.isArray(x.images) ? x.images
-            .filter(function (im) { return im && typeof im.src === 'string' && im.src.indexOf('data:') === 0; })
-            .map(function (im) { return { src: im.src, filename: String(im.filename || 'image.png') }; }) : []
-        };
-      });
-    } catch (e) { return []; }
+      if (Array.isArray(a)) {
+        out = a.filter(function (x) { return x && x.id != null; }).map(function (x) {
+          return {
+            id: String(x.id),
+            text: x.text == null ? '' : String(x.text),
+            ts: x.ts || 0,
+            // 图片附件:{src:dataURL, filename}(可序列化;只留带 data: 前缀的)。文件附件注入侧无法
+            // 干净恢复(setComposerStateField 不可达 / 合成 drop 无 fs path),不纳入,见 followup CAT-260。
+            images: Array.isArray(x.images) ? x.images
+              .filter(function (im) { return im && typeof im.src === 'string' && im.src.indexOf('data:') === 0; })
+              .map(function (im) { return { src: im.src, filename: String(im.filename || 'image.png') }; }) : []
+          };
+        });
+      }
+    } catch (e) { out = []; }
+    __loadVal = out; __loadRev = __rev;
+    return out;
   }
   // save 返回是否成功:图片 dataURL 较大,localStorage 配额(~5-10MB)可能溢出,caller 据此降级
-  // (绝不在保存失败时清空 composer 丢内容)。
-  function save(a) { try { localStorage.setItem(KEY, JSON.stringify(a)); return true; } catch (e) { return false; } }
+  // (绝不在保存失败时清空 composer 丢内容)。写成功才 bump __rev 让缓存失效(失败则缓存仍有效)。
+  function save(a) { try { localStorage.setItem(KEY, JSON.stringify(a)); __rev++; return true; } catch (e) { return false; } }
   // id 用「ms + 会话内单调序号 + 随机」:序号保证同毫秒/同 random 也不碰撞(碰撞会让
   // filter(x=>x.id!==id) 误删两条)。
   var __seq = 0;
@@ -76,19 +89,51 @@ const INSTALL_SCRIPT: &str = r##"
 
   // ── composer 操作(.ProseMirror,选择子均 CDP 实证)──
   function composerEl() { return document.querySelector('.ProseMirror'); }
-  function composerText() { var e = composerEl(); return e ? (e.textContent || '') : ''; }
+  // 取草稿全文(保留换行):ProseMirror 多行草稿是单 textblock 内的 hard break(<br>)/多 block,
+  // textContent 把文本节点直接拼接、丢掉所有换行(`a<br>b` → "ab")。用 innerText 还原渲染所见
+  // 的换行(块边界 / <br> → \n),不可用时回退 textContent。**捕获/恢复/校验三处都走它**保持同一
+  // 文本空间;空值判断用更廉价的 composerTextRaw(见 ensureBar 热路径)。
+  function composerText() { var e = composerEl(); if (!e) return ''; var v = e.innerText; return (v != null ? v : (e.textContent || '')); }
+  // 仅判空(textContent 即可,无需 innerText 触发 reflow):热路径用,避免每 tick reflow。
+  function composerTextRaw() { var e = composerEl(); return e ? (e.textContent || '') : ''; }
+  // 暂存用的规范文本:本 composer 的 Shift+Enter = 新建段落,innerText 段间是 `\n\n`(每个换行
+  // 渲染成空行)。但 paste 把每个 `\n` 当一个段落边界 —— 若原样存 `\n\n` 再 paste 回去,换行会
+  // 翻倍膨胀(非幂等)。故规范化为「每个换行一个 `\n`」:折叠连续 `\n` 为单个 + 去尾换行。这样
+  // 存 `a\nb\nc`,paste 回去重建 3 段(innerText `a\n\nb\n\nc`),再捕获仍得 `a\nb\nc` —— 幂等且保留换行。
+  function captureText() { return composerText().replace(/\r/g, '').replace(/\n{2,}/g, '\n').replace(/\n+$/, ''); }
+  // 文本比较归一:折叠任意连续换行为单个 + 去首尾空白,容忍 ProseMirror 把 hard break 映成
+  // paragraph(innerText 读回多一个 \n)等差异,避免成功写入却被判失败。
+  function nrm(s) { return (s == null ? '' : String(s)).replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n+/g, '\n').replace(/^\n+|\s+$/g, ''); }
   function fiberOf(el) { if (!el) return null; for (var k in el) { if (k.indexOf('__reactFiber$') === 0) return el[k]; } return null; }
-  // 设输入框内容:focus → 全选删除 → insertText(空则只清);execCommand 不生效时回退派发 InputEvent。
-  // **返回是否真落值**(caller 据此决定是否消费 stash,绝不在没落值时丢草稿):目标空 → 须真空;
-  // 目标非空 → textContent 须等于目标。
+  // 把文本合成 text/plain paste 进 composer(ProseMirror 的 paste 路径把 \n→hard break、\n\n→段落,
+  // 是多行最可靠的注入方式,与图片合成 paste 同机制)。
+  function pasteText(pm, text) {
+    try {
+      var dt = new DataTransfer(); dt.setData('text/plain', text);
+      var ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'clipboardData', { value: dt });
+      pm.dispatchEvent(ev);
+    } catch (x) {}
+  }
+  // 设输入框内容:focus → 全选删除(CDP 实证可靠清空)→ 写入(空则只清)。**返回是否真落值**
+  // (caller 据此决定是否消费 stash,绝不在没落值时丢草稿):目标空 → 须真空;目标非空 → 归一后
+  // 须等于目标(nrm 容忍换行映射差异)。
+  // **写入机制实证(CDP)**:本 composer 的 Shift+Enter = 新建 `<p>` 段落(非 `<br>` hard break),
+  // 多行草稿即多个 `<p>`(innerText 段间为 `\n\n`)。text/plain 合成 paste 恰好按 `\n` 切段、重建
+  // 同构 `<p>`,**稳定且与原草稿同构**,故作首选。execCommand insertLineBreak 会插入裸 `\n` 文本、
+  // 被 ProseMirror 规整后坍缩成空格(丢换行),**不可用**;回退仅用 insertText / InputEvent。
   function setComposer(text) {
     var e = composerEl(); if (!e) return false;
     try { e.focus(); } catch (x) {}
     try { document.execCommand('selectAll', false, null); } catch (x) {}
     try { document.execCommand('delete', false, null); } catch (x) {}
     if (text) {
-      try { document.execCommand('insertText', false, text); } catch (x) {}
-      if ((composerText() || '') !== text) {
+      pasteText(e, text); // 首选:多行安全(重建 <p> 段落,与 Shift+Enter 同构)
+      if (nrm(composerText()) !== nrm(text)) { // 回退 1:execCommand insertText(paste 被拦时;单行可靠)
+        try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (x) {}
+        try { document.execCommand('insertText', false, text); } catch (x) {}
+      }
+      if (nrm(composerText()) !== nrm(text)) { // 回退 2:单次 InputEvent
         try {
           e.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: text, bubbles: true, cancelable: true }));
           e.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
@@ -96,7 +141,7 @@ const INSTALL_SCRIPT: &str = r##"
       }
     }
     var now = composerText() || '';
-    return text ? (now === text) : (now.trim() === '');
+    return text ? (now.trim() !== '' && nrm(now) === nrm(text)) : (now.trim() === '');
   }
   // 提交:优先点 compose 按钮,但**运行态(按钮为 Stop)不点**——点它会停掉当前轮次;
   // 改走 fiber handleSubmit()(空闲时发送,运行时入队为 steer,符合「运行中也能发送」语义)。
@@ -158,12 +203,15 @@ const INSTALL_SCRIPT: &str = r##"
       } catch (e) {}
     });
   }
-  // 合成 paste 是异步落值(FileReader+persist),发送前轮询图片就位(最多 ~2.5s)再提交。
+  // 合成 paste 是异步落值(FileReader+persist),发送前轮询图片就位(最多 ~2.5s)。
+  // **回调带 ok**:就位 → cb(true);超时 → cb(false)。caller 必须区分 —— 超时不能照发(会发出
+  // 不带图片的消息),更不能在确认前消费 stash。
   function waitImages(target, cb) {
     var tries = 0;
     var iv = setInterval(function () {
       tries++;
-      if (readImages().length >= target || tries > 25) { clearInterval(iv); cb(); }
+      if (readImages().length >= target) { clearInterval(iv); cb(true); }
+      else if (tries > 25) { clearInterval(iv); cb(false); }
     }, 100);
   }
   // 最小 toast(暂存失败/降级时告知;无侵入,2.5s 自removed)
@@ -180,48 +228,61 @@ const INSTALL_SCRIPT: &str = r##"
   // ── 核心动作 ──
   // 当前 composer 内容(文本 + 图片)打包成一条 swap 用的 entry;全空返 null
   function curEntry() {
-    var t = composerText(), imgs = readImages();
+    var t = captureText(), imgs = readImages();
     if ((!t || !t.trim()) && !imgs.length) return null;
     return { id: uid(), text: t || '', ts: Date.now(), images: imgs };
   }
+  // 当前内容 swap 进 stash 但**暂不消费目标项**:先存一份「原列表 + cur」(cur 不丢),目标项
+  // 仍在列表里;真正落值/发送成功后再单独移除目标项。返回该 swap 是否 save 成功(配额够)。
+  function swapInCurrent(arr) {
+    var cur = curEntry();
+    if (!cur) return true;          // 输入框空,无需 swap
+    var next = arr.slice(); next.push(cur);
+    return save(next);
+  }
+  function consumeItem(id) { save(load().filter(function (x) { return x.id !== id; })); }
   // 恢复:把目标(文本+图片)放进 composer;输入框非空则先把当前内容 swap 进 stash(不丢)。
-  // **先 save(配额够)再动 composer**——保存失败就安全中止,绝不出现「清了 composer 但没存上」。
+  // **先 swap-save(配额够)再动 composer**——保存失败就安全中止。**setComposer 真落值才消费目标项**:
+  // 写失败(composer 不在 / 没落值)则目标项保留在 stash,绝不出现「消费了却没填进输入框」。
   function restore(id) {
     var arr = load(); var item = findItem(arr, id); if (!item) return;
-    var cur = curEntry();
-    var rest = arr.filter(function (x) { return x.id !== id; });
-    if (cur) rest.push(cur);
-    if (!save(rest)) { notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
+    if (!swapInCurrent(arr)) { notify('暂存空间不足,恢复已取消'); return; } // composer 还没动,安全
     clearImages();                 // 清掉当前图片(已 swap 进 stash);不动文件
-    setComposer(item.text);
+    if (!setComposer(item.text)) { notify('写入输入框失败,恢复已取消'); closeMenu(); ensure(); return; } // 目标项仍在 stash
+    consumeItem(id);               // 文本已落值,消费目标项
     addImages(item.images || []);
     closeMenu(); ensure();
   }
-  // 发送:同 restore 把目标放进 composer,图片就位后提交;提交成功消费该条,失败也无损
-  //(目标内容已在输入框可重发,当前内容已 swap 进 stash)。
+  // 发送:同 restore 把目标放进 composer。**仅在文本落值 + 图片就位后才消费并提交**:
+  // 写失败 → 不消费、不提交;图片超时未就位 → 不消费、不提交(避免发出不带图片的消息),目标项
+  // 留在 stash 可重试。失败均无损(当前内容已 swap 进 stash,目标项仍在)。
   function sendItem(id) {
     var arr = load(); var item = findItem(arr, id); if (!item) return;
-    var cur = curEntry();
-    var next = arr.filter(function (x) { return x.id !== id; });
-    if (cur) next.push(cur);
-    if (!save(next)) { notify('暂存空间不足,发送已取消'); return; }
+    if (!swapInCurrent(arr)) { notify('暂存空间不足,发送已取消'); return; }
     clearImages();
-    setComposer(item.text);
-    addImages(item.images || []);
-    var fire = function () { submitComposer(); ensure(); };
-    if ((item.images || []).length) waitImages(item.images.length, fire); else fire(); // 合成 paste 异步,等图片就位再发
+    if (!setComposer(item.text)) { notify('写入输入框失败,发送已取消'); ensure(); return; } // 目标项仍在 stash
+    var imgs = item.images || [];
+    addImages(imgs);
+    var fire = function () { consumeItem(id); submitComposer(); ensure(); }; // 确认后才消费 + 提交
+    if (imgs.length) {
+      waitImages(imgs.length, function (ok) {
+        if (ok) fire();
+        else { notify('图片未就位,已保留暂存(未发送)'); ensure(); } // 不消费、不提交
+      });
+    } else fire();
   }
   function del(id) { save(load().filter(function (x) { return x.id !== id; })); ensure(); }
   // 暂存当前(文本+图片)→ 清空输入框(**不动文件**,文件不在范围见 CAT-260)。
   // **先 save 成功才清**,避免清了没存上丢内容;配额溢出时降级为只存文字(图片太大),不丢文字。
+  // load() 返回只读缓存,故先 .slice() 再 push(不污染缓存)。
   function stashCurrent() {
-    var t = composerText(), imgs = readImages();
+    var t = captureText(), imgs = readImages();
     if ((!t || !t.trim()) && !imgs.length) return;
     var entry = { id: uid(), text: t || '', ts: Date.now(), images: imgs };
-    var arr = load(); arr.push(entry);
+    var arr = load().slice(); arr.push(entry);
     if (!save(arr)) {
       if (t && t.trim()) { // 退化:只存文字,图片留在输入框不清
-        entry.images = []; var a2 = load(); a2.push(entry);
+        var a2 = load().slice(); a2.push({ id: entry.id, text: entry.text, ts: entry.ts, images: [] });
         if (save(a2)) { setComposer(''); notify('图片过大未暂存,仅暂存了文字'); ensure(); return; }
       }
       notify('暂存失败:存储空间不足'); return; // 什么都没存,什么都不动
@@ -300,8 +361,7 @@ const INSTALL_SCRIPT: &str = r##"
     return null;
   }
   var CHEV = '<svg class="cschev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
-  function renderPanel(node) {
-    var arr = load();
+  function renderPanel(node, arr) {
     node.textContent = '';
     node.classList.toggle('cscol', isCollapsed());
     var h = el('div', 'cshdr');
@@ -348,9 +408,11 @@ const INSTALL_SCRIPT: &str = r##"
     // 用签名 guard 跳过无变化重建(对齐 quota 的 __catQuotaSig)。折叠态由 header 点击直接 toggle class,
     // 不经重建,故不入签名。
     // 廉价签名:条目不可变(只增删/消费),id 列表 + 各自图片数即可表征变化;**不** stringify 整个
-    // load()(图片 dataURL 可达数 MB,每 tick stringify 会很热)。
-    var sig = load().map(function (e) { return e.id + '#' + ((e.images || []).length); }).join(',');
-    if (fresh || sig !== window.__catStashSig) { renderPanel(node); window.__catStashSig = sig; }
+    // load()(图片 dataURL 可达数 MB,每 tick stringify 会很热)。load() 已带解析缓存(见上),
+    // 此处与 renderPanel 共用同一份(不重复解析)。
+    var arr = load();
+    var sig = arr.map(function (e) { return e.id + '#' + ((e.images || []).length); }).join(',');
+    if (fresh || sig !== window.__catStashSig) { renderPanel(node, arr); window.__catStashSig = sig; }
   }
 
   // ── 下拉选单(pop 多条时)──
@@ -403,11 +465,12 @@ const INSTALL_SCRIPT: &str = r##"
       bar.__push = push; bar.__pop = pop; bar.__badge = badge;
     }
     if (bar.parentElement !== host || host.firstChild !== bar) { host.insertBefore(bar, host.firstChild); }
-    // 状态刷新(仅变化时写,避免自触发 observer churn)
+    // 状态刷新(仅变化时写,避免自触发 observer churn)。load() 带解析缓存,热路径不重复 parse。
     var arr = load();
-    // 有文字或有图片(廉价 DOM 查附件行里的 img 缩略图,避免每 tick 爬 fiber)即可暂存
+    // 有文字或有图片(均走廉价检查:文字用 textContent 判空而非 innerText 触发 reflow;图片查
+    // 附件行里的 img 缩略图,避免每 tick 爬 fiber)即可暂存
     var hasImg = !!document.querySelector('[data-composer-attachments-row] img');
-    var pushDisabled = !(composerText().trim()) && !hasImg;
+    var pushDisabled = !(composerTextRaw().trim()) && !hasImg;
     if (bar.__push.disabled !== pushDisabled) bar.__push.disabled = pushDisabled;
     bar.__push.title = '暂存当前输入(文字 + 图片)';
     var popShow = arr.length > 0 ? '' : 'none';
