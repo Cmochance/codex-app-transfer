@@ -163,7 +163,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 |---|---|---|---|---|
 | Kimi (Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | Thinking 3-layer defense; Kimi Code plan quota shown via console session (see usage notes below) |
 | DeepSeek V4 (incl. Max thinking) | ✅ | ✅ | ✅ | Vision input stripped to avoid 400; xhigh → real max effort (#254) |
-| Xiaomi MiMo (Token Plan / Pay for Token) | ✅ | ✅ | ✅ | Image-only requests get space text-part fallback |
+| Xiaomi MiMo (Token Plan / Pay for Token) | ✅ | ✅ | ✅ | **Now uses native responses protocol passthrough** |
 | MiniMax M3 (1M) / M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` → user (v2.1.6 fix for 400); M3 context 1M; compact keeps tool-call args valid JSON (#356) |
 | OpenCode Go (`opencode.ai/zen/go/v1`, openai_chat) | ✅ | ✅ | ✅ | Low-cost open-source coding model subscription ($5 first month / $10/mo); GLM/Kimi/DeepSeek/MiMo family via /chat/completions; MiniMax/Qwen via /messages (not in this preset); 5h/weekly/monthly plan quota via console session (see usage notes below) |
 | Google AI Studio (`gemini_native`) | ✅ | ✅ | ✅ | Auto-selects Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` |
