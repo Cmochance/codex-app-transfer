@@ -99,7 +99,7 @@
     "baseUrl": "https://api.xiaomimimo.com/v1",
     "docsUrl": "https://www.mimo-v2.com/zh/docs/quick-start/first-api-call",
     "authScheme": "bearer",
-    "apiFormat": "openai_chat",
+    "apiFormat": "responses",
     "models": {
       "default": "mimo-v2.5-pro"
     },
@@ -132,7 +132,7 @@
     "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
     "docsUrl": "https://www.mimo-v2.com/zh/docs/quick-start/first-api-call",
     "authScheme": "bearer",
-    "apiFormat": "openai_chat",
+    "apiFormat": "responses",
     "baseUrlOptions": [
       {
         "label": "中国集群",
