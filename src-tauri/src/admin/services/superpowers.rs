@@ -129,7 +129,10 @@ pub fn managed_cache_present() -> Result<bool, String> {
     let dir = codex_plugins::plugins_cache_root()?
         .join(MANAGED_MARKET)
         .join(PLUGIN_NAME);
-    Ok(dir.exists())
+    // try_exists 而非 exists:exists() 对 stat 错误(权限拒绝等)也返 false 会吞错误,与本函数
+    // "不吞错误"的契约矛盾;try_exists 把 NotFound 以外的 stat 失败作为 Err 传播。
+    dir.try_exists()
+        .map_err(|e| format!("stat {}: {e}", dir.display()))
 }
 
 /// 据 api_format + 开关 + 已装检测,收敛内置 superpowers 的装/卸态。
