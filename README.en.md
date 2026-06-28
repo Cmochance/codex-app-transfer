@@ -390,6 +390,7 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire-level reference
 - [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web reverse-engineering ref
 - [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Codex Desktop Plugins unlock script
+- [`obra/superpowers`](https://github.com/obra/superpowers) — Bundled constraint-skill plugin
 - [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — Qwen Token Plan model registry
 - [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX CDP injection path
 - [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — managed-block six-op design
