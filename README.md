@@ -162,7 +162,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 |---|---|---|---|---|
 | Kimi(Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | thinking 三层防御;Kimi Code 套餐用量经控制台 session 显示(见下方用量说明) |
 | DeepSeek V4(含 Max 思维) | ✅ | ✅ | ✅ | 视觉输入剥离避免 400;xhigh → max 真实到达(#254) |
-| Xiaomi MiMo(Token Plan / Pay for Token) | ✅ | ✅ | ✅ | **已切原生 responses 协议直连** |
+| Xiaomi MiMo(Token Plan / Pay for Token) | ✅ | ✅ | ✅ | 纯图请求兜底空格 text part |
 | MiniMax M3(1M)/ M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` 转 user 防 400(v2.1.6);M3 上下文 1M;compact 截断工具参数保持合法 JSON(#356) |
 | OpenCode Go(`opencode.ai/zen/go/v1`,openai_chat) | ✅ | ✅ | ✅ | 低成本开源编程模型订阅($5 首月/$10 月);GLM/Kimi/DeepSeek/MiMo 系走 /chat/completions;MiniMax/Qwen 系走 /messages(不在此 preset);5h/周/月三档套餐用量经控制台 session 显示(见下方用量说明) |
 | Google AI Studio(`gemini_native`) | ✅ | ✅ | ✅ | Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` 自动选 |
