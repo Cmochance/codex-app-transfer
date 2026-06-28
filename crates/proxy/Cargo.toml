@@ -52,4 +52,4 @@ indexmap = "2"
 tokio-tungstenite = "0.29"
 tempfile = "3"
 # [MOC-195] 集成测试 main 前隔离 home(tests/common/mod.rs),版本跟 lock 内既有传递依赖一致
-ctor = "0.8"
+ctor = "1.0"

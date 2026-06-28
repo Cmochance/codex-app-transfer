@@ -925,7 +925,7 @@ dependencies = [
  "bytes",
  "codex-app-transfer-gemini-oauth",
  "codex-app-transfer-registry",
- "ctor",
+ "ctor 1.0.7",
  "futures-core",
  "futures-util",
  "getrandom 0.2.17",
@@ -1027,7 +1027,7 @@ dependencies = [
  "codex-app-transfer-adapters",
  "codex-app-transfer-gemini-oauth",
  "codex-app-transfer-registry",
- "ctor",
+ "ctor 1.0.7",
  "futures-core",
  "futures-util",
  "http",
@@ -1319,6 +1319,16 @@ checksum = "352d39c2f7bef1d6ad73db6f5160efcaed66d94ef8c6c573a8410c00bf909a98"
 dependencies = [
  "ctor-proc-macro",
  "dtor",
+]
+
+[[package]]
+name = "ctor"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01334b89b69ff726750c5ce5073fc8bd860e99aa9a8fc5ca11b04730e3aee97a"
+dependencies = [
+ "link-section",
+ "linktime-proc-macro",
 ]
 
 [[package]]
@@ -3216,6 +3226,18 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "link-section"
+version = "0.18.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24670b639492630905459a6c7d47f063d33c2d4fcd5362f6e5827c5613976c9f"
+
+[[package]]
+name = "linktime-proc-macro"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c7b0a3383c2a1002d11349c92c85a666a5fb679e96c79d782cf0dbe557fd6ee"
 
 [[package]]
 name = "linux-raw-sys"
@@ -5888,7 +5910,7 @@ dependencies = [
  "anyhow",
  "brotli",
  "cargo_metadata",
- "ctor",
+ "ctor 0.8.0",
  "dom_query 0.27.0",
  "dunce",
  "glob",
