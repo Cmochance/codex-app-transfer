@@ -10,7 +10,8 @@
 //! binary 静默回到真机数据。
 
 /// 所有 `mod common;` 引入本模块的集成测试 binary,main 前自动执行一次。
-#[ctor::ctor]
+// ctor 1.0 起要求显式 `unsafe` 标注(ctor 在 main 前的单线程阶段运行,语义未变)。
+#[ctor::ctor(unsafe)]
 fn isolate_test_home() {
     let dir = tempfile::tempdir().expect("create temp home for test isolation");
     std::env::set_var(codex_app_transfer_registry::HOME_OVERRIDE_ENV, dir.path());
