@@ -432,7 +432,14 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("codexQuotaEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled {
+    // 草稿暂存(Stash)注入 daemon 同样走 CDP,只开 stash 不开其它时也要端口。
+    let stash_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("codexStashEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled && !stash_enabled {
         return vec![];
     }
 

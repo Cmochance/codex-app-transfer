@@ -586,6 +586,8 @@ export default {
   "settings.autoUnlockCodexPluginsHint": "Unlocks Codex plugins. Requires launching Codex from this app.",
   "settings.codexQuotaEnabled": "Show usage in Codex",
   "settings.codexQuotaEnabledHint": "Shows a usage panel in Codex (context, token rate/total, quota). Only when Codex is launched from this app.",
+  "settings.codexStashEnabled": "Enable draft stash in Codex",
+  "settings.codexStashEnabledHint": "Stash composer drafts to restore or send later. Only when Codex is launched from this app.",
   "settings.pluginUnlockForce": "Force unlock",
   "settings.pluginUnlockForced": "Force-unlock triggered",
   "settings.pluginUnlockForceFailed": "Force unlock failed",

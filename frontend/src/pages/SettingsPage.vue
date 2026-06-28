@@ -242,6 +242,7 @@ const autoApplyOnStart = toggle('autoApplyOnStart', true)
 const restoreCodexOnExit = toggle('restoreCodexOnExit', true)
 const autoWakeCodexPet = toggle('autoWakeCodexPet', true)
 const codexQuotaEnabled = toggle('codexQuotaEnabled', false)
+const codexStashEnabled = toggle('codexStashEnabled', false)
 const codexNetworkAccess = toggle('codexNetworkAccess', false)
 const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
@@ -616,6 +617,9 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     <SettingsGroup :title="t('settings.groupCodexIntegration')">
       <SettingsRow :title="t('settings.codexQuotaEnabled')" :description="t('settings.codexQuotaEnabledHint')">
         <AppSwitch v-model="codexQuotaEnabled" />
+      </SettingsRow>
+      <SettingsRow :title="t('settings.codexStashEnabled')" :description="t('settings.codexStashEnabledHint')">
+        <AppSwitch v-model="codexStashEnabled" />
       </SettingsRow>
       <RouterLink to="/codex-skin" class="nav-row">
         <div class="nav-row__text">

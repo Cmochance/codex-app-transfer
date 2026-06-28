@@ -8,6 +8,7 @@ mod anyrouter_quota;
 mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;
+mod codex_stash_injector;
 mod codex_theme_injector;
 mod deepseek_quota;
 mod glm_quota;
@@ -220,6 +221,11 @@ fn main() {
             // + proxy rate limit 快照,经 CDP 推进 Codex Environment 卡片。
             // 开关关 / CDP 不可达时 tick 内静默跳过,常驻无负担。
             tauri::async_runtime::spawn(codex_quota_injector::run_quota_daemon());
+
+            // 草稿暂存(Stash)注入 daemon:每 tick 读 settings.codexStashEnabled,经 CDP 推
+            // 幂等注入(composer 工具栏 push/pop 按钮 + Usage 下方 Stash 面板)。独立于额度开关;
+            // 开关关 / CDP 不可达时 tick 内静默跳过。
+            tauri::async_runtime::spawn(codex_stash_injector::run_stash_daemon());
 
             // [MOC-231] GC 旧的上下文明细缓存(context-breakdown/<uuid>.json,每对话一个;
             // >14 天的陈旧对话删除,下次有请求会重建)。fire-and-forget,不阻塞 startup。

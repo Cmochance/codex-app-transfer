@@ -668,6 +668,9 @@ export default {
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",
+  "settings.codexStashEnabled": "Codex 内启用草稿暂存",
+  "settings.codexStashEnabledHint":
+    "仅通过本应用启动 Codex 时生效，可暂存输入框草稿，随后恢复到输入框或直接发送。",
   "settings.pluginUnlockForce": "强制开启",
   "settings.pluginUnlockForced": "已触发强制解锁",
   "settings.pluginUnlockForceFailed": "强制开启失败",
