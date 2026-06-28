@@ -84,7 +84,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # objc2 / objc2-foundation 不直接声明:代码只 use objc2_app_kit,这俩作为
 # objc2-app-kit 的传递依赖自动可用,显式列为直接依赖是冗余(cargo-machete 真阳性)。
-objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication"] }
 
 # Windows MSIX Codex Desktop 启动 — IApplicationActivationManager COM 调用
 # 让 packaged Codex.exe 接收 `--remote-debugging-port=9222` 启动参数,
