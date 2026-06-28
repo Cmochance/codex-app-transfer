@@ -26,7 +26,10 @@ import {
   startRealAccountLogin,
   cancelRealAccountLogin,
   pinCurrentRealAccount,
+  getSuperpowersStatus,
+  reconcileSuperpowers,
   type PluginUnlockMode,
+  type SuperpowersStatus,
 } from '@/api/desktop'
 import type { ApiError } from '@/api/http'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
@@ -116,6 +119,7 @@ onMounted(() => {
     .then((r) => (appVersion.value = r.version || ''))
     .catch(() => {})
   refreshPluginUnlockStatus()
+  refreshSuperpowersStatus()
   mcpRecovery.refresh()
 })
 
@@ -248,6 +252,28 @@ const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
 const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
 const hideDockIcon = toggle('hideDockIcon', false)
+// [MOC-277] superpowers 强约束插件开关:默认态由后端算(已自装 superpowers → 默认关,避免双装),
+// 翻开关后即时收敛(装/卸插件文件),否则要等下次 apply / Codex relaunch 才生效。
+const superpowersStatus = ref<SuperpowersStatus | null>(null)
+const antigravitySuperpowers = computed<boolean>({
+  get: () =>
+    store.bool('antigravitySuperpowersEnabled', superpowersStatus.value?.effectiveEnabled ?? true),
+  set: (v) => {
+    void (async () => {
+      await persist({ antigravitySuperpowersEnabled: v })
+      try {
+        superpowersStatus.value = await reconcileSuperpowers()
+      } catch {
+        /* best-effort:收敛失败不影响设置已存,下次 apply 仍会生效 */
+      }
+    })()
+  },
+})
+function refreshSuperpowersStatus() {
+  getSuperpowersStatus()
+    .then((s) => (superpowersStatus.value = s))
+    .catch(() => {})
+}
 // macOS 限定:隐藏程序坞图标(Windows/Linux 无 Dock 概念,该开关不显示)
 const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent)
 
@@ -648,6 +674,13 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       </SettingsRow>
       <SettingsRow :title="t('settings.showGrayProviders')" :description="t('settings.showGrayProvidersHint')">
         <AppSwitch v-model="showGrayProviders" />
+      </SettingsRow>
+      <SettingsRow
+        v-if="showGrayProviders"
+        :title="t('settings.antigravitySuperpowers')"
+        :description="t('settings.antigravitySuperpowersHint')"
+      >
+        <AppSwitch v-model="antigravitySuperpowers" />
       </SettingsRow>
       <SettingsRow
         :title="t('settings.mcpCredentialsPortableStore')"

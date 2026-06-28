@@ -565,6 +565,8 @@ export default {
   "settings.showGrayProviders": "Show gray-area providers",
   "settings.showGrayProvidersWarn": "⚠️ Account-ban risk: enabling and using these providers is entirely at your own risk.",
   "settings.showGrayProvidersHint": "Experimental providers such as Gemini CLI and Antigravity are hidden by default.",
+  "settings.antigravitySuperpowers": "Antigravity constraints (superpowers)",
+  "settings.antigravitySuperpowersHint": "Auto-mount the superpowers constraint plugin for Antigravity (relaunch Codex to take effect).",
   "settings.pluginUnlock": "Codex plugin unlock",
   "settings.pluginUnlockHint":
     "Off / Synthetic (local fake) / Real (logged-in ChatGPT); the latter two need an active provider.",

@@ -111,6 +111,11 @@ fn managed_installed_version() -> Option<String> {
         .map(|e| e.version)
 }
 
+/// 我方受管 superpowers 是否已安装(供设置页 status 端点)。
+pub fn is_managed_installed() -> bool {
+    managed_installed_version().is_some()
+}
+
 /// 据 api_format + 开关 + 已装检测,收敛内置 superpowers 的装/卸态。
 ///
 /// best-effort:任何失败只 log,不影响 provider apply 主流程。返回收敛后的期望态(供日志)。

@@ -544,7 +544,7 @@ async fn sync_desktop_for_active_provider_impl(state: &AdminState, force_apikey:
 /// [MOC-277] 据 active provider 的 api_format + 开关(三态)+ 已装检测,装/卸内置 superpowers
 /// 插件。best-effort:任何失败只 log,不影响 provider apply 主流程。切到非 antigravity / 关开关
 /// 都会经此卸掉我方挂载(只动受管 market,不碰用户自装)。
-fn reconcile_superpowers_from_config() {
+pub fn reconcile_superpowers_from_config() {
     let Ok(cfg) = load_registry() else {
         return;
     };

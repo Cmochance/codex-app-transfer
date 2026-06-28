@@ -107,6 +107,34 @@ pub async fn desktop_clear() -> impl IntoResponse {
     Json(json!({"success": true, "restored": restored})).into_response()
 }
 
+/// [MOC-277] GET /api/desktop/superpowers/status — 设置页据此算开关 effective 默认 + 展示检测态
+/// (用户已自装 superpowers → 默认关,避免双装)。
+pub async fn superpowers_status() -> impl IntoResponse {
+    use crate::admin::services::superpowers;
+    let explicit = load_registry()
+        .ok()
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get(superpowers::SETTING_KEY))
+        .and_then(|v| v.as_bool());
+    let foreign = superpowers::user_has_foreign_superpowers();
+    Json(json!({
+        "effectiveEnabled": explicit.unwrap_or(!foreign),
+        "explicit": explicit,
+        "foreignDetected": foreign,
+        "managedInstalled": superpowers::is_managed_installed(),
+        "version": superpowers::vendored_version(),
+    }))
+    .into_response()
+}
+
+/// [MOC-277] POST /api/desktop/superpowers/reconcile — 翻开关后即时按当前 active provider + 新设置
+/// 装/卸内置 superpowers(否则要等下次 apply / Codex relaunch)。返回收敛后的 status。
+pub async fn superpowers_reconcile() -> impl IntoResponse {
+    snapshot::reconcile_superpowers_from_config();
+    superpowers_status().await
+}
+
 pub async fn desktop_snapshots() -> impl IntoResponse {
     let paths = match CodexPaths::from_home_env() {
         Ok(p) => p,
