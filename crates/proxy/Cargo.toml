@@ -38,7 +38,7 @@ tokio-socks = "0.5"
 # (tokio-rustls)前必须显式装 aws-lc-rs(与 reqwest 上游转发一致),否则 panic。
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
