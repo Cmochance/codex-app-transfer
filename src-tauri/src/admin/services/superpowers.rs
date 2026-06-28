@@ -116,9 +116,23 @@ fn managed_entry() -> Option<PluginEntry> {
         .find(|e| e.key == managed_key())
 }
 
-/// 我方受管 superpowers 是否已安装(供设置页 status 端点)。
+/// 我方受管 superpowers 是否已安装(供设置页 status 端点;读 config.toml 拿 enabled,
+/// 解析失败被 `.ok()` 吞成 false —— 仅用于**只读展示**,不可用于"是否需清理"的决策)。
 pub fn is_managed_installed() -> bool {
     managed_entry().is_some()
+}
+
+/// 我方受管 superpowers 的 cache 目录是否存在 —— **直接看文件系统、不读 config.toml**,
+/// 且不吞错误(HOME 解析失败等返回 Err)。用于 clear 等"是否需清理"的判定:config.toml
+/// 损坏时 `is_managed_installed`/`list_installed` 会 Err→false(假阴性)而漏清理,本函数避开。
+pub fn managed_cache_present() -> Result<bool, String> {
+    let dir = codex_plugins::plugins_cache_root()?
+        .join(MANAGED_MARKET)
+        .join(PLUGIN_NAME);
+    // try_exists 而非 exists:exists() 对 stat 错误(权限拒绝等)也返 false 会吞错误,与本函数
+    // "不吞错误"的契约矛盾;try_exists 把 NotFound 以外的 stat 失败作为 Err 传播。
+    dir.try_exists()
+        .map_err(|e| format!("stat {}: {e}", dir.display()))
 }
 
 /// 据 api_format + 开关 + 已装检测,收敛内置 superpowers 的装/卸态。

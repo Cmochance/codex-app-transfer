@@ -7,10 +7,10 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    get_snapshot_status, has_snapshot, has_stale_active_snapshot, ignore_mcp_credentials_keys,
-    list_recovery, list_snapshots, remove_mcp_credentials_keys, repair_residual_pollution,
-    restore_codex_snapshot, restore_codex_state, restore_mcp_credentials_keys,
-    scan_residual_pollution, CodexPaths, RecoveryItem,
+    detect_signatures_in_text, get_snapshot_status, has_snapshot, has_stale_active_snapshot,
+    ignore_mcp_credentials_keys, list_recovery, list_snapshots, remove_mcp_credentials_keys,
+    repair_residual_pollution, restore_codex_snapshot, restore_codex_state,
+    restore_mcp_credentials_keys, scan_residual_pollution, CodexPaths, RecoveryItem,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -69,16 +69,78 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // follow-up #28 P0 守门:无快照时**直接 noop 不动文件**。
+    // follow-up #28 P0 守门:无 Codex 配置快照时**不动 config/auth 文件**。
     // [MOC-197] stale session 快照(被强杀 session 遗留)也算"有快照"——
     // restore_codex_state 内部会兜底还原它;只有 active/ 真空(从未 apply)才 noop。
     if !has_snapshot(&paths) && !has_stale_active_snapshot(&paths) {
-        return Json(json!({
-            "success": true,
-            "restored": false,
-            "message": "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)",
-        }))
-        .into_response();
+        // [MOC-277 followup] 无 Codex 配置快照,但 superpowers 可能已被 reconcile 端点装上(切到
+        // Antigravity 后翻开关、尚未 apply 建快照)。此分支里卸载是**唯一**清理动作 → 失败必须
+        // surface(否则 UI 谎报清理成功但插件仍在);未装则维持原 noop 文案。
+        // 检测用 managed_cache_present(直接看 cache 目录、不读 config.toml),且 Err 必须 surface:
+        // config.toml 损坏时 is_managed_installed 会被吞成 false(假阴性)→ 漏清理却谎报 noop。
+        match crate::admin::services::superpowers::managed_cache_present() {
+            Ok(false) => {
+                return Json(json!({
+                    "success": true,
+                    "restored": false,
+                    "message": "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)",
+                }))
+                .into_response();
+            }
+            Ok(true) => {
+                // [MOC-277 followup] 降级态守门:no-snapshot 正常意味着 config 从未 Transfer-apply
+                // (apply 必先建快照);但快照被外部删时 live ~/.codex 可能仍是 Transfer 残留态。此时无
+                // 快照可还原 config,若仍卸 superpowers 会留下"Transfer 配置但无约束插件"的不一致(同
+                // delete_provider 已规避的 live-state mismatch)→ 不卸、surface,交由重启自愈。
+                // 只读 **LIVE** config 做项目权威的高精度签名检测(已知 Transfer 端口 / app_home
+                // catalog / backend-api relay),天然不误判用户本地 provider(Ollama localhost:11434
+                // 非 Transfer 签名)。不连带扫 active/recovery 快照 —— 本守门只关心 live config,避免无关
+                // 的 recovery 快照读失败阻塞清理。读失败(非"文件不存在")propagate surface;不存在 =
+                // 用户无 config = 未 applied(裸 openai_base_url localhost 启发式两头都会错,见 snapshot.rs:582)。
+                let ports = known_transfer_proxy_ports();
+                let live_applied = match std::fs::read_to_string(&paths.config_toml) {
+                    Ok(text) => {
+                        !detect_signatures_in_text(&text, &paths.model_catalog_json, &ports)
+                            .is_empty()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        return err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("读 Codex config.toml 失败: {e}"),
+                        )
+                        .into_response();
+                    }
+                };
+                if live_applied {
+                    return err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Codex 配置仍是 Transfer 残留态但快照已丢失,无法干净还原;为避免留下「Transfer 配置但无约束插件」的不一致,未卸载 superpowers,请重启 Codex App Transfer 自愈。".to_owned(),
+                    )
+                    .into_response();
+                }
+                if let Err(e) = crate::admin::services::superpowers::uninstall() {
+                    return err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("卸载 superpowers 约束插件失败: {e}"),
+                    )
+                    .into_response();
+                }
+                return Json(json!({
+                    "success": true,
+                    "restored": true,
+                    "message": "已卸载 superpowers 约束插件(无 Codex 配置快照需还原)",
+                }))
+                .into_response();
+            }
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("检测 superpowers 安装状态失败: {e}"),
+                )
+                .into_response();
+            }
+        }
     }
     // [MOC-257 review] 顺序 mirror exit/startup:**先 restore_codex,再 un-stash 真账号**(真账号最终写)。
     // 反序(先 un-stash 再 restore_codex)会让 restore_codex 在 stash 还原出的真账号上 merge 旧快照 managed auth
@@ -88,7 +150,9 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // [MOC-277] 清 Codex 时一并卸载我方挂载的 superpowers(只动受管 market,不碰用户自装)。
+    // [MOC-277] 有快照的 clear:restore 成功**之后**再卸 superpowers —— 放 restore 之前会在 restore
+    // 失败时留下"superpowers 已删但 Codex 配置仍 Transfer-applied Antigravity"的不一致。restore 是主
+    // 清理,此处卸载失败 best-effort 只 log(无快照路径才把卸载失败 surface,见上)。
     if let Err(e) = crate::admin::services::superpowers::uninstall() {
         tracing::warn!("[MOC-277] superpowers uninstall on clear failed: {e}");
     }

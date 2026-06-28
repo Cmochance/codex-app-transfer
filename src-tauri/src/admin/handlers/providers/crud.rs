@@ -507,6 +507,11 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
         Ok(ConfigMutation::Modified(()))
     });
     match result {
+        // [MOC-277 followup] **不**在此 reconcile superpowers:delete_provider 只改 registry
+        // activeProvider,不走 sync_desktop_for_active_provider,live ~/.codex 仍指向被删的 Antigravity。
+        // 据未 apply 的 registry 新 active 卸载会让 Codex 还在 Antigravity 却没了 superpowers(不一致)。
+        // 原"残留到下次 apply"反而与 live 状态一致,且下次 apply/switch 与 exit restore 都会经
+        // reconcile_superpowers_from_config / uninstall 自愈,故这里不动。
         Ok(()) => Json(json!({"success": true})).into_response(),
         Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
