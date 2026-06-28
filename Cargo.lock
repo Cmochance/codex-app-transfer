@@ -1045,7 +1045,7 @@ dependencies = [
  "tokio-socks",
  "tokio-tungstenite",
  "tracing",
- "webpki-roots 0.26.11",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
