@@ -439,7 +439,19 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("codexStashEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled && !stash_enabled {
+    // 活跃对话顶栏注入 daemon 同样走 CDP,只开该功能时也要端口。
+    let conversation_strip_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("codexActiveConversationsEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !plugin_unlock_needs_port
+        && !theme_enabled
+        && !quota_enabled
+        && !stash_enabled
+        && !conversation_strip_enabled
+    {
         return vec![];
     }
 

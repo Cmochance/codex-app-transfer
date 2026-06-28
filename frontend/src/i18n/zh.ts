@@ -674,6 +674,9 @@ export default {
   "settings.codexStashEnabled": "Codex 内启用草稿暂存",
   "settings.codexStashEnabledHint":
     "仅通过本应用启动 Codex 时生效，可暂存输入框草稿，随后恢复到输入框或直接发送。",
+  "settings.codexActiveConversationsEnabled": "Codex 顶部显示活跃对话",
+  "settings.codexActiveConversationsEnabledHint":
+    "仅通过本应用启动 Codex 时生效，在主界面顶部显示活跃对话标题和状态，支持点击切换与关闭。",
   "settings.pluginUnlockForce": "强制开启",
   "settings.pluginUnlockForced": "已触发强制解锁",
   "settings.pluginUnlockForceFailed": "强制开启失败",

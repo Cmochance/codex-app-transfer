@@ -247,6 +247,7 @@ const restoreCodexOnExit = toggle('restoreCodexOnExit', true)
 const autoWakeCodexPet = toggle('autoWakeCodexPet', true)
 const codexQuotaEnabled = toggle('codexQuotaEnabled', false)
 const codexStashEnabled = toggle('codexStashEnabled', false)
+const codexActiveConversationsEnabled = toggle('codexActiveConversationsEnabled', false)
 const codexNetworkAccess = toggle('codexNetworkAccess', false)
 const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
@@ -646,6 +647,12 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       </SettingsRow>
       <SettingsRow :title="t('settings.codexStashEnabled')" :description="t('settings.codexStashEnabledHint')">
         <AppSwitch v-model="codexStashEnabled" />
+      </SettingsRow>
+      <SettingsRow
+        :title="t('settings.codexActiveConversationsEnabled')"
+        :description="t('settings.codexActiveConversationsEnabledHint')"
+      >
+        <AppSwitch v-model="codexActiveConversationsEnabled" />
       </SettingsRow>
       <RouterLink to="/codex-skin" class="nav-row">
         <div class="nav-row__text">

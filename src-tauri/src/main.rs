@@ -5,6 +5,7 @@
 
 mod admin;
 mod anyrouter_quota;
+mod codex_conversation_strip_injector;
 mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;
@@ -226,6 +227,13 @@ fn main() {
             // 幂等注入(composer 工具栏 push/pop 按钮 + Usage 下方 Stash 面板)。独立于额度开关;
             // 开关关 / CDP 不可达时 tick 内静默跳过。
             tauri::async_runtime::spawn(codex_stash_injector::run_stash_daemon());
+
+            // 活跃对话顶栏注入 daemon:在主界面顶部展示 active 会话条(标题 + 状态),支持点击切换/
+            // 关闭。每 tick 读 settings.codexActiveConversationsEnabled + 活跃会话列表并经 CDP
+            // 幂等注入;开关关 / CDP 不可达时静默跳过。
+            tauri::async_runtime::spawn(
+                codex_conversation_strip_injector::run_active_conversation_strip_daemon(),
+            );
 
             // [MOC-231] GC 旧的上下文明细缓存(context-breakdown/<uuid>.json,每对话一个;
             // >14 天的陈旧对话删除,下次有请求会重建)。fire-and-forget,不阻塞 startup。

@@ -590,6 +590,8 @@ export default {
   "settings.codexQuotaEnabledHint": "Shows a usage panel in Codex (context, token rate/total, quota). Only when Codex is launched from this app.",
   "settings.codexStashEnabled": "Enable draft stash in Codex",
   "settings.codexStashEnabledHint": "Stash composer drafts to restore or send later. Only when Codex is launched from this app.",
+  "settings.codexActiveConversationsEnabled": "Show active conversations at the top of Codex",
+  "settings.codexActiveConversationsEnabledHint": "Shows active conversation titles and status in a top strip, with click-to-switch and close actions. Only when Codex is launched from this app.",
   "settings.pluginUnlockForce": "Force unlock",
   "settings.pluginUnlockForced": "Force-unlock triggered",
   "settings.pluginUnlockForceFailed": "Force unlock failed",
