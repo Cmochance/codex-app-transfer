@@ -79,6 +79,65 @@ pub fn uninstall() -> Result<(), String> {
     codex_plugins::uninstall(&managed_key())
 }
 
+/// settings 里控制本功能的开关键(三态:未设 / true / false)。
+pub const SETTING_KEY: &str = "antigravitySuperpowersEnabled";
+
+/// 期望态:仅 antigravity provider 才考虑;显式开关优先,未设时默认开 —— 除非用户已自装
+/// superpowers(避免与用户自有双装,见 [`user_has_foreign_superpowers`])。
+fn desired(api_format_lower: &str, setting: Option<bool>) -> bool {
+    if !matches!(api_format_lower, "antigravity_oauth" | "antigravity") {
+        return false;
+    }
+    setting.unwrap_or_else(|| !user_has_foreign_superpowers())
+}
+
+/// 用户是否自装过 superpowers(任何**非**受管 market 下名为 superpowers 的 plugin)。
+/// 命中即"用户自有",默认不挂我方(避免双装);只读扫 cache,不写盘。
+pub fn user_has_foreign_superpowers() -> bool {
+    codex_plugins::list_installed()
+        .map(|list| {
+            list.iter()
+                .any(|e| e.name == PLUGIN_NAME && e.marketplace != MANAGED_MARKET)
+        })
+        .unwrap_or(false)
+}
+
+/// 我方受管 superpowers 当前安装的版本(未装 → None)。
+fn managed_installed_version() -> Option<String> {
+    codex_plugins::list_installed()
+        .ok()?
+        .into_iter()
+        .find(|e| e.key == managed_key())
+        .map(|e| e.version)
+}
+
+/// 据 api_format + 开关 + 已装检测,收敛内置 superpowers 的装/卸态。
+///
+/// best-effort:任何失败只 log,不影响 provider apply 主流程。返回收敛后的期望态(供日志)。
+/// 幂等:已是期望态则跳过;版本与内置不一致则先卸旧再装新(覆盖 app 升级后 vendored 版本变化)。
+pub fn reconcile(api_format_lower: &str, setting: Option<bool>) -> bool {
+    let want = desired(api_format_lower, setting);
+    let result = if want {
+        if managed_installed_version().as_deref() != Some(vendored_version()) {
+            let _ = uninstall(); // 清旧版本(若有),best-effort
+            install().map(|_| ())
+        } else {
+            Ok(()) // 已装且版本一致,跳过
+        }
+    } else if managed_installed_version().is_some() {
+        uninstall()
+    } else {
+        Ok(()) // 未装且不需要
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            error_id = "SUPERPOWERS_RECONCILE",
+            "superpowers reconcile (want={want}) failed: {e}"
+        );
+    }
+    want
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +181,22 @@ mod tests {
     #[test]
     fn managed_key_is_namespaced() {
         assert_eq!(managed_key(), "superpowers@cas-antigravity");
+    }
+
+    #[test]
+    fn desired_only_for_antigravity() {
+        // 非 antigravity provider 一律不挂(即便显式开)。
+        assert!(!desired("openai_chat", Some(true)));
+        assert!(!desired("gemini_native", Some(true)));
+        assert!(!desired("openai_responses", None));
+    }
+
+    #[test]
+    fn desired_respects_explicit_setting() {
+        // 显式开关优先于默认/检测;两种 antigravity api_format 形态都认。
+        assert!(desired("antigravity_oauth", Some(true)));
+        assert!(desired("antigravity", Some(true)));
+        assert!(!desired("antigravity_oauth", Some(false)));
     }
 
     /// EXECUTABLE_FILES 必须等于 vendored 树里真实带 +x 的文件集合 —— 防上游升级后漏更。

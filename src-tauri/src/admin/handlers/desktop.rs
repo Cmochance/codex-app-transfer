@@ -88,6 +88,10 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // [MOC-277] 清 Codex 时一并卸载我方挂载的 superpowers(只动受管 market,不碰用户自装)。
+    if let Err(e) = crate::admin::services::superpowers::uninstall() {
+        tracing::warn!("[MOC-277] superpowers uninstall on clear failed: {e}");
+    }
     // un-stash 失败 → **abort + surface**,别静默吞:restore_stashed_impl 先删活动再 rename stash,Windows 文件锁/
     // 权限失败会留 auth.json 缺失;真账号未丢(rename 失败=仍在 stash),报错让用户重启自愈。
     if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
