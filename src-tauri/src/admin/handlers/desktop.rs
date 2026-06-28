@@ -158,6 +158,11 @@ pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // [MOC-277] 快照还原(有快照时前端走这条而非 /clear)→ 同样卸载我方挂载的 superpowers
+    // (只动受管 market,不碰用户自装),否则还原回 pristine 后约束插件仍残留。
+    if let Err(e) = crate::admin::services::superpowers::uninstall() {
+        tracing::warn!("[MOC-277] superpowers uninstall on snapshot restore failed: {e}");
+    }
     // un-stash 失败 → abort + surface(真账号仍安全在 stash,重启自愈)。
     if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
         return err(

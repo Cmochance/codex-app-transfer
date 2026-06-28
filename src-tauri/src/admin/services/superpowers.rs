@@ -81,10 +81,20 @@ pub const SETTING_KEY: &str = "antigravitySuperpowersEnabled";
 /// 期望态:仅 antigravity provider 才考虑;显式开关优先,未设时默认开 —— 除非用户已自装
 /// superpowers(避免与用户自有双装,见 [`user_has_foreign_superpowers`])。
 fn desired(api_format_lower: &str, setting: Option<bool>) -> bool {
-    if !matches!(api_format_lower, "antigravity_oauth" | "antigravity") {
+    // 三个 api_format 别名全栈都按 antigravity 路由(registry.rs:73 / resolver.rs / cloud_code.rs 等);
+    // import 只填缺失 apiFormat 不归一,legacy/custom 配置可能是 google_oauth_antigravity,必须一并认。
+    if !is_antigravity_api_format(api_format_lower) {
         return false;
     }
     setting.unwrap_or_else(|| !user_has_foreign_superpowers())
+}
+
+/// 是否 antigravity provider 的 api_format(含全栈三别名;与 registry/resolver 路由口径一致)。
+pub fn is_antigravity_api_format(api_format_lower: &str) -> bool {
+    matches!(
+        api_format_lower,
+        "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
+    )
 }
 
 /// 用户是否自装过 superpowers(任何**非**受管 market 下名为 superpowers 的 plugin)。
@@ -98,18 +108,17 @@ pub fn user_has_foreign_superpowers() -> bool {
         .unwrap_or(false)
 }
 
-/// 我方受管 superpowers 当前安装的版本(未装 → None)。
-fn managed_installed_version() -> Option<String> {
+/// 我方受管 superpowers 当前安装条目(含 version + enabled;未装 → None)。
+fn managed_entry() -> Option<PluginEntry> {
     codex_plugins::list_installed()
         .ok()?
         .into_iter()
         .find(|e| e.key == managed_key())
-        .map(|e| e.version)
 }
 
 /// 我方受管 superpowers 是否已安装(供设置页 status 端点)。
 pub fn is_managed_installed() -> bool {
-    managed_installed_version().is_some()
+    managed_entry().is_some()
 }
 
 /// 据 api_format + 开关 + 已装检测,收敛内置 superpowers 的装/卸态。
@@ -119,13 +128,20 @@ pub fn is_managed_installed() -> bool {
 pub fn reconcile(api_format_lower: &str, setting: Option<bool>) -> bool {
     let want = desired(api_format_lower, setting);
     let result = if want {
-        if managed_installed_version().as_deref() != Some(vendored_version()) {
-            let _ = uninstall(); // 清旧版本(若有),best-effort
-            install().map(|_| ())
-        } else {
-            Ok(()) // 已装且版本一致,跳过
+        match managed_entry() {
+            // 已装、版本一致且已启用 → 完全收敛,跳过(不 churn config.toml)
+            Some(e) if e.version == vendored_version() && e.enabled => Ok(()),
+            // 版本一致但被禁用(如用户在 Codex Plugins tab 关过)→ 仅重新 enable,不重装
+            Some(e) if e.version == vendored_version() => {
+                codex_plugins::set_enabled(&managed_key(), true)
+            }
+            // 未装 / 版本不符 → 清旧(若有)+ 装新
+            _ => {
+                let _ = uninstall(); // 清旧版本(若有),best-effort
+                install().map(|_| ())
+            }
         }
-    } else if managed_installed_version().is_some() {
+    } else if managed_entry().is_some() {
         uninstall()
     } else {
         Ok(()) // 未装且不需要
@@ -197,10 +213,21 @@ mod tests {
 
     #[test]
     fn desired_respects_explicit_setting() {
-        // 显式开关优先于默认/检测;两种 antigravity api_format 形态都认。
+        // 显式开关优先于默认/检测;三种 antigravity api_format 别名都认(含 legacy 第三别名)。
         assert!(desired("antigravity_oauth", Some(true)));
         assert!(desired("antigravity", Some(true)));
+        assert!(desired("google_oauth_antigravity", Some(true)));
         assert!(!desired("antigravity_oauth", Some(false)));
+    }
+
+    #[test]
+    fn antigravity_alias_set_matches_routing() {
+        // 与 registry.rs:73 / resolver.rs / cloud_code.rs 全栈路由口径一致。
+        assert!(is_antigravity_api_format("antigravity_oauth"));
+        assert!(is_antigravity_api_format("antigravity"));
+        assert!(is_antigravity_api_format("google_oauth_antigravity"));
+        assert!(!is_antigravity_api_format("gemini_native"));
+        assert!(!is_antigravity_api_format("openai_chat"));
     }
 
     /// EXECUTABLE_FILES 必须等于 vendored 树里真实带 +x 的文件集合 —— 防上游升级后漏更。

@@ -51,7 +51,9 @@ pub struct DesktopConfigTarget {
 /// 避免在 config-apply 热路径(启动 / 切 provider / restore 都走)塞网络 I/O + 失败态。
 /// 非 antigravity → `Value::Null`(catalog 回退 raw id)。
 fn antigravity_display_names(api_format_lower: &str) -> Value {
-    if !matches!(api_format_lower, "antigravity_oauth" | "antigravity") {
+    // [MOC-277] 与 superpowers gate / 全栈路由口径一致(含 google_oauth_antigravity 别名);
+    // 之前只认两别名,legacy/custom 配置用第三别名时不给 antigravity 显示名 —— 一并对齐。
+    if !crate::admin::services::superpowers::is_antigravity_api_format(api_format_lower) {
         return Value::Null;
     }
     let mut map = serde_json::Map::new();
