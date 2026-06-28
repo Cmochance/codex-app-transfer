@@ -88,6 +88,23 @@ pub async fn desktop_clear() -> impl IntoResponse {
                 .into_response();
             }
             Ok(true) => {
+                // [MOC-277 followup] 降级态守门:no-snapshot 正常意味着 config 从未 Transfer-apply
+                // (apply 必先建快照);但快照被外部删时 live ~/.codex 可能仍是 Transfer-applied
+                // Antigravity(openai_base_url 指向本地 proxy)。此时无快照可还原 config,若仍卸
+                // superpowers 会留下"Antigravity 配置但无约束插件"的不一致(同 delete_provider 已规避的
+                // live-state mismatch)→ 不卸、surface,交由重启自愈。
+                let live_applied = snapshot::read_codex_toml_root_string(&paths, "openai_base_url")
+                    .map(|u| {
+                        u.starts_with("http://127.0.0.1:") || u.starts_with("http://localhost:")
+                    })
+                    .unwrap_or(false);
+                if live_applied {
+                    return err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Codex 配置仍指向 Transfer 本地代理但快照已丢失,无法干净还原;为避免留下「Antigravity 配置但无约束插件」的不一致,未卸载 superpowers,请重启 Codex App Transfer 自愈。".to_owned(),
+                    )
+                    .into_response();
+                }
                 if let Err(e) = crate::admin::services::superpowers::uninstall() {
                     return err(
                         StatusCode::INTERNAL_SERVER_ERROR,

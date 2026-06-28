@@ -66,10 +66,10 @@ pub struct PluginInterface {
 }
 
 fn resolve_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .map(PathBuf::from)
+    // [MOC-277 followup] 用 workspace 统一 home 解析(`$CODEX_APP_TRANSFER_HOME` 覆盖 → HOME →
+    // USERPROFILE),与 `CodexPaths` 同源。否则 e2e 隔离运行(设了 CODEX_APP_TRANSFER_HOME)时
+    // 这里仍解析真实 HOME,plugin 安装/卸载/cache 检测会误动真实用户的 ~/.codex/plugins。
+    codex_app_transfer_registry::paths::resolve_home()
 }
 
 pub fn codex_home() -> Result<PathBuf, String> {
