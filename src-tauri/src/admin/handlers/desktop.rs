@@ -76,27 +76,40 @@ pub async fn desktop_clear() -> impl IntoResponse {
         // [MOC-277 followup] 无 Codex 配置快照,但 superpowers 可能已被 reconcile 端点装上(切到
         // Antigravity 后翻开关、尚未 apply 建快照)。此分支里卸载是**唯一**清理动作 → 失败必须
         // surface(否则 UI 谎报清理成功但插件仍在);未装则维持原 noop 文案。
-        if !crate::admin::services::superpowers::is_managed_installed() {
-            return Json(json!({
-                "success": true,
-                "restored": false,
-                "message": "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)",
-            }))
-            .into_response();
+        // 检测用 managed_cache_present(直接看 cache 目录、不读 config.toml),且 Err 必须 surface:
+        // config.toml 损坏时 is_managed_installed 会被吞成 false(假阴性)→ 漏清理却谎报 noop。
+        match crate::admin::services::superpowers::managed_cache_present() {
+            Ok(false) => {
+                return Json(json!({
+                    "success": true,
+                    "restored": false,
+                    "message": "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)",
+                }))
+                .into_response();
+            }
+            Ok(true) => {
+                if let Err(e) = crate::admin::services::superpowers::uninstall() {
+                    return err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("卸载 superpowers 约束插件失败: {e}"),
+                    )
+                    .into_response();
+                }
+                return Json(json!({
+                    "success": true,
+                    "restored": true,
+                    "message": "已卸载 superpowers 约束插件(无 Codex 配置快照需还原)",
+                }))
+                .into_response();
+            }
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("检测 superpowers 安装状态失败: {e}"),
+                )
+                .into_response();
+            }
         }
-        if let Err(e) = crate::admin::services::superpowers::uninstall() {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("卸载 superpowers 约束插件失败: {e}"),
-            )
-            .into_response();
-        }
-        return Json(json!({
-            "success": true,
-            "restored": true,
-            "message": "已卸载 superpowers 约束插件(无 Codex 配置快照需还原)",
-        }))
-        .into_response();
     }
     // [MOC-257 review] 顺序 mirror exit/startup:**先 restore_codex,再 un-stash 真账号**(真账号最终写)。
     // 反序(先 un-stash 再 restore_codex)会让 restore_codex 在 stash 还原出的真账号上 merge 旧快照 managed auth
