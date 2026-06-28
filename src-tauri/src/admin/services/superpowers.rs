@@ -48,11 +48,7 @@ pub fn vendored_version() -> &'static str {
                 .get_file(".codex-plugin/plugin.json")
                 .and_then(|f| f.contents_utf8())
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .and_then(|v| {
-                    v.get("version")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_owned)
-                })
+                .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(str::to_owned))
                 .unwrap_or_else(|| "local".to_owned())
         })
         .as_str()
@@ -178,7 +174,10 @@ mod tests {
         let v = vendored_version();
         assert_ne!(v, "local", "应从 plugin.json 读出真实版本而非兜底 local");
         assert!(
-            v.split('.').next().and_then(|s| s.parse::<u32>().ok()).is_some(),
+            v.split('.')
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some(),
             "version 形态异常: {v}"
         );
     }
