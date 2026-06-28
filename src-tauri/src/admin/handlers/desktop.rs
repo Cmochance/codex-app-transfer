@@ -7,10 +7,10 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    get_snapshot_status, has_snapshot, has_stale_active_snapshot, ignore_mcp_credentials_keys,
-    list_recovery, list_snapshots, remove_mcp_credentials_keys, repair_residual_pollution,
-    restore_codex_snapshot, restore_codex_state, restore_mcp_credentials_keys,
-    scan_residual_pollution, CodexPaths, PollutionSourceKind, RecoveryItem,
+    detect_signatures_in_text, get_snapshot_status, has_snapshot, has_stale_active_snapshot,
+    ignore_mcp_credentials_keys, list_recovery, list_snapshots, remove_mcp_credentials_keys,
+    repair_residual_pollution, restore_codex_snapshot, restore_codex_state,
+    restore_mcp_credentials_keys, scan_residual_pollution, CodexPaths, RecoveryItem,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -92,20 +92,22 @@ pub async fn desktop_clear() -> impl IntoResponse {
                 // (apply 必先建快照);但快照被外部删时 live ~/.codex 可能仍是 Transfer 残留态。此时无
                 // 快照可还原 config,若仍卸 superpowers 会留下"Transfer 配置但无约束插件"的不一致(同
                 // delete_provider 已规避的 live-state mismatch)→ 不卸、surface,交由重启自愈。
-                // 用项目权威的 residual 高精度签名检测(已知 Transfer 端口 / app_home catalog /
-                // backend-api relay),天然不误判用户本地 provider(Ollama localhost:11434 非 Transfer
-                // 签名);返 Result 能传播读错误,不吞成"未 applied"(裸 openai_base_url localhost 启发式
-                // 两头都会错,见 snapshot.rs:582 同款教训)。
+                // 只读 **LIVE** config 做项目权威的高精度签名检测(已知 Transfer 端口 / app_home
+                // catalog / backend-api relay),天然不误判用户本地 provider(Ollama localhost:11434
+                // 非 Transfer 签名)。不连带扫 active/recovery 快照 —— 本守门只关心 live config,避免无关
+                // 的 recovery 快照读失败阻塞清理。读失败(非"文件不存在")propagate surface;不存在 =
+                // 用户无 config = 未 applied(裸 openai_base_url localhost 启发式两头都会错,见 snapshot.rs:582)。
                 let ports = known_transfer_proxy_ports();
-                let live_applied = match scan_residual_pollution(&paths, &ports) {
-                    Ok(report) => report
-                        .polluted
-                        .iter()
-                        .any(|p| matches!(p.kind, PollutionSourceKind::LiveConfig)),
+                let live_applied = match std::fs::read_to_string(&paths.config_toml) {
+                    Ok(text) => {
+                        !detect_signatures_in_text(&text, &paths.model_catalog_json, &ports)
+                            .is_empty()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
                         return err(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("检测 Codex 配置 Transfer 残留失败: {e}"),
+                            format!("读 Codex config.toml 失败: {e}"),
                         )
                         .into_response();
                     }
