@@ -69,14 +69,25 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // follow-up #28 P0 守门:无快照时**直接 noop 不动文件**。
+    // [MOC-277 followup] superpowers 卸载必须在「无快照早返回」**之前** —— reconcile 端点能在任何
+    // desktop apply 建快照前就装上 superpowers(切到 Antigravity 后翻开关),此时若按"无 Codex 配置
+    // 快照"早返回会漏卸、残留约束插件。改成无条件先卸(只动受管 market,幂等)。
+    let had_superpowers = crate::admin::services::superpowers::is_managed_installed();
+    if let Err(e) = crate::admin::services::superpowers::uninstall() {
+        tracing::warn!("[MOC-277] superpowers uninstall on clear failed: {e}");
+    }
+    // follow-up #28 P0 守门:无 Codex 配置快照时**不动 config/auth 文件**。
     // [MOC-197] stale session 快照(被强杀 session 遗留)也算"有快照"——
     // restore_codex_state 内部会兜底还原它;只有 active/ 真空(从未 apply)才 noop。
     if !has_snapshot(&paths) && !has_stale_active_snapshot(&paths) {
         return Json(json!({
             "success": true,
-            "restored": false,
-            "message": "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)",
+            "restored": had_superpowers,
+            "message": if had_superpowers {
+                "已卸载 superpowers 约束插件(无 Codex 配置快照需还原)"
+            } else {
+                "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)"
+            },
         }))
         .into_response();
     }
@@ -88,10 +99,6 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // [MOC-277] 清 Codex 时一并卸载我方挂载的 superpowers(只动受管 market,不碰用户自装)。
-    if let Err(e) = crate::admin::services::superpowers::uninstall() {
-        tracing::warn!("[MOC-277] superpowers uninstall on clear failed: {e}");
-    }
     // un-stash 失败 → **abort + surface**,别静默吞:restore_stashed_impl 先删活动再 rename stash,Windows 文件锁/
     // 权限失败会留 auth.json 缺失;真账号未丢(rename 失败=仍在 stash),报错让用户重启自愈。
     if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {

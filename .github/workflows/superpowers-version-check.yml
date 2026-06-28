@@ -28,8 +28,20 @@ jobs:
           set -euo pipefail
           manifest="src-tauri/vendor/superpowers/.codex-plugin/plugin.json"
           vendored="$(python3 -c "import json;print(json.load(open('$manifest'))['version'])")"
-          upstream="$(curl -fsSL https://raw.githubusercontent.com/obra/superpowers/main/.codex-plugin/plugin.json \
-            | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
+          # 上游 fetch/parse 失败按 warning 处理,**不** fail job(本检查设计为非阻塞;`|| upstream=""`
+          # 让 set -e 不在 transient raw.githubusercontent 网络/HTTP 错误时退出,避免把无关 PR 刷红)。
+          upstream="$(curl -fsSL https://raw.githubusercontent.com/obra/superpowers/main/.codex-plugin/plugin.json 2>/dev/null \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null)" || upstream=""
+          if [ -z "$upstream" ]; then
+            echo "::warning title=superpowers version check skipped::could not fetch/parse upstream plugin.json (network or raw.githubusercontent error) — skipped, non-blocking"
+            {
+              echo "### superpowers vendored version check"
+              echo ""
+              echo "- vendored: \`$vendored\`"
+              echo "- :warning: upstream fetch failed — skipped (non-blocking)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           echo "vendored=$vendored upstream=$upstream"
           {
             echo "### superpowers vendored version check"

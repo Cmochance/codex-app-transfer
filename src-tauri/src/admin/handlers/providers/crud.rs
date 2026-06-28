@@ -507,7 +507,13 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
         Ok(ConfigMutation::Modified(()))
     });
     match result {
-        Ok(()) => Json(json!({"success": true})).into_response(),
+        Ok(()) => {
+            // [MOC-277 followup] 删除 provider 改写了 activeProvider 但**不**走 apply/switch_provider_and_sync
+            // → 主动收敛 superpowers:删掉的是 active Antigravity 时新 active 已非 antigravity → 卸我方挂载;
+            // 否则不动。best-effort,不影响删除结果。
+            crate::admin::services::desktop::snapshot::reconcile_superpowers_from_config();
+            Json(json!({"success": true})).into_response()
+        }
         Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
