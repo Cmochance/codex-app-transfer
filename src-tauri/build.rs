@@ -10,6 +10,9 @@ fn main() {
     // 也纳入、每次 npm 操作触发重编。
     println!("cargo:rerun-if-changed=../frontend/dist");
     println!("cargo:rerun-if-changed=../crates/registry/src/presets_data.json");
+    // [MOC-277] vendored superpowers 插件树由 superpowers.rs 的 include_dir! 编译期嵌入;
+    // 改 vendor/ 内容需重编才进 binary。include_dir! 编译期展开,目录缺失会 panic(已 committed)。
+    println!("cargo:rerun-if-changed=vendor/superpowers");
 
     // frontend/dist 是 gitignored 构建产物。fresh checkout / `make clean` 后裸
     // `cargo check`/`cargo tauri dev`(debug)会因 static_files.rs 的 include_dir!(编译期展开)

@@ -696,3 +696,119 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
         .find(|e| e.key == key)
         .ok_or_else(|| format!("install ok but not found in list: {key}"))
 }
+
+/// 从编译期内置(`include_dir!`)的 plugin 目录树安装 —— 不下载、不解 tar。
+///
+/// 复用 [`install_tarball`] 落盘后段范式:staged tempdir → 写内置树 → 校验
+/// `.codex-plugin/plugin.json` → atomic rename 进 cache → 写 `[plugins."name@market"] enabled = true`。
+/// 内置树可信(字节来自编译期、无 symlink/traversal),故省去下载与 tar 条目硬化校验。
+///
+/// `executable_rel_paths`:`include_dir` 不保留可执行位,装完在 unix 上对这些相对路径补
+/// `chmod 0o755`(如 SessionStart hook 入口 `hooks/run-hook.cmd`,Codex 会直接执行)。
+pub fn install_embedded(
+    name: &str,
+    marketplace: &str,
+    version: &str,
+    dir: &include_dir::Dir<'_>,
+    executable_rel_paths: &[&str],
+) -> Result<PluginEntry, String> {
+    // 与 install_tarball 同款 path-traversal 校验(三段都 join 进 cache 路径)。
+    for (label, val) in [
+        ("name", name),
+        ("marketplace", marketplace),
+        ("version", version),
+    ] {
+        if val.is_empty() {
+            return Err(format!("plugin {label} 不能为空"));
+        }
+        if val == "." || val == ".." {
+            return Err(format!("plugin {label} '{val}' 不安全(禁止 . / ..)"));
+        }
+        for c in val.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+                return Err(format!("plugin {label} '{val}' 含非法字符"));
+            }
+        }
+    }
+    let target_dir = plugins_cache_root()?
+        .join(marketplace)
+        .join(name)
+        .join(version);
+    let staged = target_dir
+        .parent()
+        .ok_or_else(|| "target_dir 无父目录".to_owned())?
+        .join(format!("{version}.staged.tmp"));
+    if staged.exists() {
+        fs::remove_dir_all(&staged).map_err(|e| format!("clean staged: {e}"))?;
+    }
+    fs::create_dir_all(&staged).map_err(|e| format!("mkdir staged: {e}"))?;
+    if let Err(e) = write_embedded_dir(dir, &staged) {
+        let _ = fs::remove_dir_all(&staged);
+        return Err(e);
+    }
+    // include_dir 丢失可执行位 → 在 staged(rename 前)补 chmod,使最终目录原子地带 +x。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for rel in executable_rel_paths {
+            let p = staged.join(rel);
+            if p.is_file() {
+                match fs::metadata(&p) {
+                    Ok(meta) => {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(0o755);
+                        if let Err(e) = fs::set_permissions(&p, perms) {
+                            let _ = fs::remove_dir_all(&staged);
+                            return Err(format!("chmod +x {rel}: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&staged);
+                        return Err(format!("stat {rel}: {e}"));
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = executable_rel_paths;
+    // fail-closed backstop:内置树理应含 plugin.json(若 include_dir 漏了 dotfile 会在此暴露)
+    if !staged.join(".codex-plugin/plugin.json").exists()
+        && !staged.join(".claude-plugin/plugin.json").exists()
+    {
+        let _ = fs::remove_dir_all(&staged);
+        return Err(
+            "内置 plugin 树缺 .codex-plugin/plugin.json(检查 include_dir 是否纳入 dotfile)".into(),
+        );
+    }
+    // atomic rename:删旧 → mv staged
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir).map_err(|e| format!("rm old target: {e}"))?;
+    }
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir target parent: {e}"))?;
+    }
+    fs::rename(&staged, &target_dir).map_err(|e| format!("rename staged: {e}"))?;
+    let key = format!("{name}@{marketplace}");
+    set_enabled(&key, true)?;
+    list_installed()?
+        .into_iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("install ok but not found in list: {key}"))
+}
+
+/// 递归把 `include_dir` 目录树写进 `dest_root`(`File::path()` 是相对内置根的完整路径,
+/// 直接 join 还原结构)。
+fn write_embedded_dir(dir: &include_dir::Dir<'_>, dest_root: &Path) -> Result<(), String> {
+    for file in dir.files() {
+        let dest = dest_root.join(file.path());
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        fs::write(&dest, file.contents()).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    }
+    for sub in dir.dirs() {
+        write_embedded_dir(sub, dest_root)?;
+    }
+    Ok(())
+}
