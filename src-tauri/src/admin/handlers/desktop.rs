@@ -10,7 +10,7 @@ use codex_app_transfer_codex_integration::{
     get_snapshot_status, has_snapshot, has_stale_active_snapshot, ignore_mcp_credentials_keys,
     list_recovery, list_snapshots, remove_mcp_credentials_keys, repair_residual_pollution,
     restore_codex_snapshot, restore_codex_state, restore_mcp_credentials_keys,
-    scan_residual_pollution, CodexPaths, RecoveryItem,
+    scan_residual_pollution, CodexPaths, PollutionSourceKind, RecoveryItem,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -89,19 +89,31 @@ pub async fn desktop_clear() -> impl IntoResponse {
             }
             Ok(true) => {
                 // [MOC-277 followup] 降级态守门:no-snapshot 正常意味着 config 从未 Transfer-apply
-                // (apply 必先建快照);但快照被外部删时 live ~/.codex 可能仍是 Transfer-applied
-                // Antigravity(openai_base_url 指向本地 proxy)。此时无快照可还原 config,若仍卸
-                // superpowers 会留下"Antigravity 配置但无约束插件"的不一致(同 delete_provider 已规避的
-                // live-state mismatch)→ 不卸、surface,交由重启自愈。
-                let live_applied = snapshot::read_codex_toml_root_string(&paths, "openai_base_url")
-                    .map(|u| {
-                        u.starts_with("http://127.0.0.1:") || u.starts_with("http://localhost:")
-                    })
-                    .unwrap_or(false);
+                // (apply 必先建快照);但快照被外部删时 live ~/.codex 可能仍是 Transfer 残留态。此时无
+                // 快照可还原 config,若仍卸 superpowers 会留下"Transfer 配置但无约束插件"的不一致(同
+                // delete_provider 已规避的 live-state mismatch)→ 不卸、surface,交由重启自愈。
+                // 用项目权威的 residual 高精度签名检测(已知 Transfer 端口 / app_home catalog /
+                // backend-api relay),天然不误判用户本地 provider(Ollama localhost:11434 非 Transfer
+                // 签名);返 Result 能传播读错误,不吞成"未 applied"(裸 openai_base_url localhost 启发式
+                // 两头都会错,见 snapshot.rs:582 同款教训)。
+                let ports = known_transfer_proxy_ports();
+                let live_applied = match scan_residual_pollution(&paths, &ports) {
+                    Ok(report) => report
+                        .polluted
+                        .iter()
+                        .any(|p| matches!(p.kind, PollutionSourceKind::LiveConfig)),
+                    Err(e) => {
+                        return err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("检测 Codex 配置 Transfer 残留失败: {e}"),
+                        )
+                        .into_response();
+                    }
+                };
                 if live_applied {
                     return err(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "Codex 配置仍指向 Transfer 本地代理但快照已丢失,无法干净还原;为避免留下「Antigravity 配置但无约束插件」的不一致,未卸载 superpowers,请重启 Codex App Transfer 自愈。".to_owned(),
+                        "Codex 配置仍是 Transfer 残留态但快照已丢失,无法干净还原;为避免留下「Transfer 配置但无约束插件」的不一致,未卸载 superpowers,请重启 Codex App Transfer 自愈。".to_owned(),
                     )
                     .into_response();
                 }

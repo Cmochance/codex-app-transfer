@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, DocumentMut, Item, Table};
 
-use super::mcp_servers;
-
 const DEFAULT_VERSION: &str = "local";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -81,8 +79,15 @@ pub fn plugins_cache_root() -> Result<PathBuf, String> {
     Ok(codex_home()?.join("plugins").join("cache"))
 }
 
+/// codex_plugins 自己的 config.toml 路径 —— 走本模块 `codex_home()`(认 `CODEX_APP_TRANSFER_HOME`
+/// override),而非 `mcp_servers::config_path()`(只认 HOME)。否则 e2e 隔离时 cache 落 override 下、
+/// 但 `[plugins.*]` 读写真实用户的 `~/.codex/config.toml` → 状态劈裂(误改真实 config / 漏删隔离条目)。
+fn config_toml_path() -> Result<PathBuf, String> {
+    Ok(codex_home()?.join("config.toml"))
+}
+
 fn read_doc() -> Result<DocumentMut, String> {
-    let path = mcp_servers::config_path()?;
+    let path = config_toml_path()?;
     if !path.exists() {
         return Ok(DocumentMut::new());
     }
@@ -92,7 +97,7 @@ fn read_doc() -> Result<DocumentMut, String> {
 }
 
 fn write_doc(doc: &DocumentMut) -> Result<(), String> {
-    let path = mcp_servers::config_path()?;
+    let path = config_toml_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir: {e}"))?;
     }
