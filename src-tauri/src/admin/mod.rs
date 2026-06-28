@@ -119,6 +119,15 @@ pub fn build_app_router(state: AdminState) -> Router {
         )
         // Desktop / Codex CLI
         .route("/api/desktop/clear", post(handlers::desktop::desktop_clear))
+        // [MOC-277] superpowers 强约束插件:设置页开关 effective 默认 + 翻开关即时收敛
+        .route(
+            "/api/desktop/superpowers/status",
+            get(handlers::desktop::superpowers_status),
+        )
+        .route(
+            "/api/desktop/superpowers/reconcile",
+            post(handlers::desktop::superpowers_reconcile),
+        )
         .route(
             "/api/desktop/snapshots",
             get(handlers::desktop::desktop_snapshots),

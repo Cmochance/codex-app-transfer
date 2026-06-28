@@ -648,6 +648,9 @@ export default {
     "⚠️ 存在封号风险，开启并使用这些提供商的后果由你自行承担。",
   "settings.showGrayProvidersHint":
     "默认隐藏Gemini CLI、Antigravity 等实验性提供商。",
+  "settings.antigravitySuperpowers": "Antigravity 强约束(superpowers)",
+  "settings.antigravitySuperpowersHint":
+    "为 Antigravity 自动挂载 superpowers 强约束插件,约束模型不超出指令范围(需 relaunch Codex 生效)。",
   "settings.pluginUnlock": "Codex 插件解锁",
   "settings.pluginUnlockHint":
     "关闭 / 模拟账号(本机伪造)/ 真实账号(已登录 ChatGPT);后两者需已激活 provider。",

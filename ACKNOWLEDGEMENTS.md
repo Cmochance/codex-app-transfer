@@ -517,6 +517,26 @@
 
 ---
 
+## obra/superpowers
+
+- **Link**: https://github.com/obra/superpowers
+- **License**: **MIT**(vendored 树含上游 LICENSE 原件,见 `src-tauri/vendor/superpowers/LICENSE`)
+- **借鉴形式**: 整体内置 / 原样再分发(非 idea 借鉴 —— vendored 上游整套 Codex 插件全量,skill 内容不改)
+- **首次借鉴 PR / 时间**: 2026-06-28(MOC-277,pin 上游 commit `896224c` / plugin v6.0.3)
+- **借鉴清单**:
+  - 整个 Codex 插件子树(`.codex-plugin/plugin.json` + `skills/` 14 个 skill + `hooks/` + `assets/`)原样 vendored → `src-tauri/vendor/superpowers/`(`include_dir!` 编译期嵌入)
+  - 启用 Antigravity 提供商时装进 `~/.codex/plugins/cache/superpowers/cas-antigravity/` 并写 `[plugins."superpowers@cas-antigravity"] enabled=true` → `src-tauri/src/admin/services/superpowers.rs` + `codex_plugins.rs` 的 `install_embedded`
+  - 插件自带 SessionStart hook(`hooks/hooks-codex.json` → `run-hook.cmd session-start-codex`)在会话起始加载 `using-superpowers` 总闸,使 skill 自动触发(作者认可的"真集成")
+- **本项目差异 / 扩展**:
+  - **不改上游 skill 内容**(行为塑形内容经上游 eval 调优,擅改会削弱约束力)
+  - 用受管 market 命名空间 `cas-antigravity` 做归属隔离:卸载只动我方挂载,**绝不**误删用户自装的 superpowers;检测到用户自有(非此 market)则开关默认关
+  - 中文化版(逐块翻译 + 优化)规划在 MOC-277 PR2,作为脱离上游的托管 fork
+- **同步策略**:
+  - 版本漂移由 CI `.github/workflows/superpowers-version-check.yml` 比对 vendored `plugin.json` version vs 上游 `main`,落后发 `::warning::`(非阻塞)
+  - 更新 = 重新 vendored 上游插件子树 + bump pin commit / version + 重跑 brainstorming 验收(见 `src-tauri/vendor/superpowers/VENDOR.md`)
+- **TOS / 法律注意**: MIT 允许再分发;保留 LICENSE + 版权署名,不改 skill 内容
+- **关联 PR / followup**: Linear [MOC-277](https://linear.app/mochance/issue/MOC-277)
+
 ## 维护规则
 
 - **新增借鉴**:1 个 PR 内 ① README 致谢段加一行概览 ② 本文档加完整 entry(必填字段全),缺一不可

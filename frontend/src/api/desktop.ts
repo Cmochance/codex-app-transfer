@@ -144,6 +144,27 @@ export function clearDesktop() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// [MOC-277] superpowers 强约束插件:设置页开关 effective 默认 + 翻开关即时收敛
+// ───────────────────────────────────────────────────────────────────────────
+export interface SuperpowersStatus {
+  /** 开关未显式设过时的默认态(已自装 superpowers → false) */
+  effectiveEnabled: boolean
+  /** 用户显式设过的值;未设为 null */
+  explicit: boolean | null
+  /** 用户自装过 superpowers(非受管 market) */
+  foreignDetected: boolean
+  /** 我方受管 superpowers 当前是否已挂载 */
+  managedInstalled: boolean
+  /** 内置 superpowers 版本 */
+  version: string
+}
+export const getSuperpowersStatus = () =>
+  api<SuperpowersStatus>('GET', '/api/desktop/superpowers/status')
+/** 翻开关后即时按当前 active provider + 新设置装/卸,返回收敛后的 status。 */
+export const reconcileSuperpowers = () =>
+  api<SuperpowersStatus>('POST', '/api/desktop/superpowers/reconcile')
+
+// ───────────────────────────────────────────────────────────────────────────
 // Residual 反投毒自检(#268,/api/desktop/{scan,repair}-residual)
 // ───────────────────────────────────────────────────────────────────────────
 export type ResidualKind = 'liveConfig' | 'activeSnapshot' | 'recoverySnapshot'

@@ -51,7 +51,9 @@ pub struct DesktopConfigTarget {
 /// 避免在 config-apply 热路径(启动 / 切 provider / restore 都走)塞网络 I/O + 失败态。
 /// 非 antigravity → `Value::Null`(catalog 回退 raw id)。
 fn antigravity_display_names(api_format_lower: &str) -> Value {
-    if !matches!(api_format_lower, "antigravity_oauth" | "antigravity") {
+    // [MOC-277] 与 superpowers gate / 全栈路由口径一致(含 google_oauth_antigravity 别名);
+    // 之前只认两别名,legacy/custom 配置用第三别名时不给 antigravity 显示名 —— 一并对齐。
+    if !crate::admin::services::superpowers::is_antigravity_api_format(api_format_lower) {
         return Value::Null;
     }
     let mut map = serde_json::Map::new();
@@ -531,12 +533,35 @@ async fn sync_desktop_for_active_provider_impl(state: &AdminState, force_apikey:
                 obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
                 obj.insert("proxyStarted".into(), Value::Bool(proxy_started));
             }
+            // [MOC-277] apply 成功后收敛内置 superpowers 的装/卸态(best-effort,不影响主流程)。
+            reconcile_superpowers_from_config();
             result
         }
         Err(e) => {
             json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "proxyStarted": proxy_started, "message": e})
         }
     }
+}
+
+/// [MOC-277] 据 active provider 的 api_format + 开关(三态)+ 已装检测,装/卸内置 superpowers
+/// 插件。best-effort:任何失败只 log,不影响 provider apply 主流程。切到非 antigravity / 关开关
+/// 都会经此卸掉我方挂载(只动受管 market,不碰用户自装)。
+pub fn reconcile_superpowers_from_config() {
+    let Ok(cfg) = load_registry() else {
+        return;
+    };
+    let api_format = active_provider(&cfg)
+        .and_then(|p| {
+            p.get("apiFormat")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+        })
+        .unwrap_or_default();
+    let setting = cfg
+        .get("settings")
+        .and_then(|s| s.get(crate::admin::services::superpowers::SETTING_KEY))
+        .and_then(|v| v.as_bool());
+    crate::admin::services::superpowers::reconcile(&api_format, setting);
 }
 
 /// [MOC-257 review] 从 `http://127.0.0.1:<port>` / `http://localhost:<port>`(Codex config.toml 的
@@ -651,6 +676,11 @@ pub fn restore_codex_if_enabled(reason: &str) -> Value {
             // 自愈失败的症状(残留 sandbox_mode → Codex 报"无法设置管理员沙盒")
             // 与未触发无法区分。
             tracing::info!("codex restore ({reason}): restored={restored}");
+            // [MOC-277] Codex 已还原回 pristine → 卸载我方挂载的 superpowers(只动受管 market,
+            // 不碰用户自装);restoreCodexOnExit=false 的保留态走不到这里,挂载随 transfer 态保留。
+            if let Err(e) = crate::admin::services::superpowers::uninstall() {
+                tracing::warn!("[MOC-277] superpowers uninstall on restore ({reason}) failed: {e}");
+            }
             json!({"attempted": true, "restored": restored, "success": true, "reason": reason})
         }
         Err(e) => {

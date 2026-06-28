@@ -1,0 +1,45 @@
+name: superpowers-version-check
+
+# [MOC-277] 检测 vendored 的 obra/superpowers 插件版本是否落后上游。
+# 非阻塞:落后只发 ::warning:: + job summary,**不** fail PR —— 避免无关 PR 因 superpowers
+# 落后一版而被卡住;真要更新看 src-tauri/vendor/superpowers/VENDOR.md。
+# 触发:每个 PR(后续推 PR 时即检测)+ 每周定时(主动发现漂移)+ 手动。
+
+on:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # 每周一 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: superpowers-version-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare vendored vs upstream superpowers version
+        run: |
+          set -euo pipefail
+          manifest="src-tauri/vendor/superpowers/.codex-plugin/plugin.json"
+          vendored="$(python3 -c "import json;print(json.load(open('$manifest'))['version'])")"
+          upstream="$(curl -fsSL https://raw.githubusercontent.com/obra/superpowers/main/.codex-plugin/plugin.json \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')"
+          echo "vendored=$vendored upstream=$upstream"
+          {
+            echo "### superpowers vendored version check"
+            echo ""
+            echo "- vendored: \`$vendored\`"
+            echo "- upstream (obra/superpowers@main): \`$upstream\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$vendored" != "$upstream" ]; then
+            echo "::warning title=superpowers out of date::vendored $vendored != upstream $upstream — consider refreshing src-tauri/vendor/superpowers/ (see VENDOR.md / MOC-277)"
+            echo "- :warning: **out of date** — refresh the vendored tree + bump the pinned commit/version" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- :white_check_mark: up to date" >> "$GITHUB_STEP_SUMMARY"
+          fi
