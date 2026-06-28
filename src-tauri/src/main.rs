@@ -1010,7 +1010,7 @@ pub(crate) fn activate_macos_app() {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
     unsafe {
         let app = NSRunningApplication::currentApplication();
-        app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows);
+        app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
     }
 }
 
