@@ -12,7 +12,7 @@
 
 **Trae 账号 OAuth 登录 + 额度查看(#547)**:新增 Trae provider 的 OAuth 账号登录与额度查看,每账号设备指纹隔离。/ **Trae account OAuth login + quota (#547)**: adds OAuth account login and quota viewing for the Trae provider, with per-account device-fingerprint isolation.
 
-**修复**:小米 MiMo 预设 apiFormat 改为 `responses`(#552);proxy gateway 对 `cas_` 格式做校验兜底,消除双写不一致导致的间歇性 401(#549);依赖升级(anyhow / webpki-roots / wreq-util ignore 等)。/ **Fixes**: Xiaomi MiMo preset apiFormat switched to `responses` (#552); the proxy gateway validates the `cas_` format defensively, eliminating intermittent 401s from dual-write skew (#549); dependency bumps (anyhow / webpki-roots / wreq-util ignore, etc.).
+**修复**:GLM 文本款(glm-5.2)漏判视觉,含图会话(view_image 截图)继续时把图发往 GLM 纯文本编程端点致请求失败、会话卡死且重启也无法继续,改用版本谓词 `is_glm_text_only_model`(`glm-` 前缀且非 `-*v` 视觉变体)统一剥图,覆盖全系文本款 + 未来版本(#563);小米 MiMo 预设 apiFormat 改为 `responses`(#552);proxy gateway 对 `cas_` 格式做校验兜底,消除双写不一致导致的间歇性 401(#549);依赖升级(anyhow / webpki-roots / wreq-util ignore 等)。/ **Fixes**: GLM text models (glm-5.2) were misclassified as vision, so image-bearing conversations (view_image screenshots) hung when continued — the image was sent to GLM's text-only coding endpoint, failing the request and leaving the conversation stuck even across restarts — now stripped via the `is_glm_text_only_model` version predicate (`glm-` prefix and not a `-*v` vision variant), covering all text tiers and future versions (#563); Xiaomi MiMo preset apiFormat switched to `responses` (#552); the proxy gateway validates the `cas_` format defensively, eliminating intermittent 401s from dual-write skew (#549); dependency bumps (anyhow / webpki-roots / wreq-util ignore, etc.).
 
 ## v2.4.0
 
