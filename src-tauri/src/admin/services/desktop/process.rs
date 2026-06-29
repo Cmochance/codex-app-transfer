@@ -409,11 +409,16 @@ fn sync_codex_reasoning_efforts_state() {
 ///
 /// - 顶层 / 该子对象非 object → 返回 `false`(调用方跳过,内部 warn 含文件名)。
 /// - `electron-persisted-atom-state` 缺失 → 创建空 object。
+/// 仅强制补「Codex 默认隐藏、而我们模型需要」的档位 = `required \ CODEX_DEFAULT`(当前 = `none`/`max`);
+/// `high` 等**默认可见**档不强加 —— 尊重用户/Codex 对默认档的删改(与对 `xhigh`/`ultra` 的保留一致)。
+///
+/// - 顶层 / 该子对象非 object → 返回 `false`(调用方跳过,内部 warn 含文件名)。
+/// - `electron-persisted-atom-state` 缺失 → 创建空 object。
 /// - `enabled-reasoning-efforts` **缺失 / 空 / 过滤掉非字符串项后为空** → 以 Codex 默认集
-///   `["low","medium","high","xhigh","ultra"]` 为基线再并入 `required`,**保证不把 GPT 等模型默认
-///   可见的档意外砍掉**(picker 与启用集求交,基线缺了它们这些档也会消失);写入返回 `true`。
-/// - **已有非空(且含 ≥1 个字符串项)值** → 仅追加缺的 `required` 档,全在则返回 `false`(幂等);
-///   已有非字符串项忽略(防御损坏数据)。
+///   `["low","medium","high","xhigh","ultra"]` 为基线再并入隐藏档(`none`/`max`),**保证不把 GPT 等
+///   模型默认可见档意外砍掉**(picker 与启用集求交,基线缺了它们这些档也会消失);写入返回 `true`。
+/// - **已有非空(且含 ≥1 个字符串项)值** → 仅追加缺的隐藏档(`none`/`max`),全在则返回 `false`
+///   (幂等);**不**回填用户删掉的默认可见档(如 `high`);已有非字符串项忽略(防御损坏数据)。
 fn ensure_enabled_reasoning_efforts(state: &mut Value, required: &[&str]) -> bool {
     const KEY: &str = "enabled-reasoning-efforts";
     // Codex 该设置的内置默认集(codex-cli 0.142.3 webview LM atom default)。键缺失/空/损坏时以它
@@ -458,14 +463,19 @@ fn ensure_enabled_reasoning_efforts(state: &mut Value, required: &[&str]) -> boo
         (filtered, true)
     };
 
+    // 只强制补「Codex 默认隐藏」的档(required \ CODEX_DEFAULT,当前 = none/max)。high 等默认可见档
+    // 即便 spec(如 DeepSeek)声明也不在此强加:absent 情形 high 已由 CODEX_DEFAULT 基线提供,present
+    // 情形则尊重用户/Codex 是否保留 high(与 xhigh/ultra 一视同仁)。
+    // (PR #560 codex-connector P2:旧实现 union 整个 required 会把用户删掉的默认档 high 重新加回,
+    // 破坏「只增隐藏档、保留用户对默认档选择」的语义。)
     let mut added = false;
-    for e in required {
+    for e in required.iter().filter(|e| !CODEX_DEFAULT.contains(e)) {
         if !current.iter().any(|x| x == e) {
             current.push((*e).to_owned());
             added = true;
         }
     }
-    // 缺键/空(首次 seed)即便 required 已在基线里也要落盘补齐键;已有值则仅在新增档时写。
+    // 缺键/空(首次 seed)即便隐藏档已在基线里也要落盘补齐键;已有值则仅在新增隐藏档时写。
     if had_value && !added {
         return false;
     }
@@ -889,6 +899,40 @@ mod tests {
         assert_eq!(set, vec!["low", "medium", "high", "max", "none"]);
         // 用户没启用的 xhigh/ultra 不被我们硬塞回去
         assert!(!set.contains(&"xhigh".to_owned()) && !set.contains(&"ultra".to_owned()));
+    }
+
+    #[test]
+    fn seed_does_not_readd_user_removed_default_tier() {
+        // [MOC-285 PR #560 codex-connector P2] 用户/Codex 在已有非空值里删掉了默认可见档 high
+        //(present),seeding 只补隐藏档 none/max,**不**把 high 加回 —— 与对 xhigh/ultra 的保留一视同仁。
+        let mut state = json!({"electron-persisted-atom-state": {
+            "enabled-reasoning-efforts": ["low", "medium", "xhigh", "ultra"]
+        }});
+        // required 含 high(DeepSeek),但 high ∈ CODEX_DEFAULT → 不强加。
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        let set = enabled_set(&state);
+        assert_eq!(set, vec!["low", "medium", "xhigh", "ultra", "max", "none"]);
+        assert!(
+            !set.contains(&"high".to_owned()),
+            "不得回填用户删掉的默认档 high"
+        );
+    }
+
+    #[test]
+    fn seed_absent_still_provides_high_via_default_base() {
+        // 反向保证:absent 情形 high 仍由 CODEX_DEFAULT 基线提供(DeepSeek 的 high 档不受 P2 修复影响)。
+        let mut state = json!({"electron-persisted-atom-state": {}});
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        let set = enabled_set(&state);
+        for d in ["low", "medium", "high", "xhigh", "ultra", "none", "max"] {
+            assert!(set.contains(&d.to_owned()), "absent 基线应含 {d}");
+        }
     }
 
     #[test]
