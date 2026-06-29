@@ -27,6 +27,13 @@ updates:
       # (wreq-util rc.13 已写给 wreq rc.29+ 重命名后的 emulation API ——
       # `IntoEmulation`/`tls::compress`/`Group`/`KeyShare`,与锁定的 wreq rc.23
       # 编不过;PR #558 即漏网的 rc.13,因旧 ignore 仅 `<= rc.12` 未覆盖,已关闭)。
+      # ⚠️ 锁步维护:这两个 ignore 上限是手动维护的「hold」,版本号本就错位
+      # (wreq 在 rc.29 档、wreq-util 在 rc.13 档),dependabot 不保证两者原子升级。
+      # **解除 hold 时(wreq 升 rc.30+ / 6.0.0 经 canary 复验)必须同时抬高下面两条
+      # ignore 上限**,让 cf-bypass group 一次性 bump 成配套组合。期间若任一边新 rc
+      # escape 自己的 ignore、另一边仍被压住 → dependabot 会提**单边错位 PR**(build
+      # 必挂,如 #558):这是预期噪音,**关闭该 PR + 把对应 ignore 上限抬到该 rc**,
+      # 绝不 merge 错位组合。
       - dependency-name: "wreq"
         versions: ["<= 6.0.0-rc.29"]
       - dependency-name: "wreq-util"
