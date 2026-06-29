@@ -4579,3 +4579,80 @@ fn custom_tool_call_output_with_image_lifts_to_user_message() {
     let all = serde_json::to_string(messages).unwrap();
     assert!(!all.contains("__cas_tool_images"), "wire 不得含侧信道字段");
 }
+
+// ── GLM 文本款视觉判定(glm-5.2 漏判修复)──
+
+fn glm_provider(model: &str) -> Provider {
+    let mut p = provider(
+        "zhipu",
+        "GLM",
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+    );
+    p.models.insert("default".into(), model.into());
+    p.api_format = "openai_chat".into();
+    p
+}
+
+#[test]
+fn is_glm_text_only_model_classifies_text_vs_vision() {
+    // 文本款(含漏判的 glm-5.2)→ true
+    for m in [
+        "glm-5.2",
+        "glm-5",
+        "glm-5-turbo",
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-4.5",
+        "glm-4",
+        "glm-4-plus",
+        "glm-air",
+        "glm-4.5-air",
+        "GLM-5.2",
+    ] {
+        assert!(is_glm_text_only_model(m), "{m} 应判纯文本");
+    }
+    // 视觉款(版本号后紧跟 v)→ false(不当纯文本,保留图)
+    for m in [
+        "glm-5v",
+        "glm-5v-turbo",
+        "glm-4.5v",
+        "glm-4.6v",
+        "glm-4v",
+        "glm-4.1v-thinking",
+    ] {
+        assert!(!is_glm_text_only_model(m), "{m} 是视觉款,不应判纯文本");
+    }
+    // 非 GLM → false
+    for m in ["deepseek-v4-pro", "gpt-5.5", "", "vglm-5"] {
+        assert!(!is_glm_text_only_model(m), "{m} 非 GLM,不应判纯文本");
+    }
+}
+
+#[test]
+fn glm_5_2_strips_image_url_no_longer_treated_as_vision() {
+    // 回归:glm-5.2 含图请求必须剥掉 image_url(否则发往 bigmodel 文本端点 → 拒/断流、会话毒化)。
+    let req = vision_request_for("glm-5.2");
+    assert!(
+        !image_url_kept(&req, &glm_provider("glm-5.2")),
+        "glm-5.2 是文本旗舰,必须 strip image_url"
+    );
+    // glm-5 / glm-5-turbo 同样
+    for m in ["glm-5", "glm-5-turbo", "glm-5.1"] {
+        let req = vision_request_for(m);
+        assert!(
+            !image_url_kept(&req, &glm_provider(m)),
+            "{m} 必须 strip image_url"
+        );
+    }
+}
+
+#[test]
+fn glm_vision_variant_keeps_image_url() {
+    // glm-5v(视觉款)→ 保留 image_url(不误伤,视觉能力正常)。
+    let req = vision_request_for("glm-5v");
+    assert!(
+        image_url_kept(&req, &glm_provider("glm-5v")),
+        "glm-5v 是视觉款,应保留 image_url"
+    );
+}
