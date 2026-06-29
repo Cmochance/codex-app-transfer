@@ -23,11 +23,14 @@ updates:
       # wreq 6.0.0-rc.29 经 CI canary 实证 CF 绕过回归 —— 数据中心 IP 下浏览器指纹
       # 被 Cloudflare 识破返 403(rc.23 同环境正常,见 #371 / MOC-160)。保持 rc.23,
       # 待 wreq 出更高 rc(rc.30+)或正式版 6.0.0 时再由 cf-bypass group 提 PR + canary
-      # 验证后评估升级。wreq-util 与 wreq 锁步,同 ignore 配对的 rc.12 及更低。
+      # 验证后评估升级。wreq-util 与 wreq 锁步,同 ignore 配对的 rc.13 及更低
+      # (wreq-util rc.13 已写给 wreq rc.29+ 重命名后的 emulation API ——
+      # `IntoEmulation`/`tls::compress`/`Group`/`KeyShare`,与锁定的 wreq rc.23
+      # 编不过;PR #558 即漏网的 rc.13,因旧 ignore 仅 `<= rc.12` 未覆盖,已关闭)。
       - dependency-name: "wreq"
         versions: ["<= 6.0.0-rc.29"]
       - dependency-name: "wreq-util"
-        versions: ["<= 3.0.0-rc.12"]
+        versions: ["<= 3.0.0-rc.13"]
       # sha2 0.11 切到 digest 0.11,但 rsa 0.9.x 仍锁 digest/sha2 0.10
       # (xtask/release_bundle.rs 用 rsa::Pkcs1v15Sign + Sha256 签名)。两版本的
       # Digest/AssociatedOid trait 不互通 → 编译 fail(E0277,见 #379 / MOC-167)。
