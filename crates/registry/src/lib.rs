@@ -48,5 +48,7 @@ pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
 pub use reasoning_effort_policy::{
     apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
 };
-pub use reasoning_tiers::{reasoning_tiers_for_model, ReasoningTier, ReasoningTierSpec};
+pub use reasoning_tiers::{
+    all_reasoning_tier_efforts, reasoning_tiers_for_model, ReasoningTier, ReasoningTierSpec,
+};
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};

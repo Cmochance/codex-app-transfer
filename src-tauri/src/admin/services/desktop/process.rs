@@ -349,6 +349,143 @@ fn sync_codex_pet_state() {
     }
 }
 
+/// [MOC-285] 把本项目 catalog 暴露的思考档位(GLM 等的 `none`/`max`,见
+/// [`codex_app_transfer_registry::all_reasoning_tier_efforts`])并入 Codex 全局状态文件的
+/// `electron-persisted-atom-state["enabled-reasoning-efforts"]`,在启动 Codex 前补齐。
+///
+/// **为什么需要**:Codex 26.623(codex-cli 0.142.3)起新增用户级持久设置
+/// `enabled-reasoning-efforts`(webview LM atom,默认 `["low","medium","high","xhigh","ultra"]`)。
+/// reasoning 选择器实际显示 = 模型 `supported_reasoning_levels` ∩ 该集合。MOC-241 给
+/// GLM/Kimi/Qwen/MiMo/DeepSeek/Gemini/MiniMax 写的 `none`/`max` 不在默认集 → 交集为空 → picker
+/// 兜底成残留「Medium」、原生两档不显示。本函数把这些档位并进启用集还原显示。
+///
+/// **union 语义、零副作用**:只增不删用户/Codex 既有档;picker 是「模型支持档 ∩ 启用集」,启用
+/// 更多档对每个模型仍只显其声明档(GPT 仍 low/medium/high/xhigh,GLM 才出现 none/max)。文件不存在
+///(Codex 从未启动过)→ 跳过不创建(镜像 [`sync_codex_pet_state`]);已是超集 → 不写(幂等)。
+/// 全程失败路径 `tracing::warn!` 记录、绝不阻断启动。**调用时机**:`open_codex_app` 内、Codex 已退出
+/// 时写(global-state 由 Codex 主进程启动时加载,运行中写会被忽略/覆盖,故必须在拉起前)。
+fn sync_codex_reasoning_efforts_state() {
+    let Some(home) = codex_app_transfer_registry::paths::resolve_home() else {
+        tracing::warn!("[Reasoning] 无法解析 home 目录,跳过 enabled-reasoning-efforts 同步");
+        return;
+    };
+    let path = home.join(".codex").join(".codex-global-state.json");
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        // 文件不存在 = Codex 还没首启,不主动创建(镜像 sync_codex_pet_state)。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "[Reasoning] 读 state 文件失败,跳过同步");
+            return;
+        }
+    };
+    let mut state: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "[Reasoning] state JSON 解析失败,跳过同步");
+            return;
+        }
+    };
+    let required = codex_app_transfer_registry::all_reasoning_tier_efforts();
+    if !ensure_enabled_reasoning_efforts(&mut state, &required) {
+        return; // 无变化(幂等)或结构异常(已在内部 warn)
+    }
+    // to_string_pretty 失败时**不能** fallback 空串(会把 state 截成 corrupt),显式跳过。
+    let serialized = match serde_json::to_string_pretty(&state) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "[Reasoning] state 序列化失败,跳过写回");
+            return;
+        }
+    };
+    if let Err(e) = fs::write(&path, serialized) {
+        tracing::warn!(path = %path.display(), error = %e, "[Reasoning] 写 state 失败,none/max 档可能仍不显示");
+    }
+}
+
+/// [MOC-285] 纯函数:把 `required` 档位并入 `state` 的
+/// `electron-persisted-atom-state["enabled-reasoning-efforts"]`(union 不覆盖)。返回是否发生改动
+///(`true` = 需写回)。拆出纯函数便于单测,IO 留给 [`sync_codex_reasoning_efforts_state`]。
+///
+/// - 顶层 / 该子对象非 object → 返回 `false`(调用方跳过,内部 warn 含文件名)。
+/// - `electron-persisted-atom-state` 缺失 → 创建空 object。
+/// 仅强制补「Codex 默认隐藏、而我们模型需要」的档位 = `required \ CODEX_DEFAULT`(当前 = `none`/`max`);
+/// `high` 等**默认可见**档不强加 —— 尊重用户/Codex 对默认档的删改(与对 `xhigh`/`ultra` 的保留一致)。
+///
+/// - 顶层 / 该子对象非 object → 返回 `false`(调用方跳过,内部 warn 含文件名)。
+/// - `electron-persisted-atom-state` 缺失 → 创建空 object。
+/// - `enabled-reasoning-efforts` **缺失 / 空 / 过滤掉非字符串项后为空** → 以 Codex 默认集
+///   `["low","medium","high","xhigh","ultra"]` 为基线再并入隐藏档(`none`/`max`),**保证不把 GPT 等
+///   模型默认可见档意外砍掉**(picker 与启用集求交,基线缺了它们这些档也会消失);写入返回 `true`。
+/// - **已有非空(且含 ≥1 个字符串项)值** → 仅追加缺的隐藏档(`none`/`max`),全在则返回 `false`
+///   (幂等);**不**回填用户删掉的默认可见档(如 `high`);已有非字符串项忽略(防御损坏数据)。
+fn ensure_enabled_reasoning_efforts(state: &mut Value, required: &[&str]) -> bool {
+    const KEY: &str = "enabled-reasoning-efforts";
+    // Codex 该设置的内置默认集(codex-cli 0.142.3 webview LM atom default)。键缺失/空/损坏时以它
+    // 为基线,避免只写 `required` 把默认可见档(low/medium/high/xhigh/ultra)挤出交集。
+    // ⚠️ 维护哨兵:这是 Codex 自身的默认值副本;**若未来 Codex 改了该设置的默认集,这里需同步更新**
+    // (否则首次 seed 会把用户钉在过时默认集上,可能漏掉 Codex 新增的可见档)。
+    const CODEX_DEFAULT: &[&str] = &["low", "medium", "high", "xhigh", "ultra"];
+
+    let Some(obj) = state.as_object_mut() else {
+        tracing::warn!("[Reasoning] .codex-global-state.json 顶层非 object,跳过同步");
+        return false;
+    };
+    let atoms = obj
+        .entry("electron-persisted-atom-state")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(atoms) = atoms.as_object_mut() else {
+        tracing::warn!(
+            "[Reasoning] .codex-global-state.json 的 electron-persisted-atom-state 非 object,跳过同步"
+        );
+        return false;
+    };
+
+    // 先取已有数组、过滤掉非字符串项(防御损坏数据),**再**按过滤结果是否为空决定基线:
+    // 过滤后非空 → 以其为基线(had_value=true);缺失 / 空 / 全非字符串过滤后为空 → 以 Codex 默认集为
+    // 基线(had_value=false)。先 filter 再判空很关键——非空但全非字符串的损坏数组(如 `[1,2]`)若按
+    // 原始数组判 had_value=true,会只写 required 把 GPT 默认可见档挤出交集(PR review HIGH)。
+    let filtered: Vec<String> = atoms
+        .get(KEY)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (mut current, had_value) = if filtered.is_empty() {
+        (
+            CODEX_DEFAULT.iter().map(|s| (*s).to_owned()).collect(),
+            false,
+        )
+    } else {
+        (filtered, true)
+    };
+
+    // 只强制补「Codex 默认隐藏」的档(required \ CODEX_DEFAULT,当前 = none/max)。high 等默认可见档
+    // 即便 spec(如 DeepSeek)声明也不在此强加:absent 情形 high 已由 CODEX_DEFAULT 基线提供,present
+    // 情形则尊重用户/Codex 是否保留 high(与 xhigh/ultra 一视同仁)。
+    // (PR #560 codex-connector P2:旧实现 union 整个 required 会把用户删掉的默认档 high 重新加回,
+    // 破坏「只增隐藏档、保留用户对默认档选择」的语义。)
+    let mut added = false;
+    for e in required.iter().filter(|e| !CODEX_DEFAULT.contains(e)) {
+        if !current.iter().any(|x| x == e) {
+            current.push((*e).to_owned());
+            added = true;
+        }
+    }
+    // 缺键/空(首次 seed)即便隐藏档已在基线里也要落盘补齐键;已有值则仅在新增隐藏档时写。
+    if had_value && !added {
+        return false;
+    }
+    atoms.insert(
+        KEY.to_owned(),
+        Value::Array(current.into_iter().map(Value::String).collect()),
+    );
+    true
+}
+
 /// 探测一个可用的 CDP debug port(非 macOS):**优先 9222**(跟 Chrome 一致),
 /// 占用时 fallback OS 分配的随机空闲端口。
 ///
@@ -618,6 +755,9 @@ fn read_theme_settings() -> Option<String> {
 
 fn open_codex_app(platform: &str) -> Result<(), String> {
     sync_codex_pet_state();
+    // [MOC-285] Codex 启动前补齐 enabled-reasoning-efforts 持久 atom,让 GLM 等的 none/max 档
+    // 在 reasoning 选择器正常显示(Codex 26.623+ 默认启用集不含这两档)。
+    sync_codex_reasoning_efforts_state();
 
     // Windows MSIX activation: 见 `windows_msix.rs` module docs。失败时
     // fallthrough 到 explorer.exe shell:AppsFolder 老路径(args 丢失)。
@@ -698,6 +838,176 @@ pub fn with_codex_closed<T>(platform: &str, work: impl FnOnce() -> T) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // ── [MOC-285] enabled-reasoning-efforts 并入(纯函数 ensure_enabled_reasoning_efforts) ──
+
+    fn enabled_set(state: &Value) -> Vec<String> {
+        state["electron-persisted-atom-state"]["enabled-reasoning-efforts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn seed_when_key_absent_uses_codex_default_base_plus_required() {
+        // 键缺失 → 以 Codex 默认集为基线再并入 {none,high,max};返回 true(需写)。
+        let mut state =
+            json!({"electron-persisted-atom-state": {"composer-auto-context-enabled": false}});
+        let required = ["high", "max", "none"];
+        assert!(ensure_enabled_reasoning_efforts(&mut state, &required));
+        let set = enabled_set(&state);
+        // 默认可见档保留(GPT 等不被砍)
+        for d in ["low", "medium", "high", "xhigh", "ultra"] {
+            assert!(set.contains(&d.to_owned()), "默认档 {d} 应保留");
+        }
+        // 我们的隐藏档补上
+        assert!(set.contains(&"none".to_owned()) && set.contains(&"max".to_owned()));
+        // 不动同子对象里的其它 atom
+        assert_eq!(
+            state["electron-persisted-atom-state"]["composer-auto-context-enabled"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn seed_creates_persisted_atom_subobject_when_missing() {
+        // 顶层无 electron-persisted-atom-state → 创建之,且不污染其它顶层字段。
+        let mut state = json!({"electron-avatar-overlay-open": true});
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["none", "max"]
+        ));
+        let set = enabled_set(&state);
+        assert!(set.contains(&"none".to_owned()) && set.contains(&"max".to_owned()));
+        assert_eq!(state["electron-avatar-overlay-open"], json!(true));
+    }
+
+    #[test]
+    fn seed_unions_into_existing_user_value_preserving_it() {
+        // 已有用户值(去掉了 xhigh)→ 只追加缺的 required,保留用户既有(含其去掉 xhigh 的选择)。
+        let mut state = json!({"electron-persisted-atom-state": {
+            "enabled-reasoning-efforts": ["low", "medium", "high"]
+        }});
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        let set = enabled_set(&state);
+        assert_eq!(set, vec!["low", "medium", "high", "max", "none"]);
+        // 用户没启用的 xhigh/ultra 不被我们硬塞回去
+        assert!(!set.contains(&"xhigh".to_owned()) && !set.contains(&"ultra".to_owned()));
+    }
+
+    #[test]
+    fn seed_does_not_readd_user_removed_default_tier() {
+        // [MOC-285 PR #560 codex-connector P2] 用户/Codex 在已有非空值里删掉了默认可见档 high
+        //(present),seeding 只补隐藏档 none/max,**不**把 high 加回 —— 与对 xhigh/ultra 的保留一视同仁。
+        let mut state = json!({"electron-persisted-atom-state": {
+            "enabled-reasoning-efforts": ["low", "medium", "xhigh", "ultra"]
+        }});
+        // required 含 high(DeepSeek),但 high ∈ CODEX_DEFAULT → 不强加。
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        let set = enabled_set(&state);
+        assert_eq!(set, vec!["low", "medium", "xhigh", "ultra", "max", "none"]);
+        assert!(
+            !set.contains(&"high".to_owned()),
+            "不得回填用户删掉的默认档 high"
+        );
+    }
+
+    #[test]
+    fn seed_absent_still_provides_high_via_default_base() {
+        // 反向保证:absent 情形 high 仍由 CODEX_DEFAULT 基线提供(DeepSeek 的 high 档不受 P2 修复影响)。
+        let mut state = json!({"electron-persisted-atom-state": {}});
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        let set = enabled_set(&state);
+        for d in ["low", "medium", "high", "xhigh", "ultra", "none", "max"] {
+            assert!(set.contains(&d.to_owned()), "absent 基线应含 {d}");
+        }
+    }
+
+    #[test]
+    fn seed_is_idempotent_when_already_superset() {
+        // 已是超集 → 不改、返回 false(避免无谓写盘)。
+        let mut state = json!({"electron-persisted-atom-state": {
+            "enabled-reasoning-efforts": ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+        }});
+        let before = state.clone();
+        assert!(!ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        assert_eq!(state, before, "幂等:不得有任何改动");
+    }
+
+    #[test]
+    fn seed_treats_empty_array_as_absent() {
+        // 显式空数组(或损坏)→ 当作缺失,回落 Codex 默认集 + required,防 GPT 档全消失。
+        let mut state = json!({"electron-persisted-atom-state": {"enabled-reasoning-efforts": []}});
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["none", "high", "max"]
+        ));
+        let set = enabled_set(&state);
+        assert!(set.contains(&"low".to_owned()) && set.contains(&"none".to_owned()));
+    }
+
+    #[test]
+    fn seed_treats_all_non_string_array_as_absent() {
+        // [MOC-285 PR review HIGH] 非空但全非字符串的损坏数组(如 [1,2])过滤后为空 →
+        // 必须回落 Codex 默认集 + required,不能只写 required 把 GPT 默认可见档挤出交集。
+        let mut state = json!({"electron-persisted-atom-state": {
+            "enabled-reasoning-efforts": [1, 2, true]
+        }});
+        assert!(ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["high", "max", "none"]
+        ));
+        let set = enabled_set(&state);
+        for d in ["low", "medium", "high", "xhigh", "ultra", "none", "max"] {
+            assert!(set.contains(&d.to_owned()), "{d} 应在(默认集 + required)内");
+        }
+    }
+
+    #[test]
+    fn seed_drops_non_string_items_but_keeps_valid_ones() {
+        // 混合数组:保留合法字符串项 + 丢弃非字符串项 + 并入 required。
+        let mut state = json!({"electron-persisted-atom-state": {
+            "enabled-reasoning-efforts": ["low", 7, "medium"]
+        }});
+        assert!(ensure_enabled_reasoning_efforts(&mut state, &["max"]));
+        let set = enabled_set(&state);
+        assert_eq!(set, vec!["low", "medium", "max"], "丢非字符串项、并入 max");
+    }
+
+    #[test]
+    fn seed_returns_false_when_top_level_not_object() {
+        // 顶层非 object(异常文件)→ 不改、返回 false,调用方跳过写回。
+        let mut state = json!(["not", "an", "object"]);
+        assert!(!ensure_enabled_reasoning_efforts(
+            &mut state,
+            &["none", "max"]
+        ));
+    }
+
+    #[test]
+    fn seed_uses_registry_required_set() {
+        // 与 registry 单一来源对齐:用真实 all_reasoning_tier_efforts() 也能正确补上 none/max。
+        let mut state = json!({"electron-persisted-atom-state": {}});
+        let required = codex_app_transfer_registry::all_reasoning_tier_efforts();
+        assert!(ensure_enabled_reasoning_efforts(&mut state, &required));
+        let set = enabled_set(&state);
+        assert!(set.contains(&"none".to_owned()) && set.contains(&"max".to_owned()));
+    }
 
     #[test]
     fn running_check_command_is_platform_specific() {
