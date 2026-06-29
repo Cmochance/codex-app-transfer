@@ -2486,11 +2486,8 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
             // Xiaomi MiMo 文本-only 子集(实测响应 "I don't see any image attached")
             "mimo-v2-pro",
             "mimo-v2.5-pro",
-            // 智谱 GLM 文本旗舰模型（官方明确为文本模型，视觉走 GLM-5V 等独立模型）
-            "glm-5.1",
-            "glm-4.7",
-            // GLM Coding Plan 套餐档（zhipu-coding preset 的 mini/codex 槽,同纯文本）
-            "glm-4.6",
+            // 智谱 GLM 文本款不在此硬编码 —— 由下方 `is_glm_text_only_model` 版本谓词统一覆盖
+            //(glm-5.1/4.7/4.6/5/5.2/5-turbo… 全系文本款 + 未来版本,视觉 glm-*v 款不误伤)。
             // 阿里云百炼 Qwen 标准版（视觉能力走 Qwen-VL 系列）
             "qwen3.6-plus",
             "qwen3.6-flash",
@@ -2500,9 +2497,42 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
         if TEXT_ONLY_MODELS.iter().any(|n| lc == *n) {
             return false;
         }
+        // 3.5:智谱 GLM 文本款(版本谓词,覆盖全系 + 未来版本,见 [`is_glm_text_only_model`])。
+        // 修 glm-5.2 漏判:旧硬编码只列 glm-5.1/4.7/4.6,glm-5.2 落到默认 `true` 被当视觉,
+        // 含图会话(如 view_image 截图)继续时把 base64 发往 bigmodel 文本端点 → 拒/断流 →
+        // 会话毒化、重启也无法继续。
+        if is_glm_text_only_model(&lc) {
+            return false;
+        }
     }
 
     // 4:默认支持(覆盖未列在白名单的新模型 / OpenAI 标准 vision provider)
+    true
+}
+
+/// 智谱 GLM **纯文本模型**(非视觉)判定:`glm-` 前缀且不是视觉变体。
+///
+/// GLM 视觉款在**版本号后紧跟 `v`**(`glm-4v` / `glm-4.5v` / `glm-4.6v` / `glm-5v` /
+/// `glm-5v-turbo` / `glm-4.1v-thinking` 等);文本款无此 `v`(`glm-4` / `glm-4.5` /
+/// `glm-4.6` / `glm-4.7` / `glm-5` / `glm-5.1` / `glm-5.2` / `glm-5-turbo` / `glm-air` 等)。
+/// 智谱官方文本旗舰不收图(视觉走独立 GLM-xV);实测 bigmodel chat-completions 文本端点收到
+/// `image_url` 直接拒/断流,致含图会话无法继续。版本谓词覆盖全系 + 未来型号,免再漏判。
+fn is_glm_text_only_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    let Some(rest) = m.strip_prefix("glm-") else {
+        return false;
+    };
+    // 跳过版本号(数字 + 点),看紧随的首个非版本字符是否为 'v'(视觉标记)。
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    // 版本号后紧跟 'v' → 视觉变体(4.5v / 5v / 5v-turbo / 4.1v-thinking)→ 非纯文本。
+    if i < bytes.len() && bytes[i] == b'v' {
+        return false;
+    }
+    // 其余 glm-*(glm-5.2 / glm-5-turbo / glm-air / glm-4.5-air …)→ 纯文本。
     true
 }
 
