@@ -192,6 +192,45 @@ fn is_glm_thinking_model(model: &str) -> bool {
     major > 4 || (major == 4 && minor >= 5)
 }
 
+/// 本表所有 spec 的可选思考档位**全集**(去重 + 排序)。
+///
+/// **用途([MOC-285])**:Codex 26.623(codex-cli 0.142.3)起新增用户级持久设置
+/// `enabled-reasoning-efforts`(webview LM atom,`hostStorage.kind="persisted-atom"`,默认
+/// `["low","medium","high","xhigh","ultra"]`)。reasoning picker 实际显示 =
+/// 模型 `supported_reasoning_levels` ∩ `enabled-reasoning-efforts`。我们 catalog 给 GLM 等写的
+/// `none` / `max` 不在默认启用集 → 交集为空 → picker 兜底成残留「Medium」(none/max 档不显示)。
+///
+/// app 在「退出 Codex → 启动前」窗口把**本全集**并入 `enabled-reasoning-efforts` 持久 atom
+///(union,非覆盖),即可让这些档位正常显示。**单一来源**:与 catalog 显档、wire 关思考同一张
+/// `reasoning_tiers` 表(本模块),不另列一份 effort 名单,杜绝 MOC-241 强调的判定漂移。
+///
+/// 当前返回 `["high", "max", "none"]`(GLM/Kimi/Qwen/MiMo 的 none+max、DeepSeek 的 none+high+max、
+/// Gemini/MiniMax-M2.x 的 max)。
+///
+/// ⚠️ **维护**:下方 `ALL_TIER_SPECS` 与 [`reasoning_tiers_for_model`] 的 match/谓词分发是**两处独立
+/// 枚举**,不会自动联动 —— **新增一个 `ReasoningTierSpec` 常量并接进 `reasoning_tiers_for_model` 时,
+/// 必须同步把它加进 `ALL_TIER_SPECS`**,否则该模型的档位不会被 seed 进 Codex 启用集、picker 又塌成
+/// Medium(MOC-285 复发)。测试 `union_covers_specs_reachable_from_dispatch` 用模型语料兜底捕获遗漏。
+pub fn all_reasoning_tier_efforts() -> Vec<&'static str> {
+    const ALL_TIER_SPECS: &[&ReasoningTierSpec] = &[
+        &GLM_TWO_TIER,
+        &DEEPSEEK_TIERS,
+        &BINARY_THINKING_TYPE,
+        &BINARY_ENABLE_THINKING,
+        &SINGLE_MAX,
+    ];
+    let mut efforts: Vec<&'static str> = Vec::new();
+    for spec in ALL_TIER_SPECS {
+        for tier in spec.levels {
+            if !efforts.contains(&tier.effort) {
+                efforts.push(tier.effort);
+            }
+        }
+    }
+    efforts.sort_unstable();
+    efforts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +360,52 @@ mod tests {
             assert_eq!(s.default_level, Some("max"), "{m} 默认 max");
             assert_eq!(s.disable_wire, None, "{m} wire 经 gemini_native 不在本表");
             assert_eq!(s.on_tier_wire, None, "{m}");
+        }
+    }
+
+    #[test]
+    fn all_efforts_union_covers_none_high_max_deduped_sorted() {
+        // [MOC-285] enabled-reasoning-efforts seeding 用的全集 = 所有 spec 档位并集。
+        // 当前表:GLM/Kimi/Qwen/MiMo(none,max)+ DeepSeek(none,high,max)+ Gemini/MiniMax-M2.x(max)
+        // → 去重 = {high, max, none}。
+        let efforts = all_reasoning_tier_efforts();
+        assert_eq!(efforts, vec!["high", "max", "none"], "并集去重 + 排序");
+        // 去重不变量:无重复
+        let mut sorted = efforts.clone();
+        sorted.dedup();
+        assert_eq!(sorted, efforts, "不得有重复档位");
+        // 默认隐藏的 none/max 必在内(本 issue 核心)
+        assert!(efforts.contains(&"none") && efforts.contains(&"max"));
+    }
+
+    #[test]
+    fn union_covers_specs_reachable_from_dispatch() {
+        // [MOC-285 PR review HIGH] 防 ALL_TIER_SPECS 与 reasoning_tiers_for_model 漂移:
+        // 模型语料里每个命中的 spec,其全部档位必须都在 all_reasoning_tier_efforts() 全集内。
+        // 新增 spec 只接进 dispatch、忘了加 ALL_TIER_SPECS,只要其模型在本语料里就会被本测捕获。
+        let union = all_reasoning_tier_efforts();
+        let corpus = [
+            "glm-5.2",
+            "glm-5.1",
+            "glm-4.7",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "kimi-k2.6",
+            "minimax-m3",
+            "qwen3.6-plus",
+            "mimo-v2.5-pro",
+            "minimax-m2.7",
+            "gemini-3-pro",
+        ];
+        for m in corpus {
+            let spec = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中 spec"));
+            for tier in spec.levels {
+                assert!(
+                    union.contains(&tier.effort),
+                    "{m} 的档位 {} 不在 all_reasoning_tier_efforts() 全集 —— ALL_TIER_SPECS 漏了对应 spec",
+                    tier.effort
+                );
+            }
         }
     }
 
