@@ -56,12 +56,16 @@ const INSTALL_SCRIPT: &str = r##"
   // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
   // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
   // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
-  var VERSION = 4; // 加「Stash 面板在场时让位坐到其前」的占位协调 → bump,升级后免重启 Codex 即覆盖旧注入
+  var VERSION = 5; // bump:quota 行 CSS 改动(.cql nowrap)+ 明细精简 → 升级后免重启 Codex 即覆盖旧注入
   if (window.__catQuotaInstalled) {
     if (window.__catQuotaVersion === VERSION) return;
     try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
     var __stale = document.getElementById('cat-quota-entry');
     if (__stale) __stale.remove();
+    // 版本变时也移除旧样式 —— 否则 ensureStyle() 见旧 #cat-quota-style 仍在即 bail,
+    // CSS 改动(如 .cql nowrap)在已注入的 Codex 窗口上不生效(codex review P2)。
+    var __staleStyle = document.getElementById('cat-quota-style');
+    if (__staleStyle) __staleStyle.remove();
   }
   window.__catQuotaVersion = VERSION;
   window.__catQuotaLast = null;
@@ -1852,6 +1856,8 @@ mod tests {
         assert!(REMOVE_SCRIPT.contains("cat-quota-entry"));
         assert!(REMOVE_SCRIPT.contains("disconnect"));
         assert!(REMOVE_SCRIPT.contains("cat-quota-style"));
+        // 版本变重装时必须也移除旧 #cat-quota-style(否则 ensureStyle bail、CSS 改动不生效)
+        assert!(INSTALL_SCRIPT.contains("__staleStyle"));
     }
 
     #[test]
@@ -1983,7 +1989,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
                                                      // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
         assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
-        assert!(INSTALL_SCRIPT.contains("var VERSION = 4")); // bump:Stash 面板在场时让位占位协调
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 5")); // bump:quota 行 CSS(.cql nowrap)+ 明细精简
     }
 
     #[test]
