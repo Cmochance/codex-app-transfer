@@ -570,7 +570,7 @@
   },
   {
     "id": "trae-cn",
-    "name": "Trae（国内版）",
+    "name": "Trae-CN",
     "gray": true,
     "baseUrl": "https://api.trae.cn",
     "docsUrl": "https://docs.trae.cn/",
@@ -593,7 +593,7 @@
   },
   {
     "id": "workbuddy",
-    "name": "WorkBuddy (腾讯 CodeBuddy)",
+    "name": "WorkBuddy（APIKEY）",
     "baseUrl": "https://copilot.tencent.com/v2",
     "docsUrl": "https://www.codebuddy.ai",
     "authScheme": "bearer",
@@ -648,7 +648,7 @@
   },
   {
     "id": "workbuddy-login",
-    "name": "WorkBuddy (腾讯 CodeBuddy · 账号登录)",
+    "name": "WorkBuddy（Login）",
     "baseUrl": "https://copilot.tencent.com/v2",
     "docsUrl": "https://www.codebuddy.ai",
     "authScheme": "workbuddy_oauth",

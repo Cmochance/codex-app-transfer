@@ -308,6 +308,25 @@ function resetToCustom() {
   availableModels.value = []
 }
 
+// 网关无 /models 端点(如 WorkBuddy 网关 copilot.tencent.com)或尚未「获取模型」时,
+// 用 preset / 已存 provider 声明的 modelCapabilities + 槽位映射里的模型 id 作为下拉可选项,
+// 免得无从选起。仅在 availableModels 仍为空时种子填充;fetch 成功 / 本地缓存会覆盖(更全/更新)。
+function seedModelsFromDeclared(
+  caps?: Record<string, unknown>,
+  models?: Record<string, string>,
+) {
+  if (availableModels.value.length > 0) return
+  const ids = new Set<string>()
+  for (const k of Object.keys(caps || {})) ids.add(k)
+  for (const s of MODEL_SLOTS) {
+    const v = models?.[s.key]
+    if (v) ids.add(v)
+  }
+  if (ids.size > 0) {
+    availableModels.value = [...ids].map((id) => ({ value: id, label: id }))
+  }
+}
+
 // 选预设 → 预填该预设携带的全部默认内容(baseUrl / 协议 / 鉴权 / 模型映射 / 高级字段)
 function applyPreset(p: Preset) {
   form.name = p.name
@@ -324,6 +343,8 @@ function applyPreset(p: Preset) {
   availableModels.value = []
   loadCachedModels(form.baseUrl)
   loadMsgFiltered(form.baseUrl)
+  // 无 fetch 缓存时,用 preset 声明的模型作为下拉可选项(网关无 /models 端点也能选)
+  seedModelsFromDeclared(p.modelCapabilities as Record<string, unknown> | undefined, p.models)
 }
 
 // 名称下拉显式点选(自由键入自定义名称不触发, 走 v-model 直更 form.name)
@@ -377,7 +398,21 @@ async function fetchModels() {
     }
     toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
   } catch (e) {
-    error.value = (e as Error).message || t('providerForm.modelsFetchFailed')
+    // 上游无 /models 端点(如 WorkBuddy 网关 copilot.tencent.com 仅有 chat/completions)→
+    // 回落到 preset / 已存 provider 声明的 modelCapabilities,不刷红错、仍可在下拉选模型。
+    let caps: Record<string, unknown> | undefined
+    try {
+      const v = JSON.parse(form.modelCapabilities || '{}')
+      if (v && typeof v === 'object') caps = v as Record<string, unknown>
+    } catch {
+      /* modelCapabilities 非合法 JSON 时忽略,走原错误 */
+    }
+    seedModelsFromDeclared(caps, form.models)
+    if (availableModels.value.length > 0) {
+      toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
+    } else {
+      error.value = (e as Error).message || t('providerForm.modelsFetchFailed')
+    }
   } finally {
     fetching.value = false
   }
@@ -431,6 +466,11 @@ onMounted(async () => {
   // 该上游之前抓过模型 → 带出本地缓存清单, 无需重新「获取模型」即可切换映射
   loadCachedModels(form.baseUrl)
   loadMsgFiltered(form.baseUrl)
+  // 无缓存时,用已存 provider 声明的模型作为下拉可选项(网关无 /models 端点也能选)
+  seedModelsFromDeclared(
+    p.modelCapabilities as Record<string, unknown> | undefined,
+    p.mappings as Record<string, string>,
+  )
   const secret = await providersApi.getProviderSecret(props.editId).catch(() => ({ apiKey: '' }))
   form.apiKey = secret.apiKey || ''
 })
