@@ -27,7 +27,7 @@ function errMsg(e: unknown): string {
   return (e as Error)?.message || String(e)
 }
 function accountLabel(a: WorkbuddyAccount): string {
-  return a.nickname || a.uid
+  return a.display || a.uid
 }
 async function refresh() {
   if (!props.providerId) {

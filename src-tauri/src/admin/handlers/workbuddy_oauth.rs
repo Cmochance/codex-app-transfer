@@ -221,6 +221,7 @@ async fn status_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
                 .map(|a| {
                     json!({
                         "uid": a.uid,
+                        "display": a.display,
                         "nickname": a.nickname,
                         "isActive": a.is_active,
                         // exhausted_until > now → 当前因额度耗尽被跳过(UI 标「额度不足」)

@@ -70,6 +70,7 @@ export function oauthClaimPending(kind: OAuthKind, providerId: string) {
 // account 移除单账号;switch 手动切当前服务账号。
 export interface WorkbuddyAccount {
   uid: string
+  display?: string // 账号人类可读标签(脱敏手机号),取不到时前端退回短 uid
   nickname?: string
   isActive: boolean // 当前服务账号(sticky)
   exhausted: boolean // 额度低于守护阈值、当前被跳过

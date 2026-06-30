@@ -30,6 +30,8 @@ pub struct ServingAccount {
 pub struct PoolAccount {
     pub uid: String,
     pub nickname: Option<String>,
+    /// 账号人类可读标签(脱敏手机号),UI 显示用;取不到则 None(前端退回短 uid)。
+    pub display: Option<String>,
     pub device_id: Option<String>,
     /// 是否为当前 sticky 服务账号。
     pub is_active: bool,
@@ -109,8 +111,13 @@ pub fn add_account(
         .ok_or(WorkbuddyError::Parse("uid"))?;
     cred.uid = Some(uid.clone());
     // device_id:重登复用该 uid 既有账号的(设备指纹保持稳定),首登新生成 v4 UUID。
+    // 容忍腐败文件:旧 JSON 解析失败时丢弃它(返回 None),让新登录覆盖。
+    // 否则 needs_login 后的正常恢复路径会因 load()? 传播 serde 错误而 500,
+    // 用户只能手动删文件。本读仅为保留旧 device_id,丢掉无伤大雅。
     let existing_dev = WorkbuddyCredentialStore::for_account(provider_id, &uid)?
-        .load()?
+        .load()
+        .ok()
+        .flatten()
         .and_then(|c| c.device_id);
     cred.device_id = cred.device_id.or(existing_dev).or_else(|| Some(uuid_v4()));
     WorkbuddyCredentialStore::for_account(provider_id, &uid)?.save(&cred)?;
@@ -179,6 +186,7 @@ pub fn list_pool(provider_id: &str) -> Result<Vec<PoolAccount>, WorkbuddyError> 
             Some(PoolAccount {
                 is_active: active == Some(uid.as_str()),
                 exhausted_until: pool.exhausted_until.get(&uid).copied().unwrap_or(0),
+                display: super::account_display_from_jwt(&c.access_token),
                 nickname: c.nickname,
                 device_id: c.device_id,
                 uid,
