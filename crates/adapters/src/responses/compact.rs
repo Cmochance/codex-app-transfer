@@ -440,9 +440,28 @@ pub(crate) fn build_compact_chat_request(
     super::request::set_compact_no_keep_recent(false);
     let chat_body = conversion?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
-    let chat_body = inject_compact_disable_thinking_if_supported(chat_body);
+    let mut chat_body = inject_compact_disable_thinking_if_supported(chat_body);
+    // 流式-only 网关(见 [`compact_requires_streaming`])的 compact chat 请求也必须 stream:true,
+    // 否则上游拒(WorkBuddy 网关回 11101 "Non-stream chat request is currently not supported")。
+    // 响应侧 collect_and_wrap_compact_body 自动检测 SSE 重组回非流式 chat completion,统一走下游
+    // 摘要解析,故此处只需翻转请求侧 stream 标志。
+    if compact_requires_streaming(provider) {
+        if let Some(obj) = chat_body.as_object_mut() {
+            obj.insert("stream".to_string(), json!(true));
+        }
+    }
     serde_json::to_vec(&chat_body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize compact body: {e}")))
+}
+
+/// 流式 compact **扩展点** —— 返回该 provider 的 autocompact chat 请求是否必须走流式
+/// (`stream:true` + SSE 响应)。某些上游网关**只收流式** chat completions(非流式直接拒,
+/// 如 WorkBuddy / 腾讯 CodeBuddy 网关回 11101),它们的 compact 请求也必须流式。
+///
+/// **加新的「流式-only」provider:只在此函数登记一条判定即可** —— 响应侧由
+/// [`reassemble_chat_sse_to_completion`] 自动检测 SSE 并重组,无需逐 provider 改响应处理。
+fn compact_requires_streaming(provider: &Provider) -> bool {
+    provider.base_url.contains("copilot.tencent.com")
 }
 
 /// 按 chat body 的 `model` 字段查 `compact_thinking_policy` 注册表,命中即注入
@@ -806,6 +825,49 @@ pub(crate) fn build_compact_response_plan(
     })
 }
 
+/// 把上游 `/chat/completions` 的**流式 SSE** 响应重组成等价的**非流式 chat completion
+/// JSON**（`choices[0].message.content` = 累积的 `delta.content`）。流式-only 网关
+/// （见 [`compact_requires_streaming`]）的 compact 复用本函数 —— **自动检测**：`buf` 不是
+/// SSE（普通非流式 JSON）时返 `None`，调用方原样走非流式解析，故对其它 provider 是 no-op。
+///
+/// compact 摘要只取 assistant 文本，故只累积 `choices[0].delta.content`，忽略 tool_calls /
+/// role 等；`data: [DONE]` 终止。解析不出任何 chunk 也返 `None`（当作非 SSE 兜底）。
+fn reassemble_chat_sse_to_completion(buf: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(buf).ok()?;
+    // 自动检测：SSE 以 `data:` 行开头（允许前置空白）；非 SSE 直接返 None。
+    if !text.trim_start().starts_with("data:") {
+        return None;
+    }
+    let mut content = String::new();
+    let mut saw_chunk = false;
+    for line in text.lines() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        saw_chunk = true;
+        if let Some(piece) = chunk
+            .pointer("/choices/0/delta/content")
+            .and_then(|v| v.as_str())
+        {
+            content.push_str(piece);
+        }
+    }
+    if !saw_chunk {
+        return None;
+    }
+    serde_json::to_vec(&json!({
+        "choices": [{ "message": { "role": "assistant", "content": content } }]
+    }))
+    .ok()
+}
+
 async fn collect_and_wrap_compact_body(
     upstream_status: StatusCode,
     mut upstream_stream: ByteStream,
@@ -826,6 +888,10 @@ async fn collect_and_wrap_compact_body(
         // (Codex CLI 收到非 2xx 会显示原始 body)。
         return Ok(buf);
     }
+
+    // 流式-only 网关(stream:true)回的是 SSE;自动检测并重组成等价非流式 chat completion
+    // JSON 再走下面统一解析。非 SSE(普通非流式 JSON)时返 None、原样解析(对其它 provider no-op)。
+    let buf = reassemble_chat_sse_to_completion(&buf).unwrap_or(buf);
 
     let parsed: Value = serde_json::from_slice(&buf).map_err(|e| {
         let preview: String = String::from_utf8_lossy(&buf).chars().take(500).collect();
@@ -1281,6 +1347,69 @@ mod tests {
         };
         p.models.insert("default".into(), "mimo-v2.5".into());
         p
+    }
+
+    // ── 流式-only 网关 compact(MOC-288)────────────────────────────────
+
+    fn workbuddy_provider() -> Provider {
+        let mut p = make_provider();
+        p.base_url = "https://copilot.tencent.com/v2".into();
+        p.api_format = "openai_chat".into();
+        p.models.insert("default".into(), "deepseek-v4-pro".into());
+        p
+    }
+
+    #[test]
+    fn compact_requires_streaming_matches_streaming_only_gateway_host() {
+        assert!(compact_requires_streaming(&workbuddy_provider()));
+        assert!(!compact_requires_streaming(&make_provider())); // example.com → false
+    }
+
+    #[test]
+    fn build_compact_chat_request_sets_stream_true_only_for_streaming_only_gateway() {
+        let body = serde_json::to_vec(&json!({
+            "model": "deepseek-v4-pro",
+            "input": [{"type":"message","role":"user","content":"hi"}]
+        }))
+        .unwrap();
+        // 流式-only 网关 → stream:true
+        let out = build_compact_chat_request(&body, &workbuddy_provider()).expect("build compact");
+        let chat: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            chat.get("stream"),
+            Some(&json!(true)),
+            "WorkBuddy(流式-only)compact 必须 stream:true"
+        );
+        // 普通 openai_chat provider → 不翻 stream(保持非流式)
+        let mut normal = make_provider();
+        normal.api_format = "openai_chat".into();
+        let out2 = build_compact_chat_request(&body, &normal).expect("build compact normal");
+        let chat2: Value = serde_json::from_slice(&out2).unwrap();
+        assert_ne!(
+            chat2.get("stream"),
+            Some(&json!(true)),
+            "非流式-only provider 不应被翻成 stream:true"
+        );
+    }
+
+    #[test]
+    fn reassemble_chat_sse_to_completion_accumulates_delta_content() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        let out = reassemble_chat_sse_to_completion(sse.as_bytes())
+            .expect("SSE 应重组出 chat completion");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v.pointer("/choices/0/message/content")
+                .and_then(|x| x.as_str()),
+            Some("Hello")
+        );
+        // 重组结果能被现有 summary 抽取器直接认出(下游解析不变)
+        assert_eq!(extract_compact_summary_text(&v).as_deref(), Some("Hello"));
+        // 非 SSE(普通非流式 JSON)→ None,调用方原样走非流式解析(对其它 provider no-op)
+        let json_body = br#"{"choices":[{"message":{"content":"x"}}]}"#;
+        assert!(reassemble_chat_sse_to_completion(json_body).is_none());
     }
 
     #[test]
