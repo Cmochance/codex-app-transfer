@@ -636,7 +636,7 @@
     "notices": [
       {
         "type": "info",
-        "text": "WorkBuddy / 腾讯 CodeBuddy 桌面端的模型网关（copilot.tencent.com/v2，OpenAI 兼容 chat completions）。API Key 填法：安装并登录 WorkBuddy/CodeBuddy 桌面端后，从 ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info 的 auth.accessToken 取（macOS）—— 是一个约 1 年期的 Keycloak Bearer token，单 token 直连，无需 X-User-Id/设备头。网关仅支持流式且 messages 至少 2 条（Codex 均天然满足）。"
+        "text": "WorkBuddy / 腾讯 CodeBuddy 桌面端的模型网关（copilot.tencent.com/v2，OpenAI 兼容 chat completions）。API Key 填法：安装并登录 WorkBuddy/CodeBuddy 桌面端后，从 ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info 的 auth.accessToken 取（macOS）—— 是一个约 1 年期的 Keycloak Bearer token，单 token 直连，无需 X-User-Id/设备头。网关仅支持流式且 messages 至少 2 条（Codex 均天然满足）。代理出站会自动伪装成 CodeBuddy 桌面端 coding 模式 wire 指纹（X-Agent-Intent: coding + X-IDE-* + OpenAI SDK UA/X-Stainless-* + 每请求 X-Conversation-*），避免被服务端风控判定为非官方客户端。"
       },
       {
         "type": "info",

@@ -37,6 +37,7 @@ pub mod flow;
 pub mod service;
 pub mod token;
 pub mod trae;
+pub mod workbuddy;
 pub mod zai;
 
 pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};

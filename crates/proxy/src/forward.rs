@@ -420,6 +420,18 @@ fn is_zcode_owned_header(name: &str) -> bool {
     )
 }
 
+/// WorkBuddy(腾讯 CodeBuddy)模型网关请求是否要注入完整 coding 模式 wire 指纹
+/// (`X-Agent-Intent: coding` + `X-IDE-*` + `User-Agent: OpenAI/JS <ver>` +
+/// `X-Stainless-*` + 每请求 `X-Conversation-*`)伪装成官方桌面端,避免服务端风控
+/// 把 Codex 代理流量判定为非官方客户端。命中条件:base_url 指向 WorkBuddy 网关
+/// (`copilot.tencent.com`),无论 `workbuddy`(Bearer 粘 token)还是 `workbuddy-login`
+/// (账号登录,也是 Bearer access token)路径。判定收口到本函数,既做 Bearer 注入
+/// guard,又做入站同名指纹头去重(对齐 [`injects_zcode_source_headers`] 的对称处理)。
+fn injects_workbuddy_source_headers(auth_scheme: &AuthScheme, base_url: &str) -> bool {
+    matches!(auth_scheme, AuthScheme::Bearer)
+        && base_url.contains(codex_app_transfer_gemini_oauth::workbuddy::WORKBUDDY_HOST)
+}
+
 pub async fn forward_handler(
     State(state): State<ProxyState>,
     req: Request,
@@ -1847,6 +1859,11 @@ async fn build_and_send_upstream(
     // ZCode 头、谁就 strip 入站 x-platform"两处一致,不再出现单条路径漏 strip 的不对称。
     let injects_zcode_headers =
         injects_zcode_source_headers(&resolved.auth_scheme, &resolved.provider.base_url);
+    // WorkBuddy(腾讯 CodeBuddy)coding 模式 wire 指纹伪装 —— 命中网关 host 时,下方
+    // 注入完整 coding 指纹(X-Agent-Intent: coding + X-IDE-* + OpenAI SDK UA/X-Stainless-*
+    // + 每请求 X-Conversation-*),并 strip 入站 Codex 同名头防 append 双值。
+    let injects_workbuddy_headers =
+        injects_workbuddy_source_headers(&resolved.auth_scheme, &resolved.provider.base_url);
     for (name, value) in inbound_headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
             continue;
@@ -1863,6 +1880,14 @@ async fn build_and_send_upstream(
         // 为非 ZCode 客户端。strip 入站同名让注入分支独占,ZaiOauth 与 Bearer-coding
         // 两条路径一致处理(`User-Agent` 已由 is_strip_on_forward 全局 strip)。
         if injects_zcode_headers && is_zcode_owned_header(name.as_str()) {
+            continue;
+        }
+        // WorkBuddy coding 指纹头(X-Agent-Intent / X-IDE-* / X-Stainless-* /
+        // X-Conversation-* / X-Model-ID / X-User-Id / X-Device-Id)由下方独占注入;
+        // strip 入站同名防 reqwest header() append 双值(User-Agent 已全局 strip)。
+        if injects_workbuddy_headers
+            && codex_app_transfer_gemini_oauth::workbuddy::is_workbuddy_owned_header(name.as_str())
+        {
             continue;
         }
         // dup-header 防御(review-feedback A4):GrokCookie scheme 下,grok.com
@@ -1988,6 +2013,29 @@ async fn build_and_send_upstream(
             up = up.headers(grok_headers);
         }
         _ => {}
+    }
+    // WorkBuddy coding 模式 wire 指纹注入 —— 命中网关 host 的 Bearer 请求(`workbuddy`
+    // 粘 token / `workbuddy-login` 账号登录,两条路出站都是 Bearer access token)。
+    // 独占注入完整 coding 指纹:固定身份头 + `X-Model-ID`(本次上游模型)+ `X-User-Id`
+    // (解自 access token JWT 的 `sub`)+ `X-Device-Id`(持久化稳定 UUID)+ 每请求
+    // `X-Conversation-*`。入站 Codex 同名头已在上方按 `injects_workbuddy_headers` strip,
+    // 这里独占注入(对齐 ZCode/Grok 的"代码层独占注入指纹"模式)。
+    if injects_workbuddy_headers {
+        let model_id = resolved.rewritten_model.as_deref().unwrap_or_default();
+        for (name, value) in
+            codex_app_transfer_gemini_oauth::workbuddy::workbuddy_source_headers(model_id)
+        {
+            up = up.header(name, value);
+        }
+        if let Some(uid) =
+            codex_app_transfer_gemini_oauth::workbuddy::user_id_from_jwt(&resolved.api_key)
+        {
+            up = up.header("X-User-Id", uid);
+        }
+        up = up.header(
+            "X-Device-Id",
+            codex_app_transfer_gemini_oauth::workbuddy::workbuddy_device_id(),
+        );
     }
     let req = up.build()?;
     let outbound_headers_snapshot = req.headers().clone();
