@@ -36,6 +36,24 @@
    - **e2. Merge + 远端 silent delete verify**：`gh pr merge <PR#> --squash --delete-branch` 后必须验证远端 ref 真删 —— **不能直接看 `git ls-remote` 的 exit code**（连接成功即 0，跟 ref 存不存在无关），改用 `git ls-remote --heads --exit-code origin <branch>`（ref 不存在时 exit 2）**或** `[ "$(git ls-remote --heads origin <branch> | wc -l)" -eq 0 ]`（stdout 0 行 = ref 不存在）；残留时手动 `git push origin --delete <branch>`（worktree 锁本地分支时 gh 也 skip remote delete，silent failure）。
    - **e3. 本地清理**：`git worktree remove <path>` → `git branch -D <branch>` → `git worktree prune` → 清理 `src-tauri/target/release/bundle/macos/` 等 build 残留。
    - **e4. 回归 main + 同步**：`git checkout main` → `git pull --ff-only origin main`。
-   - **e5. `.app` build + 转主仓 `dist/mac/`（必须 `test ` 前缀）**：主仓 main 跑 `make mac-app` 输出 `dist/mac/Codex App Transfer.app` → rename 为 `dist/mac/test Codex App Transfer.app`（`test ` 前缀避免跟 `/Applications/Codex App Transfer.app` 用户正式版同名，Dock / Cmd-Tab 可区分）→ `pkill -f "Codex App Transfer"` 强 kill 旧 instance → `open "dist/mac/test Codex App Transfer.app"`（不 pkill 看的是旧 binary）。**绝不**擅动 `/Applications/Codex App Transfer.app`（用户正式版）。
    - **e6. 关联 issue + Linear followup 更新**：`gh issue view <ISSUE#> --json state,closedByPullRequestsReferences` 验证是否被 PR `Closes #N` 自动关，否则手动 `gh issue close <N>`。**Linear followup（workspace Mochance / team Mochance / label Improvement）跟 GitHub issue 是两套独立系统**：本次 PR 实施掉的 Linear issue（MOC-N）用 `mcp__linear__save_issue` 改 `state=Done`，并在 issue body 末尾追加 resolved PR 链接。（历史 `docs/followup-tracker.md` 制度 2026-05-24 起停用，新工作流不再写本地 .md。`docs/` 整目录已 gitignored。）
 
+5. **发版流程**
+
+   **a. 预发布微 PR（版本号 bump + release notes + CHANGELOG）**
+   - 用户说「发版」/「trigger workflow」/「发 vX.Y.Z」时，新版本号默认 patch +1（如 2.4.1 → 2.4.2）；用户没显式指明 bump 档位时**不**按 feat 数量自行推 minor/major，只有用户明说（如「发 2.5.0」「升 minor」）才用更大档位。
+   - 在 sibling worktree 开 `chore/release-vX.Y.Z` 分支，三件事同 PR：
+     - **A. 全盘扫描更新版本号**：`rg -l "\b<OLD>\b" --type-not lock` 确认没漏。必改 `src-tauri/Cargo.toml` `[package].version` + `src-tauri/tauri.conf.json` top-level `"version"`（`Cargo.lock` 由 `cargo check -p codex-app-transfer` 自动 sync）；可能要改 `README.md` / `README.en.md` 版本行。改完跑 `cargo check -p codex-app-transfer` 让 Cargo.lock 同步。
+     - **B. 撰写 release notes**：创建 `release-notes/vX.Y.Z.md`（MOC-66 CI 门禁强制，`scripts/check_release_notes_present.py` 校验，缺文件 release.yml 直接 fail）。格式参照 `release-notes/v2.1.7.md` 标杆：`# Codex App Transfer vX.Y.Z` 标题 + `## 中文` / `## English` 两段，每段单 `###` 主题 + bullets + 验证段；2500-3200 字符；禁粗体 / 删除线 / 中文引号（「」『』）；允许 inline code。
+     - **C. CHANGELOG 补条目**：`CHANGELOG.md` 顶部（`## v<上一个版本>` 之前）插入 `## vX.Y.Z` 段，中英双语概述本版改动（参照既有格式）。
+   - 微 PR 不立即开 —— 可攒到下一个 feature PR 搭车（同 merge 收尾 d 规则），或累 ≥ 5 条微改动起 `chore: misc micro-fixes` PR。但**发版触发时必须独立开 PR**（release notes 文件 + 版本号必须在 main 上才能 dispatch release.yml）。
+   - PR title：`chore(release): prepare vX.Y.Z`。merge 走标准 merge 收尾流程（e0-e4 + e6）。
+
+   **b. dispatch release.yml**
+   - 预发布 PR merge 进 main 后，触发 `release.yml` workflow dispatch（`gh workflow run release.yml -f version=X.Y.Z` 或 GitHub Actions UI 手动 dispatch）。dispatch 前确认 main 已含版本号 bump + release-notes 文件。
+   - release.yml 跑 `check_release_notes_present.py` 门禁 → 打包 macOS .app/.dmg → 创建 draft release。
+
+   **c. draft release → 注入 notes → 等用户 publish**
+   - release.yml 创建的 draft release 用 `release-notes/vX.Y.Z.md` 全文作为 body（不走 GitHub 默认「What's Changed」footer）。
+   - 等 release.yml 全绿、draft release 创建成功后，向用户汇报 release URL + 打包产物，**等用户显式声明 publish** 才点 publish（禁止自动 publish）。
+   - publish 后打 tag `vX.Y.Z`（release.yml 自动打），验证 `gh release view vX.Y.Z` 状态为 published。
