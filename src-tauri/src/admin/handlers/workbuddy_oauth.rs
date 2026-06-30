@@ -15,7 +15,8 @@
 //! - `DELETE /api/workbuddy-oauth/login/cancel`
 //! - `DELETE /api/workbuddy-oauth/logout`
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::{
@@ -188,7 +189,32 @@ async fn login_handler() -> impl IntoResponse {
         });
     };
 
+    // 用户手动关登录窗 = 取消:登录结束前轮询窗口,曾开过又关掉则触发 cancel(对齐 Trae)。
+    // 否则关窗后 run_workbuddy_login 会傻等满 LOGIN_TIMEOUT(5min),POST /login + UI「登录中」
+    // 一直卡住(codex review P2)。
+    let login_done = Arc::new(AtomicBool::new(false));
+    {
+        let done = login_done.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut seen_open = false;
+            loop {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                if done.load(Ordering::Relaxed) {
+                    break; // 登录已结束(成功/失败/超时),停止监视
+                }
+                if web_session_quota::external_login_window_open(WORKBUDDY_LOGIN_WIN) {
+                    seen_open = true;
+                } else if seen_open {
+                    tracing::info!("[WorkBuddy] 登录窗被用户关闭 → 取消登录");
+                    cancel_in_flight_login();
+                    break;
+                }
+            }
+        });
+    }
+
     let result = run_workbuddy_login(http, on_auth_url, Some(cancel_rx)).await;
+    login_done.store(true, Ordering::Relaxed);
     cleanup_slot(my_epoch);
     web_session_quota::close_external_login_window(WORKBUDDY_LOGIN_WIN);
 
