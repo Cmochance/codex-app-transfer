@@ -20,6 +20,14 @@
 
 use std::sync::OnceLock;
 
+pub mod login;
+pub mod token;
+
+pub use login::{
+    ensure_valid_workbuddy_token, refresh_workbuddy_token, run_workbuddy_login, WorkbuddyError,
+};
+pub use token::{WorkbuddyCredential, WorkbuddyCredentialStore, WorkbuddyTokenError};
+
 /// WorkBuddy 模型网关 host —— `injects_workbuddy_source_headers` 据此判定是否注入
 /// coding 指纹。staging / 正式 / codebuddy.cn 均含 `tencent.com`/`codebuddy`,这里
 /// 取最稳的正式 host 子串。

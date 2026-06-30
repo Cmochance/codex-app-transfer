@@ -645,5 +645,60 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "workbuddy-login",
+    "name": "WorkBuddy (腾讯 CodeBuddy · 账号登录)",
+    "baseUrl": "https://copilot.tencent.com/v2",
+    "docsUrl": "https://www.codebuddy.ai",
+    "authScheme": "workbuddy_oauth",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "deepseek-v4-pro"
+    },
+    "modelCapabilities": {
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "minimax-m3": {
+        "context_window": 512000
+      },
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "glm-5v-turbo": {
+        "context_window": 200000
+      },
+      "kimi-k2.7": {
+        "context_window": 256000
+      },
+      "kimi-k2.6": {
+        "context_window": 256000
+      },
+      "hy3-preview": {
+        "context_window": 192000
+      },
+      "auto": {
+        "context_window": 168000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录（OAuth）免手动粘 token —— 点「登录」用腾讯账号授权一次，app 自动跑 /v2/plugin/auth/{state,token} 拿凭证并落盘，access token 过期前自动 refresh（X-Refresh-Token），无需每年换。与 API-key 路（workbuddy preset）等价，只是免去手抠 token；出站同样自动伪装成 coding 模式 wire 指纹避风控。"
+      },
+      {
+        "type": "info",
+        "text": "可用模型 id（实测）：deepseek-v4-pro / deepseek-v4-flash / minimax-m3 / glm-5.2 / glm-5.1 / glm-5v-turbo / kimi-k2.7 / kimi-k2.6 / hy3-preview / auto。要换模型改 provider.models 槽位映射到上述任一 id。各渠道开通子集不同，Claude（default-1.x）等可能未开通。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]

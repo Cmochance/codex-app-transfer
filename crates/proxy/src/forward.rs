@@ -428,8 +428,10 @@ fn is_zcode_owned_header(name: &str) -> bool {
 /// (账号登录,也是 Bearer access token)路径。判定收口到本函数,既做 Bearer 注入
 /// guard,又做入站同名指纹头去重(对齐 [`injects_zcode_source_headers`] 的对称处理)。
 fn injects_workbuddy_source_headers(auth_scheme: &AuthScheme, base_url: &str) -> bool {
-    matches!(auth_scheme, AuthScheme::Bearer)
-        && base_url.contains(codex_app_transfer_gemini_oauth::workbuddy::WORKBUDDY_HOST)
+    // 账号登录路(WorkbuddyOauth)无条件伪装;API-key 路(Bearer)按网关 host 命中。
+    matches!(auth_scheme, AuthScheme::WorkbuddyOauth)
+        || (matches!(auth_scheme, AuthScheme::Bearer)
+            && base_url.contains(codex_app_transfer_gemini_oauth::workbuddy::WORKBUDDY_HOST))
 }
 
 pub async fn forward_handler(
@@ -1844,6 +1846,25 @@ async fn build_and_send_upstream(
                 })?;
             Some(cred.org_api_key)
         }
+        crate::resolver::AuthScheme::WorkbuddyOauth => {
+            // WorkBuddy 账号登录:access token 在 workbuddy-oauth.json,过期前 5min 自动
+            // refresh(`X-Refresh-Token` 头);文件不存在 = 未登录 → needs_login。
+            let store =
+                codex_app_transfer_gemini_oauth::workbuddy::WorkbuddyCredentialStore::from_home_env()
+                    .map_err(|e| ForwardError::OauthUnavailable {
+                        reason: format!(
+                            "home directory unavailable; cannot locate workbuddy token store: {e}"
+                        ),
+                        needs_login: false,
+                    })?;
+            let token = codex_app_transfer_gemini_oauth::workbuddy::ensure_valid_workbuddy_token(
+                &state.http,
+                &store,
+            )
+            .await
+            .map_err(classify_workbuddy_service_error)?;
+            Some(token)
+        }
         _ => None,
     };
 
@@ -2027,8 +2048,11 @@ async fn build_and_send_upstream(
         {
             up = up.header(name, value);
         }
+        // X-User-Id 解自本次实际用的 access token 的 JWT sub:账号登录路 token 在
+        // oauth_bearer,API-key 路在 resolved.api_key。
+        let effective_token = oauth_bearer.as_deref().unwrap_or(resolved.api_key.as_str());
         if let Some(uid) =
-            codex_app_transfer_gemini_oauth::workbuddy::user_id_from_jwt(&resolved.api_key)
+            codex_app_transfer_gemini_oauth::workbuddy::user_id_from_jwt(effective_token)
         {
             up = up.header("X-User-Id", uid);
         }
@@ -2259,6 +2283,22 @@ fn classify_oauth_service_error(e: codex_app_transfer_gemini_oauth::ServiceError
     }
 }
 
+/// WorkBuddy 账号登录 service 错 → ForwardError。needs_login 判定:未登录 / refresh
+/// 被上游业务码拒 / 凭证文件损坏 → 需重登;HTTP / IO / 超时 / 取消 / 解析 → 瞬时。
+fn classify_workbuddy_service_error(
+    e: codex_app_transfer_gemini_oauth::workbuddy::WorkbuddyError,
+) -> ForwardError {
+    use codex_app_transfer_gemini_oauth::workbuddy::{WorkbuddyError as WErr, WorkbuddyTokenError};
+    let needs_login = matches!(
+        &e,
+        WErr::NotLoggedIn | WErr::Business { .. } | WErr::Token(WorkbuddyTokenError::Serde(_))
+    );
+    ForwardError::OauthUnavailable {
+        reason: e.to_string(),
+        needs_login,
+    }
+}
+
 fn inject_auth(
     mut req: reqwest::RequestBuilder,
     resolved: &ResolvedProvider,
@@ -2276,7 +2316,8 @@ fn inject_auth(
         }
         AuthScheme::GoogleOauthCloudCode
         | AuthScheme::GoogleOauthAntigravity
-        | AuthScheme::ZaiOauth(_) => {
+        | AuthScheme::ZaiOauth(_)
+        | AuthScheme::WorkbuddyOauth => {
             // 调用方在 build_and_send_upstream 入口处已 await 过 OAuth token,
             // 这里单纯 Bearer 注入。Google 两个 scheme 共用 cloudcode-pa,zai 用换出的
             // 组织 key(ZCode model 调用对 plan provider 也是 `Authorization: Bearer`)→

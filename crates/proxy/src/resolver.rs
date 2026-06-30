@@ -64,6 +64,13 @@ pub enum AuthScheme {
     /// Messages wire,forward.rs 注 `Authorization: Bearer <org_key>` + ZCode 指纹头。
     /// 内含 [`ZaiProvider`] 区分 z.ai vs bigmodel(两者 model_base / token 文件不同)。
     ZaiOauth(ZaiProvider),
+    /// WorkBuddy(腾讯 CodeBuddy)账号登录。access token 不在 `provider.api_key`,
+    /// 由 `gemini_oauth::workbuddy::WorkbuddyCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/workbuddy-oauth.json`)+ 请求时 `ensure_valid_workbuddy_token`
+    /// load + **自动 refresh**(`X-Refresh-Token` 头)。打 `copilot.tencent.com/v2/chat/completions`
+    /// 的 OpenAI Chat 兼容 wire,forward.rs 注 `Authorization: Bearer <access_token>` +
+    /// 完整 coding 模式指纹头(与 API-key 路 `workbuddy` preset 对齐)。
+    WorkbuddyOauth,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -85,6 +92,7 @@ impl AuthScheme {
             "grok_cookie" | "grok" | "grok_web" => AuthScheme::GrokCookie,
             "zai_oauth" | "zai" => AuthScheme::ZaiOauth(ZaiProvider::Zai),
             "bigmodel_oauth" | "bigmodel" => AuthScheme::ZaiOauth(ZaiProvider::BigModel),
+            "workbuddy_oauth" | "workbuddy_login" => AuthScheme::WorkbuddyOauth,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
