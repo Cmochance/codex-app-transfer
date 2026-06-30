@@ -4,14 +4,16 @@
 //   - gemini-cli                → /api/gemini-oauth/*
 //   - antigravity               → /api/antigravity-oauth/*
 //   - trae                      → /api/trae-oauth/*        (需 ?providerId=<id>,多账号按 provider 条目隔离)
+//   - workbuddy                 → /api/workbuddy-oauth/*   (单账号,无 query)
 // login 为长阻塞:POST 后端开系统浏览器授权,直到回调完成/取消才返回。
 import { api } from './http'
 
-export type OAuthKind = 'zai' | 'bigmodel' | 'gemini' | 'antigravity' | 'trae'
+export type OAuthKind = 'zai' | 'bigmodel' | 'gemini' | 'antigravity' | 'trae' | 'workbuddy'
 
 export interface OAuthStatus {
   loggedIn: boolean
   email?: string
+  nickname?: string
 }
 
 // trae 按 provider 条目 keying(同设备多账号指纹隔离),需传 providerId;其余 kind 忽略 providerId。
@@ -30,6 +32,8 @@ function endpoint(kind: OAuthKind, providerId?: string): { base: string; query: 
         base: '/api/trae-oauth',
         query: `?providerId=${encodeURIComponent(providerId ?? '')}`,
       }
+    case 'workbuddy':
+      return { base: '/api/workbuddy-oauth', query: '' }
   }
 }
 

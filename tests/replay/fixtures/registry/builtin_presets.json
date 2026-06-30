@@ -570,7 +570,7 @@
   },
   {
     "id": "trae-cn",
-    "name": "Trae（国内版）",
+    "name": "Trae-CN",
     "gray": true,
     "baseUrl": "https://api.trae.cn",
     "docsUrl": "https://docs.trae.cn/",
@@ -589,6 +589,118 @@
         "text": "当前仅支持登录 + 额度查看；模型路由开发中（Trae 为字节跳动私有协议，非标准 OpenAI/Anthropic 端点，Phase 2 接入）。"
       }
     ],
+    "isBuiltin": true
+  },
+  {
+    "id": "workbuddy",
+    "name": "WorkBuddy（APIKEY）",
+    "gray": true,
+    "baseUrl": "https://copilot.tencent.com/v2",
+    "docsUrl": "https://www.codebuddy.ai",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "deepseek-v4-pro"
+    },
+    "modelCapabilities": {
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "minimax-m3": {
+        "context_window": 512000
+      },
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "glm-5v-turbo": {
+        "context_window": 200000
+      },
+      "kimi-k2.7": {
+        "context_window": 256000
+      },
+      "kimi-k2.6": {
+        "context_window": 256000
+      },
+      "hy3-preview": {
+        "context_window": 192000
+      },
+      "auto": {
+        "context_window": 168000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "WorkBuddy / 腾讯 CodeBuddy 桌面端的模型网关（copilot.tencent.com/v2，OpenAI 兼容 chat completions）。API Key 填法：安装并登录 WorkBuddy/CodeBuddy 桌面端后，从 ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info 的 auth.accessToken 取（macOS）—— 是一个约 1 年期的 Keycloak Bearer token，单 token 直连，无需 X-User-Id/设备头。网关仅支持流式且 messages 至少 2 条（Codex 均天然满足）。代理出站会自动伪装成 CodeBuddy 桌面端 coding 模式 wire 指纹（X-Agent-Intent: coding + X-IDE-* + OpenAI SDK UA/X-Stainless-* + 每请求 X-Conversation-*），避免被服务端风控判定为非官方客户端。"
+      },
+      {
+        "type": "info",
+        "text": "可用模型 id（实测）：deepseek-v4-pro / deepseek-v4-flash / minimax-m3 / glm-5.2 / glm-5.1 / glm-5v-turbo / kimi-k2.7 / kimi-k2.6 / hy3-preview / auto。要换模型改 provider.models 槽位映射到上述任一 id。各渠道（如中国移动 Token Plan）实际开通子集不同，Claude（default-1.x）等模型可能未开通、调用会返回 invoke model error。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "workbuddy-login",
+    "name": "WorkBuddy（Login）",
+    "gray": true,
+    "baseUrl": "https://copilot.tencent.com/v2",
+    "docsUrl": "https://www.codebuddy.ai",
+    "authScheme": "workbuddy_oauth",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "deepseek-v4-pro"
+    },
+    "modelCapabilities": {
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      },
+      "minimax-m3": {
+        "context_window": 512000
+      },
+      "glm-5.2": {
+        "context_window": 1000000
+      },
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "glm-5v-turbo": {
+        "context_window": 200000
+      },
+      "kimi-k2.7": {
+        "context_window": 256000
+      },
+      "kimi-k2.6": {
+        "context_window": 256000
+      },
+      "hy3-preview": {
+        "context_window": 192000
+      },
+      "auto": {
+        "context_window": 168000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录（OAuth）免手动粘 token —— 点「登录」用腾讯账号授权一次，app 自动跑 /v2/plugin/auth/{state,token} 拿凭证并落盘，access token 过期前自动 refresh（X-Refresh-Token），无需每年换。与 API-key 路（workbuddy preset）等价，只是免去手抠 token；出站同样自动伪装成 coding 模式 wire 指纹避风控。"
+      },
+      {
+        "type": "info",
+        "text": "可用模型 id（实测）：deepseek-v4-pro / deepseek-v4-flash / minimax-m3 / glm-5.2 / glm-5.1 / glm-5v-turbo / kimi-k2.7 / kimi-k2.6 / hy3-preview / auto。要换模型改 provider.models 槽位映射到上述任一 id。各渠道开通子集不同，Claude（default-1.x）等可能未开通。"
+      }
+    ],
+    "requestOptions": {},
     "isBuiltin": true
   }
 ]

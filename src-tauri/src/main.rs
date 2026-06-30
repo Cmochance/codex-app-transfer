@@ -721,6 +721,20 @@ fn main() {
                     .await
                 });
             }
+            // 同理取消 in-flight WorkBuddy(腾讯 CodeBuddy)账号登录:user 登录期间退出 app 时,
+            // 等 in-flight 登录真跑完,避免后台轮询残留 + auth 在退出过程中完成致 ghost 凭证落盘
+            // (codex review P2,与 trae/zai/antigravity 对齐)。
+            let wb_outcome = handlers::workbuddy_oauth::cancel_in_flight_login();
+            if let (true, Some(target_epoch)) = (wb_outcome.cancelled, wb_outcome.cancelled_epoch) {
+                tracing::info!(target_epoch, "app exit: cancelled in-flight workbuddy OAuth login");
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::workbuddy_oauth::wait_for_login_epoch_complete(target_epoch),
+                    )
+                    .await
+                });
+            }
             // [devin review] 同理取消 in-flight `codex login`(真实账号登录):否则 user 在
             // OAuth 等待期间退出 app,孤儿 codex login 进程可能在下面 restore_codex_if_enabled
             // 恢复原配置**之后**才写 ~/.codex/auth.json,把刚恢复的状态又改脏(数据完整性)。

@@ -35,4 +35,5 @@ pub mod trace_viewer;
 pub mod trae_oauth;
 pub mod update;
 pub mod usage;
+pub mod workbuddy_oauth;
 pub mod zai_oauth;

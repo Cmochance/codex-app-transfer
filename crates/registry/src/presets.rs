@@ -48,7 +48,12 @@ mod tests {
         // (2026-06-22 加 OpenCode Go preset:opencode.ai/zen/go 编程模型订阅,openai_chat)
         // (2026-06-22 加 Trae（国内版）OAuth preset:字节 TRAE SOLO CN 账号登录 + 额度,CAT-257;
         //  Phase 1 仅 login+quota,模型路由 Phase 2)
-        assert_eq!(builtin_presets().len(), 18);
+        // (2026-06-30 加 WorkBuddy（腾讯 CodeBuddy）preset:复用桌面端登录 token 直连
+        //  copilot.tencent.com/v2 模型网关,openai_chat;纯 bearer,实测 deepseek-v4/glm-5.x/
+        //  minimax-m3/kimi-k2.x/hy3 等可用,详见逆向记录)
+        // (2026-06-30 加 workbuddy-login:WorkBuddy 账号登录 OAuth 路,authScheme
+        //  workbuddy_oauth;外链轮询登录 + 自动 refresh,与 API-key 路 workbuddy 并存)
+        assert_eq!(builtin_presets().len(), 20);
     }
 
     #[test]
