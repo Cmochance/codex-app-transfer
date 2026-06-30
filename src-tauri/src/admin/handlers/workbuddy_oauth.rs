@@ -1,19 +1,20 @@
 //! `/api/workbuddy-oauth/*` admin handlers — WorkBuddy(腾讯 CodeBuddy)账号登录
 //! (external-link 轮询式 OAuth)登录 / 状态 / 注销 / 取消。
 //!
-//! 跟 [`super::zai_oauth`] / [`super::trae_oauth`] **并行**,但 WorkBuddy wire 更简单:
-//! 1. **单账号**:一个本地 `workbuddy-oauth.json`,无 provider id keying(对齐"一个网关
-//!    一套登录态")。前端传的 `providerId` 接受但忽略。
+//! 跟 [`super::zai_oauth`] / [`super::trae_oauth`] **并行**:
+//! 1. **单 provider 多账号池**:所有路由按 `?providerId=<id>` 隔离账号池(一个 workbuddy-login
+//!    provider = 一个池,见 [`workbuddy::pool`])。status 列池内账号 + 当前服务账号;login 加一个
+//!    账号入池;account 移除单账号;switch 手动切当前服务账号。额度守护按总剩余自动切换。
 //! 2. **轮询式**(非 loopback):`run_workbuddy_login` 请求 state → 回调里开内置 webview
 //!    加载 authUrl → 轮询 `/auth/token` 拿凭证。用户关窗 = 取消。
-//! 3. **有 refresh**:access token 过期前 5min 由 `ensure_valid_workbuddy_token` 自动
-//!    refresh(`X-Refresh-Token` 头),不像 zai/trae 过期即重登。
+//! 3. **有 refresh**:access token 过期前 5min 自动 refresh(`X-Refresh-Token` 头)。
 //!
 //! ## 路由
-//! - `GET    /api/workbuddy-oauth/status`
-//! - `POST   /api/workbuddy-oauth/login`
-//! - `DELETE /api/workbuddy-oauth/login/cancel`
-//! - `DELETE /api/workbuddy-oauth/logout`
+//! - `GET    /api/workbuddy-oauth/status?providerId=<id>`   列池内账号
+//! - `POST   /api/workbuddy-oauth/login?providerId=<id>`    加账号入池
+//! - `DELETE /api/workbuddy-oauth/login/cancel`             取消 in-flight 登录
+//! - `DELETE /api/workbuddy-oauth/account?providerId&uid`   移除单账号
+//! - `POST   /api/workbuddy-oauth/switch?providerId&uid`    手动切当前服务账号
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};

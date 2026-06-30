@@ -5,7 +5,7 @@
 //! 旧版「单文件单账号」(`workbuddy-oauth.json`)只能登一个账号。要支持「一个
 //! `workbuddy-login` provider 内多账号 + 额度守护自动切换」,改成**每账号一文件**(对齐
 //! `trae/token.rs` 的 per-id keying):
-//! - 账号:`~/.codex-app-transfer/workbuddy/<provider_id>/<uid>.json`(凭证含**本账号专属
+//! - 账号:`~/.codex-app-transfer/workbuddy/<provider_id>/accounts/<uid>.json`(凭证含**本账号专属
 //!   `device_id`**,网关眼里每账号是独立设备,避免同客户端被风控关联);
 //! - 池态:`~/.codex-app-transfer/workbuddy/<provider_id>/_pool.json`(当前服务账号
 //!   `active_uid` + 每账号 `exhausted_until_ms`,额度刷新时刻前不再选)。
@@ -150,15 +150,19 @@ impl WorkbuddyCredentialStore {
 fn account_path(root: &Path, provider_id: &str, uid: &str) -> PathBuf {
     root.join("workbuddy")
         .join(sanitize_id(provider_id))
+        // 账号文件放 `accounts/` 子目录,与同级 `_pool.json` 物理隔离:防某 uid 清洗后恰为
+        // `_pool` 时账号文件覆盖池态文件(codex review:uid 来自 JWT sub,理论可影响)。
+        .join("accounts")
         .join(format!("{}.json", sanitize_id(uid)))
 }
 
-/// 列某 provider 池内所有账号凭证(读 `workbuddy/<provider_id>/*.json`,跳过 `_pool.json`
-/// 与 temp)。目录不存在 → 空。单个文件损坏 → 跳过(不让一个坏文件废掉整池)。
+/// 列某 provider 池内所有账号凭证(读 `workbuddy/<provider_id>/accounts/*.json`,跳过 temp)。
+/// 目录不存在 → 空。单个文件损坏 → 跳过(不让一个坏文件废掉整池)。
 pub fn list_accounts(provider_id: &str) -> Result<Vec<WorkbuddyCredential>, WorkbuddyTokenError> {
     let dir = transfer_root()?
         .join("workbuddy")
-        .join(sanitize_id(provider_id));
+        .join(sanitize_id(provider_id))
+        .join("accounts");
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -335,7 +339,7 @@ mod tests {
         let c = account_path(root, "wb-login-2", "u-alice");
         assert_ne!(a, b, "同 provider 不同 uid 分文件");
         assert_ne!(a, c, "不同 provider 分目录");
-        assert!(a.ends_with("workbuddy/wb-login/u-alice.json"));
+        assert!(a.ends_with("workbuddy/wb-login/accounts/u-alice.json"));
     }
 
     #[test]

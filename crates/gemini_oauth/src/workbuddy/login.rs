@@ -220,10 +220,11 @@ pub async fn refresh_workbuddy_token(
     Ok(token_to_cred(data))
 }
 
-/// 进程级 single-flight refresh 锁 —— 防多个 Codex 请求在 token 进入 refresh 窗口后
-/// 各自并发 refresh:并发会抢同一 `workbuddy-oauth.json.tmp` temp 文件(互相 unlink/rename
-/// 致一方失败)+ 上游 refresh 每次轮换 refresh token(并发调用互相使对方的旧 refresh token
-/// 失效)。对齐 gemini `service::ensure_valid_access_token` 的单飞模式(codex review P2)。
+/// 进程级 single-flight refresh 锁 —— 防多请求在 token 进入 refresh 窗口后各自并发 refresh:
+/// 上游 refresh 每次**轮换** refresh token,并发调用会互相使对方刚拿的旧 refresh token 失效。
+/// (账号文件已是 per-account + 唯一 temp 写,不再有 temp 互撞问题;此锁是全局单飞 —— 跨账号
+/// refresh 也被串行,over-serialize 但单用户下 refresh 罕见、无正确性问题。)对齐 gemini
+/// `service::ensure_valid_access_token`(codex review P2)。
 fn refresh_mutex() -> &'static tokio::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))

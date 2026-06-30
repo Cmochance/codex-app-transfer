@@ -1781,7 +1781,8 @@ async fn build_and_send_upstream(
     // 用不同 client_id/secret(antigravity 走 ensure_valid_antigravity_token,
     // gemini-cli 走 ensure_valid_access_token)。
     // WorkBuddy 多账号池:WorkbuddyOauth 路选中的服务账号 (uid, device_id) —— 注入 X-Device-Id
-    // 用账号专属指纹(防风控关联)+ 反应式失败转移按 uid 标记。其它路保持 None(用全局 device-id)。
+    // 用账号专属指纹(防风控关联)。uid 暂存供未来反应式失败转移按账号标记;其它路保持 None
+    // (用全局 device-id)。
     let mut workbuddy_account: Option<(String, String)> = None;
     let oauth_bearer: Option<String> = match resolved.auth_scheme {
         crate::resolver::AuthScheme::GoogleOauthCloudCode => {

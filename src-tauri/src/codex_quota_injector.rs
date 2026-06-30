@@ -1476,16 +1476,18 @@ async fn fetch_workbuddy_quota(
         };
         match fetch_workbuddy_resource(http, &token).await {
             Ok(json) => {
-                let m = guard_metrics(&json);
-                if m.total_remaining < threshold {
-                    // 标记耗尽到下次刷新(无基础包则 +6h 退避周期重查)。
-                    let until = m
-                        .next_refresh_ms
-                        .unwrap_or_else(|| workbuddy::token::unix_now_ms() + 6 * 3600 * 1000);
-                    let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
-                    tracing::debug!(uid = %acct.uid, remaining = m.total_remaining, threshold, "[Quota] WorkBuddy 账号剩余低于阈值 → 标记耗尽切换");
-                } else {
-                    let _ = workbuddy::pool::clear_exhausted(&provider_id, &acct.uid);
+                // guard_metrics None(Accounts 缺/空,异常态)→ 跳过守护更新,不据此误 bench。
+                if let Some(m) = guard_metrics(&json) {
+                    if m.total_remaining < threshold {
+                        // 标记耗尽到下次刷新(无基础包则 +6h 退避周期重查)。
+                        let until = m
+                            .next_refresh_ms
+                            .unwrap_or_else(|| workbuddy::token::unix_now_ms() + 6 * 3600 * 1000);
+                        let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
+                        tracing::debug!(uid = %acct.uid, remaining = m.total_remaining, threshold, "[Quota] WorkBuddy 账号剩余低于阈值 → 标记耗尽切换");
+                    } else {
+                        let _ = workbuddy::pool::clear_exhausted(&provider_id, &acct.uid);
+                    }
                 }
                 if active_uid.as_deref() == Some(acct.uid.as_str()) {
                     active_quota = Some(parse_workbuddy_quota(&json));
@@ -1521,12 +1523,24 @@ async fn fetch_workbuddy_quota(
 async fn run_workbuddy_guard(http: &Option<reqwest::Client>) {
     use crate::workbuddy_quota::{fetch_workbuddy_resource, guard_metrics};
     use codex_app_transfer_gemini_oauth::workbuddy;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    // **节流**:daemon 每 5s tick 调本函数,但守护无需这么勤 —— 耗尽窗口以小时计。且更关键:
+    // 高频 poll `get-user-resource` 本身会成为风控指纹(真实 CodeBuddy 客户端不会每 5s 查额度)。
+    // 至少间隔 60s 跑一次(面板开则走 fetch_workbuddy_quota 的 45s 缓存,二者都不会高频打)。
+    static LAST_RUN_MS: AtomicI64 = AtomicI64::new(0);
+    const GUARD_MIN_INTERVAL_MS: i64 = 60_000;
+    let now = workbuddy::token::unix_now_ms();
+    if now - LAST_RUN_MS.load(Ordering::Relaxed) < GUARD_MIN_INTERVAL_MS {
+        return;
+    }
     let Some((provider_id, api_key)) = active_workbuddy_provider() else {
         return;
     };
     if api_key.is_some() {
         return; // API-key 单账号无池,无需守护
     }
+    // 确定要跑了(WorkBuddy 池活跃)再记时间,避免非活跃期把 LAST_RUN 顶到未来误抑制。
+    LAST_RUN_MS.store(now, Ordering::Relaxed);
     let Some(http) = http.as_ref() else {
         return;
     };
@@ -1540,14 +1554,16 @@ async fn run_workbuddy_guard(http: &Option<reqwest::Client>) {
             continue;
         };
         if let Ok(json) = fetch_workbuddy_resource(http, &token).await {
-            let m = guard_metrics(&json);
-            if m.total_remaining < threshold {
-                let until = m
-                    .next_refresh_ms
-                    .unwrap_or_else(|| workbuddy::token::unix_now_ms() + 6 * 3600 * 1000);
-                let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
-            } else {
-                let _ = workbuddy::pool::clear_exhausted(&provider_id, &acct.uid);
+            // guard_metrics None(Accounts 缺/空,异常态)→ 跳过守护更新,不据此误 bench 健康账号。
+            if let Some(m) = guard_metrics(&json) {
+                if m.total_remaining < threshold {
+                    let until = m
+                        .next_refresh_ms
+                        .unwrap_or_else(|| workbuddy::token::unix_now_ms() + 6 * 3600 * 1000);
+                    let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
+                } else {
+                    let _ = workbuddy::pool::clear_exhausted(&provider_id, &acct.uid);
+                }
             }
         }
     }

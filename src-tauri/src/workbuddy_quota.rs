@@ -106,13 +106,18 @@ pub struct GuardMetrics {
     pub next_refresh_ms: Option<i64>,
 }
 
-/// 从 `get-user-resource` 响应抽守护指标(纯函数)。
-pub fn guard_metrics(json: &Value) -> GuardMetrics {
+/// 从 `get-user-resource` 响应抽守护指标(纯函数)。**`Accounts` 缺失/空 → `None`**:
+/// schema 漂移 / 新账号 / 异常态下不可与「真零余额」混淆,返 None 让 caller 当瞬时错跳过守护
+/// (否则会把健康账号误判耗尽 bench)。
+pub fn guard_metrics(json: &Value) -> Option<GuardMetrics> {
+    let accounts = json
+        .pointer("/data/Response/Data/Accounts")
+        .and_then(Value::as_array)?;
+    if accounts.is_empty() {
+        return None;
+    }
     let mut total_remaining = 0.0;
     let mut next_refresh_ms = None;
-    if let Some(accounts) = json
-        .pointer("/data/Response/Data/Accounts")
-        .and_then(Value::as_array)
     {
         for acc in accounts {
             let used =
@@ -133,10 +138,10 @@ pub fn guard_metrics(json: &Value) -> GuardMetrics {
             }
         }
     }
-    GuardMetrics {
+    Some(GuardMetrics {
         total_remaining,
         next_refresh_ms,
-    }
+    })
 }
 
 fn parse_workbuddy_quota_in(json: &Value, lang: Language) -> ProviderQuota {

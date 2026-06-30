@@ -2,10 +2,12 @@
 //!
 //! 一个 `workbuddy-login` provider 维护一个账号池([`token`] 的 `<provider_id>/<uid>.json`)。
 //! 代理转发时 [`select_serving_account`] 选一个「当前服务账号」并自动续期 token;某账号被
-//! 额度守护 / 反应式失败转移标记 `exhausted_until`(见 [`set_exhausted`])后,选择器自动跳到
-//! 下一个可用账号(sticky:不切则一直用同一个,直到它被标记耗尽)。
+//! 额度守护标记 `exhausted_until`(见 [`set_exhausted`])后,选择器自动跳到下一个可用账号
+//! (sticky:不切则一直用同一个,直到它被标记耗尽)。
 //!
-//! **额度守护本身**(总剩余 < 阈值 → 标记耗尽)在 quota 守护进程算,这里只消费 `exhausted_until`。
+//! **切换由额度守护驱动**(quota 守护进程:某账号总剩余 < 阈值 → 标记耗尽),本模块只消费
+//! `exhausted_until`。`set_exhausted` 也预留给未来的反应式失败转移(撞耗尽错误即标记),当前
+//! 仅守护一条路调用。
 //! **每账号独立 device_id**(登录生成、存账号文件)由 [`add_account`] 分配,避免多账号同设备被风控关联。
 
 use super::token::{
@@ -123,8 +125,8 @@ pub fn add_account(
     Ok(uid)
 }
 
-/// 标记账号耗尽到 `until_ms`(配额守护:剩余<阈值 → 该账号会刷新的包 CycleEndTime;
-/// 反应式失败转移:now + 短退避)。`until_ms <= now` 等价清除。
+/// 标记账号耗尽到 `until_ms`(配额守护:剩余<阈值 → 该账号会刷新的包 CycleEndTime)。
+/// `until_ms <= now` 等价清除。(未来反应式失败转移可复用本函数,传 now + 短退避。)
 pub fn set_exhausted(provider_id: &str, uid: &str, until_ms: i64) -> Result<(), WorkbuddyError> {
     let store = WorkbuddyPoolStore::for_provider(provider_id)?;
     let mut pool = store.load()?;
