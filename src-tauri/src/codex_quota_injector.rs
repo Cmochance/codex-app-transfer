@@ -718,9 +718,12 @@ fn fmt_reset_local(rfc3339: Option<&str>) -> Option<String> {
 /// 剩余 ≤10% 标红预警(`hot`,由 JS 上色——额度类红色判定与 used 类相反,故显式传)。
 fn quota_bar(w: &QuotaWindow) -> serde_json::Value {
     let pct = w.remaining_percent.round() as i64;
+    // 明细文案:有自定义明细(WorkBuddy 积分包「253.62 / 500 · 246.38 剩余」)优先用它,
+    // 否则用「剩余%」;两者都可再拼上绝对重置时间点。
+    let head = w.detail.clone().unwrap_or_else(|| format!("{pct}%"));
     let detail = match fmt_reset_local(w.reset_rfc3339.as_deref()) {
-        Some(t) => format!("{pct}% · {t} 刷新"),
-        None => format!("{pct}%"),
+        Some(t) => format!("{head} · {t} 刷新"),
+        None => head,
     };
     json!({"kind":"bar","cls":"quota","label":w.label,"pct":pct,"detail":detail,"hot":pct <= 10})
 }
@@ -735,6 +738,10 @@ fn quota_rows(quota: Option<&ProviderQuota>) -> Vec<serde_json::Value> {
     // 先三槽窗口 bar(5h/周/月,RollingWindows::iter 固定序),再数值条目(DeepSeek 余额等)。
     // stat 行无进度条:注入脚本 buildRow 对非 bar/duo/ctx 的 kind 落 `cqs`(label + detail)分支渲染。
     let mut rows: Vec<serde_json::Value> = q.rolling.iter().map(quota_bar).collect();
+    // 聚合额度 bar(仅 WorkBuddy 赠送包):排在三槽滚动 bar 之后、数值条目之前。
+    if let Some(agg) = &q.aggregate {
+        rows.push(quota_bar(agg));
+    }
     rows.extend(
         q.stats
             .iter()
@@ -993,6 +1000,43 @@ fn active_trae_provider() -> Option<(String, String)> {
         .api_host
         .to_string();
     Some((id, api_host))
+}
+
+/// 活动 provider 是 WorkBuddy(腾讯 CodeBuddy)→ `(provider id, api_key)`。token 取法:
+/// - **账号登录**(authScheme=`workbuddy_oauth`/`workbuddy_login`)→ `api_key=None`,由
+///   [`fetch_workbuddy_quota`] 走 `ensure_valid_workbuddy_token`(含 refresh);
+/// - **API-key**(authScheme=`bearer` 且 host=`copilot.tencent.com`)→ `api_key=Some(粘贴 key)`。
+///
+/// 两路 token 都能读 `get-user-resource`(真机实测)。否则 None(不显额度行)。
+fn active_workbuddy_provider() -> Option<(String, Option<String>)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+    let auth_scheme = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+    // host 带点边界匹配(`x == d || x.ends_with(".d")`),防 `notcopilot.tencent.com` 误判。
+    let is_wb_host = host_of(base_url)
+        .map(|h| h == "copilot.tencent.com" || h.ends_with(".copilot.tencent.com"))
+        .unwrap_or(false);
+    match auth_scheme {
+        "workbuddy_oauth" | "workbuddy_login" => Some((id, None)),
+        "bearer" if is_wb_host => {
+            let key = p
+                .get("apiKey")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            Some((id, Some(key)))
+        }
+        _ => None,
+    }
 }
 
 /// [MOC-211] MiMo Token Plan 的额度源接线规格:host `xiaomimimo.com` + 路径含 `token-plan`
@@ -1305,6 +1349,77 @@ async fn fetch_trae_quota(
         }
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] Trae quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// 取 WorkBuddy 积分额度(基础体验包 + 活动赠送包)。非 WorkBuddy → 清缓存 + None。
+/// token:API-key 直用粘贴 key;账号登录走 `ensure_valid_workbuddy_token`(含 refresh + 落盘),
+/// 未登录/refresh 失效 → 清缓存。45s 缓存,指纹按 (provider id, uid=JWT sub) —— 不按 token
+/// (每次 refresh 都变,按 token 会让续期后紧跟的瞬时失败误清缓存,对齐 Trae)。
+async fn fetch_workbuddy_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::workbuddy_quota::{fetch_workbuddy_quota_summary, QuotaError};
+    use codex_app_transfer_gemini_oauth::workbuddy;
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((provider_id, api_key)) = active_workbuddy_provider() else {
+        *cache = None;
+        return None;
+    };
+    let http = http.as_ref()?;
+    // 取 token:API-key 直接用;账号登录走 ensure_valid(含 refresh + 落盘)。
+    let token = match api_key {
+        Some(k) => k,
+        None => {
+            let store = match workbuddy::WorkbuddyCredentialStore::from_home_env() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "[Quota] WorkBuddy store 构造失败 → 清额度缓存");
+                    *cache = None;
+                    return None;
+                }
+            };
+            match workbuddy::ensure_valid_workbuddy_token(http, &store).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(provider_id, error = %e, "[Quota] WorkBuddy 无有效 token(未登录/refresh 失效)→ 清额度缓存");
+                    *cache = None;
+                    return None;
+                }
+            }
+        }
+    };
+    let uid = workbuddy::user_id_from_jwt(&token).unwrap_or_default();
+    let fp = quota_fingerprint(&[&provider_id, &uid]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    match fetch_workbuddy_quota_summary(http, &token).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] WorkBuddy quota 鉴权失败 → 清额度缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] WorkBuddy quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
             match cache.as_mut() {
                 Some((cfp, q, at)) if *cfp == fp => {
                     *at = std::time::Instant::now();
@@ -1651,6 +1766,7 @@ pub async fn run_quota_daemon() {
     let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut trae_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut workbuddy_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1686,6 +1802,7 @@ pub async fn run_quota_daemon() {
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
         let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
         let trae = fetch_trae_quota(&quota_http, &mut trae_cache).await;
+        let workbuddy = fetch_workbuddy_quota(&quota_http, &mut workbuddy_cache).await;
         // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
         let quota = antigravity
             .or(glm)
@@ -1696,6 +1813,7 @@ pub async fn run_quota_daemon() {
             .or(anyrouter)
             .or(moonshot)
             .or(trae)
+            .or(workbuddy)
             .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
@@ -1936,6 +2054,40 @@ mod tests {
         assert_eq!(rows[0]["kind"], "stat");
         assert_eq!(rows[0]["label"], "余额");
         assert_eq!(rows[0]["detail"], "¥5.37");
+    }
+
+    #[test]
+    fn quota_rows_renders_workbuddy_aggregate_bar_after_rolling() {
+        // WorkBuddy:基础体验包(monthly 槽)+ 活动赠送包(aggregate)→ 2 条 bar,
+        // 聚合 bar 排在滚动 bar 之后;custom detail 显绝对量;体验包拼刷新时间。
+        use crate::provider_quota::{QuotaWindow, RollingWindows};
+        let q = ProviderQuota {
+            rolling: RollingWindows {
+                monthly: Some(QuotaWindow::credit_bar(
+                    "基础体验包",
+                    49.0,
+                    "253.62 / 500 · 246.38 剩余",
+                    Some("2026-07-01T00:00:00+08:00".into()),
+                )),
+                ..Default::default()
+            },
+            aggregate: Some(QuotaWindow::credit_bar(
+                "活动赠送包",
+                100.0,
+                "0 / 3350 · 3350 剩余",
+                None,
+            )),
+            ..Default::default()
+        };
+        let rows = quota_rows(Some(&q));
+        assert_eq!(rows.len(), 2, "体验包 + 赠送包 两条 bar");
+        assert_eq!(rows[0]["label"], "基础体验包");
+        let d0 = rows[0]["detail"].as_str().unwrap();
+        assert!(d0.contains("253.62 / 500"), "custom 明细显绝对量");
+        assert!(d0.contains("刷新"), "体验包拼上刷新时间");
+        assert_eq!(rows[1]["label"], "活动赠送包");
+        assert_eq!(rows[1]["detail"], "0 / 3350 · 3350 剩余");
+        assert_eq!(rows[1]["pct"], 100);
     }
 
     #[test]

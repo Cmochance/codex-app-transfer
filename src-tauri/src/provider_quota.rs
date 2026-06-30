@@ -21,6 +21,28 @@ pub struct QuotaWindow {
     pub remaining_percent: f64,
     /// 重置时刻(RFC3339;各 parser 把自家时间格式统一转 RFC3339)。None=不显刷新时间。
     pub reset_rfc3339: Option<String>,
+    /// 自定义明细文案(覆盖默认「剩余%」)。`None` = 默认行为(渲染器显「剩余%」)。
+    /// 给需要显**绝对量**的「积分包」类 provider 用(WorkBuddy「253.62 / 500 · 246.38 剩余」);
+    /// 与 `reset_rfc3339` 可并存,渲染器拼成「<detail> · <reset> 刷新」。
+    pub detail: Option<String>,
+}
+
+impl QuotaWindow {
+    /// 「积分包」式 bar:自带绝对量明细(`detail`)。给 WorkBuddy 等按 used/total 显示的 provider 用。
+    /// `remaining_percent` 自动 clamp 0-100。
+    pub fn credit_bar(
+        label: impl Into<String>,
+        remaining_percent: f64,
+        detail: impl Into<String>,
+        reset_rfc3339: Option<String>,
+    ) -> Self {
+        QuotaWindow {
+            label: label.into(),
+            remaining_percent: remaining_percent.clamp(0.0, 100.0),
+            reset_rfc3339,
+            detail: Some(detail.into()),
+        }
+    }
 }
 
 /// 纯数值条目(无百分比语义 → 不画进度条):如「余额 ¥5.37」。
@@ -87,20 +109,24 @@ fn make_window(
         label: label.into(),
         remaining_percent: remaining_percent.clamp(0.0, 100.0),
         reset_rfc3339: reset,
+        detail: None,
     }
 }
 
-/// 一个 provider 的额度(三槽滚动窗口 + 数值条目)。两者皆空 = 不显额度行。
+/// 一个 provider 的额度(三槽滚动窗口 + 聚合额度 bar + 数值条目)。三者皆空 = 不显额度行。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderQuota {
     pub rolling: RollingWindows,
+    /// **聚合额度** bar —— 仅 WorkBuddy 用,显「活动赠送包」(多个赠送子包聚合成一条 bar)。
+    /// 其它 provider 恒 `None`(零影响)。渲染在三槽滚动 bar 之后、stats 之前。
+    pub aggregate: Option<QuotaWindow>,
     pub stats: Vec<QuotaStat>,
 }
 
 impl ProviderQuota {
-    /// 是否有任一窗口/条目(caller 判定要不要显示额度行)。
+    /// 是否有任一窗口/聚合/条目(caller 判定要不要显示额度行)。
     pub fn has_any(&self) -> bool {
-        !self.rolling.is_empty() || !self.stats.is_empty()
+        !self.rolling.is_empty() || self.aggregate.is_some() || !self.stats.is_empty()
     }
 }
 
