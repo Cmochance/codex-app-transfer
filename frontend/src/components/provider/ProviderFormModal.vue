@@ -15,6 +15,7 @@ import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import IconEye from '~icons/lucide/eye'
 import IconEyeOff from '~icons/lucide/eye-off'
 import OAuthLoginSection from '@/components/provider/OAuthLoginSection.vue'
+import WorkbuddyPoolSection from '@/components/provider/WorkbuddyPoolSection.vue'
 import { oauthClaimPending, type OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
 
@@ -569,7 +570,14 @@ async function save() {
         <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
       <SettingsRow v-if="oauthKind" :title="t('providerForm.account')">
+        <!-- WorkBuddy:单 provider 账号池(多账号 + 额度守护自动切换),非单账号登录区 -->
+        <WorkbuddyPoolSection
+          v-if="oauthKind === 'workbuddy'"
+          key="wbpool"
+          :provider-id="props.editId ?? undefined"
+        />
         <OAuthLoginSection
+          v-else
           :key="oauthKind"
           :kind="oauthKind!"
           :provider-id="props.editId ?? undefined"

@@ -1,33 +1,34 @@
 //! `/api/workbuddy-oauth/*` admin handlers — WorkBuddy(腾讯 CodeBuddy)账号登录
 //! (external-link 轮询式 OAuth)登录 / 状态 / 注销 / 取消。
 //!
-//! 跟 [`super::zai_oauth`] / [`super::trae_oauth`] **并行**,但 WorkBuddy wire 更简单:
-//! 1. **单账号**:一个本地 `workbuddy-oauth.json`,无 provider id keying(对齐"一个网关
-//!    一套登录态")。前端传的 `providerId` 接受但忽略。
+//! 跟 [`super::zai_oauth`] / [`super::trae_oauth`] **并行**:
+//! 1. **单 provider 多账号池**:所有路由按 `?providerId=<id>` 隔离账号池(一个 workbuddy-login
+//!    provider = 一个池,见 [`workbuddy::pool`])。status 列池内账号 + 当前服务账号;login 加一个
+//!    账号入池;account 移除单账号;switch 手动切当前服务账号。额度守护按总剩余自动切换。
 //! 2. **轮询式**(非 loopback):`run_workbuddy_login` 请求 state → 回调里开内置 webview
 //!    加载 authUrl → 轮询 `/auth/token` 拿凭证。用户关窗 = 取消。
-//! 3. **有 refresh**:access token 过期前 5min 由 `ensure_valid_workbuddy_token` 自动
-//!    refresh(`X-Refresh-Token` 头),不像 zai/trae 过期即重登。
+//! 3. **有 refresh**:access token 过期前 5min 自动 refresh(`X-Refresh-Token` 头)。
 //!
 //! ## 路由
-//! - `GET    /api/workbuddy-oauth/status`
-//! - `POST   /api/workbuddy-oauth/login`
-//! - `DELETE /api/workbuddy-oauth/login/cancel`
-//! - `DELETE /api/workbuddy-oauth/logout`
+//! - `GET    /api/workbuddy-oauth/status?providerId=<id>`   列池内账号
+//! - `POST   /api/workbuddy-oauth/login?providerId=<id>`    加账号入池
+//! - `DELETE /api/workbuddy-oauth/login/cancel`             取消 in-flight 登录
+//! - `DELETE /api/workbuddy-oauth/account?providerId&uid`   移除单账号
+//! - `POST   /api/workbuddy-oauth/switch?providerId&uid`    手动切当前服务账号
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{delete, get, post},
     Router,
 };
-use codex_app_transfer_gemini_oauth::workbuddy::{
-    run_workbuddy_login, WorkbuddyCredentialStore, WorkbuddyError,
-};
+use codex_app_transfer_gemini_oauth::workbuddy::{pool, run_workbuddy_login, WorkbuddyError};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -37,6 +38,32 @@ use crate::web_session_quota;
 
 /// 内置登录 webview 窗口 label。
 const WORKBUDDY_LOGIN_WIN: &str = "workbuddy-oauth-login";
+
+/// 多账号:所有路由按 `providerId` 隔离账号池(一个 workbuddy-login provider = 一个池)。
+#[derive(Debug, Deserialize)]
+struct ProviderIdQuery {
+    #[serde(rename = "providerId", default)]
+    provider_id: String,
+}
+
+/// 账号级操作(移除 / 切换)额外带目标账号 `uid`。
+#[derive(Debug, Deserialize)]
+struct AccountQuery {
+    #[serde(rename = "providerId", default)]
+    provider_id: String,
+    #[serde(rename = "uid", default)]
+    uid: String,
+}
+
+/// trim 后非空才有效;空 = provider 未保存,账号池无处安放。
+fn nonempty(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
 
 // ── 进程级 cancel slot(独立于 zai / trae / gemini-cli)─────────────────
 
@@ -157,13 +184,19 @@ fn shared_workbuddy_http_client() -> Result<&'static reqwest::Client, &'static s
 
 pub fn routes() -> Router<AdminState> {
     Router::new()
+        // status?providerId → 列池内账号(多账号);login?providerId → 加账号入池
         .route("/api/workbuddy-oauth/status", get(status_handler))
         .route("/api/workbuddy-oauth/login", post(login_handler))
         .route(
             "/api/workbuddy-oauth/login/cancel",
             delete(cancel_login_handler),
         )
-        .route("/api/workbuddy-oauth/logout", delete(logout_handler))
+        // account?providerId&uid → 移除单账号;switch?providerId&uid → 手动切当前服务账号
+        .route(
+            "/api/workbuddy-oauth/account",
+            delete(remove_account_handler),
+        )
+        .route("/api/workbuddy-oauth/switch", post(switch_handler))
 }
 
 async fn cancel_login_handler() -> impl IntoResponse {
@@ -175,35 +208,48 @@ async fn cancel_login_handler() -> impl IntoResponse {
     Json(json!({ "cancelled": outcome.cancelled })).into_response()
 }
 
-async fn status_handler() -> impl IntoResponse {
-    let store = match WorkbuddyCredentialStore::from_home_env() {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("home directory unavailable: {e}"),
-            )
-            .into_response()
-        }
+async fn status_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
+    // providerId 空(provider 未保存)→ 空池(前端显「先保存再添加账号」)。
+    let Some(provider_id) = nonempty(&q.provider_id) else {
+        return Json(json!({ "loggedIn": false, "accounts": [] })).into_response();
     };
-    match store.load() {
-        Ok(None) => Json(json!({ "loggedIn": false })).into_response(),
-        Ok(Some(cred)) => Json(json!({
-            "loggedIn": true,
-            "nickname": cred.nickname,
-            "userId": cred.uid,
-            "obtainedAt": cred.obtained_at_ms,
-        }))
-        .into_response(),
+    match pool::list_pool(provider_id) {
+        Ok(accounts) => {
+            let now = codex_app_transfer_gemini_oauth::workbuddy::token::unix_now_ms();
+            let list: Vec<_> = accounts
+                .iter()
+                .map(|a| {
+                    json!({
+                        "uid": a.uid,
+                        "display": a.display,
+                        "nickname": a.nickname,
+                        "isActive": a.is_active,
+                        // exhausted_until > now → 当前因额度耗尽被跳过(UI 标「额度不足」)
+                        "exhausted": a.exhausted_until > now,
+                        "exhaustedUntil": a.exhausted_until,
+                    })
+                })
+                .collect();
+            Json(json!({ "loggedIn": !list.is_empty(), "accounts": list })).into_response()
+        }
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("workbuddy credential store load: {e}"),
+            format!("workbuddy pool load: {e}"),
         )
         .into_response(),
     }
 }
 
-async fn login_handler() -> impl IntoResponse {
+async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
+    // 多账号:登录必须落到一个已保存的 provider 的账号池里;providerId 空 = provider 未保存。
+    let Some(provider_id) = nonempty(&q.provider_id) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "请先保存该 provider 再添加账号(providerId 为空)".to_string(),
+        )
+        .into_response();
+    };
+    let provider_id = provider_id.to_string();
     let my_epoch = next_epoch();
     // Drop 时广播本次 epoch 完成,让 app 退出路径的 wait_for_login_epoch_complete 能等到。
     let _done_guard = LoginDoneGuard { epoch: my_epoch };
@@ -274,31 +320,23 @@ async fn login_handler() -> impl IntoResponse {
 
     match result {
         Ok(cred) => {
-            // 落盘到 workbuddy-oauth.json(forward.rs 请求时 load + 自动 refresh)。
-            let store = match WorkbuddyCredentialStore::from_home_env() {
-                Ok(s) => s,
-                Err(e) => {
-                    return err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("home directory unavailable: {e}"),
-                    )
-                    .into_response()
-                }
-            };
-            if let Err(e) = store.save(&cred) {
-                return err(
+            let nickname = cred.nickname.clone();
+            let obtained_at = cred.obtained_at_ms;
+            // 加账号入池:分配/复用本账号 device_id + 写 <provider_id>/<uid>.json + 更新池。
+            match pool::add_account(&provider_id, cred) {
+                Ok(uid) => Json(json!({
+                    "loggedIn": true,
+                    "nickname": nickname,
+                    "userId": uid,
+                    "obtainedAt": obtained_at,
+                }))
+                .into_response(),
+                Err(e) => err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("workbuddy credential save failed: {e}"),
+                    format!("workbuddy add account failed: {e}"),
                 )
-                .into_response();
+                .into_response(),
             }
-            Json(json!({
-                "loggedIn": true,
-                "nickname": cred.nickname,
-                "userId": cred.uid,
-                "obtainedAt": cred.obtained_at_ms,
-            }))
-            .into_response()
         }
         Err(WorkbuddyError::Cancelled) => {
             tracing::info!("workbuddy OAuth login cancelled — 不落盘");
@@ -311,26 +349,42 @@ async fn login_handler() -> impl IntoResponse {
     }
 }
 
-async fn logout_handler() -> impl IntoResponse {
-    web_session_quota::close_external_login_window(WORKBUDDY_LOGIN_WIN);
-    let store = match WorkbuddyCredentialStore::from_home_env() {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("home directory unavailable: {e}"),
-            )
-            .into_response()
-        }
-    };
-    if let Err(e) = store.delete() {
+/// 移除池内单账号(UI「移除」)。providerId + uid 必填。
+async fn remove_account_handler(Query(q): Query<AccountQuery>) -> impl IntoResponse {
+    let (Some(provider_id), Some(uid)) = (nonempty(&q.provider_id), nonempty(&q.uid)) else {
         return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("workbuddy credential delete failed: {e}"),
+            StatusCode::BAD_REQUEST,
+            "providerId / uid 不能为空".to_string(),
         )
         .into_response();
+    };
+    match pool::remove_account(provider_id, uid) {
+        Ok(()) => Json(json!({ "removed": true })).into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("workbuddy remove account failed: {e}"),
+        )
+        .into_response(),
     }
-    Json(json!({ "loggedIn": false })).into_response()
+}
+
+/// 手动切换当前服务账号(UI「设为当前」)。providerId + uid 必填。
+async fn switch_handler(Query(q): Query<AccountQuery>) -> impl IntoResponse {
+    let (Some(provider_id), Some(uid)) = (nonempty(&q.provider_id), nonempty(&q.uid)) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "providerId / uid 不能为空".to_string(),
+        )
+        .into_response();
+    };
+    match pool::set_active(provider_id, uid) {
+        Ok(()) => Json(json!({ "active": uid })).into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("workbuddy switch account failed: {e}"),
+        )
+        .into_response(),
+    }
 }
 
 #[cfg(test)]

@@ -21,12 +21,17 @@
 use std::sync::OnceLock;
 
 pub mod login;
+pub mod pool;
 pub mod token;
 
 pub use login::{
     ensure_valid_workbuddy_token, refresh_workbuddy_token, run_workbuddy_login, WorkbuddyError,
 };
-pub use token::{WorkbuddyCredential, WorkbuddyCredentialStore, WorkbuddyTokenError};
+pub use pool::{add_account, select_serving_account, PoolAccount, ServingAccount};
+pub use token::{
+    list_accounts, PoolState, WorkbuddyCredential, WorkbuddyCredentialStore, WorkbuddyPoolStore,
+    WorkbuddyTokenError,
+};
 
 /// WorkBuddy 模型网关 host —— `injects_workbuddy_source_headers` 据此判定是否注入
 /// coding 指纹。staging / 正式 / codebuddy.cn 均含 `tencent.com`/`codebuddy`,这里
@@ -138,16 +143,47 @@ fn conversation_id() -> String {
     CACHE.get_or_init(uuid_v4).clone()
 }
 
-/// 从 Bearer access token(Keycloak JWT)的 payload 解出 `sub` claim 作 `X-User-Id`。
-/// **不验签**(只读 claim;真实客户端的 X-User-Id 也来自登录态 uid)。解析失败返 None。
-pub fn user_id_from_jwt(token: &str) -> Option<String> {
+/// 解 Bearer access token(Keycloak JWT)的 payload 成 JSON。**不验签**(只读 claim)。
+fn jwt_payload(token: &str) -> Option<serde_json::Value> {
     use base64::Engine;
     let payload_b64 = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("sub")?.as_str().map(|s| s.to_string())
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 从 access token 的 `sub` claim 解 `X-User-Id`(= 账号唯一 uid)。解析失败返 None。
+pub fn user_id_from_jwt(token: &str) -> Option<String> {
+    jwt_payload(token)?
+        .get("sub")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// 中国手机号脱敏 `183****5600`(11 位保留前 3 后 4);其它长度原样。
+fn mask_phone(p: &str) -> String {
+    let chars: Vec<char> = p.chars().collect();
+    if chars.len() == 11 && chars.iter().all(|c| c.is_ascii_digit()) {
+        format!(
+            "{}****{}",
+            chars[..3].iter().collect::<String>(),
+            chars[7..].iter().collect::<String>()
+        )
+    } else {
+        p.to_string()
+    }
+}
+
+/// 账号**人类可读标签**(UI 显示用,替代不可读的 uid)。默认显示脱敏手机号
+/// (`preferred_username`,WorkBuddy 登录身份、各账号唯一),不显示昵称。
+/// 取不到手机号 → None(caller 退回短 uid)。
+pub fn account_display_from_jwt(token: &str) -> Option<String> {
+    jwt_payload(token)?
+        .get("preferred_username")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(mask_phone)
 }
 
 /// 完整 coding 模式 wire 指纹头集合(① 固定身份 + ③ 每请求 UUID)。

@@ -97,6 +97,53 @@ pub fn parse_workbuddy_quota(json: &Value) -> ProviderQuota {
     parse_workbuddy_quota_in(json, current_language())
 }
 
+/// 配额守护指标 —— 账号池切换决策用(展示无关)。
+pub struct GuardMetrics {
+    /// 所有包剩余之和(基础包 + 赠送包)。守护:< 阈值即标记该账号耗尽、切下一个。
+    pub total_remaining: f64,
+    /// 基础包下次刷新时刻(ms epoch);标记耗尽到此刻、刷新后自动回池。无基础包(只赠送包
+    /// 不刷新)则 None,caller 用固定退避兜底。
+    pub next_refresh_ms: Option<i64>,
+}
+
+/// 从 `get-user-resource` 响应抽守护指标(纯函数)。**`Accounts` 缺失/空 → `None`**:
+/// schema 漂移 / 新账号 / 异常态下不可与「真零余额」混淆,返 None 让 caller 当瞬时错跳过守护
+/// (否则会把健康账号误判耗尽 bench)。
+pub fn guard_metrics(json: &Value) -> Option<GuardMetrics> {
+    let accounts = json
+        .pointer("/data/Response/Data/Accounts")
+        .and_then(Value::as_array)?;
+    if accounts.is_empty() {
+        return None;
+    }
+    let mut total_remaining = 0.0;
+    let mut next_refresh_ms = None;
+    {
+        for acc in accounts {
+            let used =
+                read_amount(acc, "CycleCapacityUsedPrecise", "CycleCapacityUsed").unwrap_or(0.0);
+            let size =
+                read_amount(acc, "CycleCapacitySizePrecise", "CycleCapacitySize").unwrap_or(0.0);
+            let remain = read_amount(acc, "CycleCapacityRemainPrecise", "CycleCapacityRemain")
+                .unwrap_or_else(|| (size - used).max(0.0));
+            total_remaining += remain;
+            let is_base = acc.get("CapacityType").and_then(Value::as_i64) == Some(4);
+            if is_base && next_refresh_ms.is_none() {
+                next_refresh_ms = acc
+                    .get("CycleEndTime")
+                    .and_then(Value::as_str)
+                    .and_then(next_refresh_rfc3339)
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.timestamp_millis());
+            }
+        }
+    }
+    Some(GuardMetrics {
+        total_remaining,
+        next_refresh_ms,
+    })
+}
+
 fn parse_workbuddy_quota_in(json: &Value, lang: Language) -> ProviderQuota {
     let Some(accounts) = json
         .pointer("/data/Response/Data/Accounts")
@@ -151,12 +198,13 @@ fn parse_workbuddy_quota_in(json: &Value, lang: Language) -> ProviderQuota {
     }
 }
 
-/// 调 `get-user-resource` 取额度。`token` = Bearer(API-key 或账号登录 access token)。
-/// best-effort:失败按 [`QuotaError`] 分类。
-pub async fn fetch_workbuddy_quota_summary(
+/// 调 `get-user-resource` 取**原始 json**(`get-user-resource` 响应)。`token` = Bearer
+/// (API-key 或账号登录 access token)。best-effort:失败按 [`QuotaError`] 分类。
+/// 显示走 [`parse_workbuddy_quota`],守护走 [`guard_metrics`],共用此 json。
+pub async fn fetch_workbuddy_resource(
     http: &reqwest::Client,
     token: &str,
-) -> Result<ProviderQuota, QuotaError> {
+) -> Result<Value, QuotaError> {
     let url = format!(
         "https://{}/v2/billing/meter/get-user-resource",
         codex_app_transfer_gemini_oauth::workbuddy::WORKBUDDY_HOST
@@ -189,7 +237,17 @@ pub async fn fetch_workbuddy_quota_summary(
             "WorkBuddy quota code != 0: {msg}"
         )));
     }
-    Ok(parse_workbuddy_quota(&json))
+    Ok(json)
+}
+
+/// 取额度并解析成显示用 [`ProviderQuota`](API-key 单账号路用)。
+pub async fn fetch_workbuddy_quota_summary(
+    http: &reqwest::Client,
+    token: &str,
+) -> Result<ProviderQuota, QuotaError> {
+    Ok(parse_workbuddy_quota(
+        &fetch_workbuddy_resource(http, token).await?,
+    ))
 }
 
 #[cfg(test)]

@@ -1780,6 +1780,10 @@ async fn build_and_send_upstream(
     // 它注 Bearer。两个 provider 共用 cloudcode-pa 上游但 token 文件 + refresh
     // 用不同 client_id/secret(antigravity 走 ensure_valid_antigravity_token,
     // gemini-cli 走 ensure_valid_access_token)。
+    // WorkBuddy 多账号池:WorkbuddyOauth 路选中的服务账号 (uid, device_id) —— 注入 X-Device-Id
+    // 用账号专属指纹(防风控关联)。uid 暂存供未来反应式失败转移按账号标记;其它路保持 None
+    // (用全局 device-id)。
+    let mut workbuddy_account: Option<(String, String)> = None;
     let oauth_bearer: Option<String> = match resolved.auth_scheme {
         crate::resolver::AuthScheme::GoogleOauthCloudCode => {
             let store =
@@ -1847,23 +1851,16 @@ async fn build_and_send_upstream(
             Some(cred.org_api_key)
         }
         crate::resolver::AuthScheme::WorkbuddyOauth => {
-            // WorkBuddy 账号登录:access token 在 workbuddy-oauth.json,过期前 5min 自动
-            // refresh(`X-Refresh-Token` 头);文件不存在 = 未登录 → needs_login。
-            let store =
-                codex_app_transfer_gemini_oauth::workbuddy::WorkbuddyCredentialStore::from_home_env()
-                    .map_err(|e| ForwardError::OauthUnavailable {
-                        reason: format!(
-                            "home directory unavailable; cannot locate workbuddy token store: {e}"
-                        ),
-                        needs_login: false,
-                    })?;
-            let token = codex_app_transfer_gemini_oauth::workbuddy::ensure_valid_workbuddy_token(
+            // WorkBuddy 多账号池:按 provider id 选当前服务账号(sticky + 额度守护跳过低额账号),
+            // 续期其 token,并带出该账号专属 device_id;池空 = 未登录 → needs_login。
+            let acct = codex_app_transfer_gemini_oauth::workbuddy::select_serving_account(
                 &state.http,
-                &store,
+                &resolved.provider.id,
             )
             .await
             .map_err(classify_workbuddy_service_error)?;
-            Some(token)
+            workbuddy_account = Some((acct.uid, acct.device_id));
+            Some(acct.token)
         }
         _ => None,
     };
@@ -2066,10 +2063,13 @@ async fn build_and_send_upstream(
         {
             up = up.header("X-User-Id", uid);
         }
-        up = up.header(
-            "X-Device-Id",
-            codex_app_transfer_gemini_oauth::workbuddy::workbuddy_device_id(),
-        );
+        // 多账号:WorkbuddyOauth 路用选中账号的专属 device_id(每账号独立设备指纹,防多账号
+        // 同设备被网关风控关联);API-key 路无池 → 全局 device-id(沿用单设备语义)。
+        let device_id = workbuddy_account
+            .as_ref()
+            .map(|(_, dev)| dev.clone())
+            .unwrap_or_else(codex_app_transfer_gemini_oauth::workbuddy::workbuddy_device_id);
+        up = up.header("X-Device-Id", device_id);
     }
     let req = up.build()?;
     let outbound_headers_snapshot = req.headers().clone();

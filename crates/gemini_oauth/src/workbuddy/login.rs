@@ -116,6 +116,9 @@ fn token_to_cred(t: TokenData) -> WorkbuddyCredential {
         obtained_at_ms: now,
         nickname: t.nickname,
         uid,
+        // device_id 是**本地生成的账号专属设备指纹**,不来自上游;由 caller(pool::add_account /
+        // ensure_valid 续期)按「复用既有 / 新登录新生成」补上。
+        device_id: None,
     }
 }
 
@@ -217,10 +220,11 @@ pub async fn refresh_workbuddy_token(
     Ok(token_to_cred(data))
 }
 
-/// 进程级 single-flight refresh 锁 —— 防多个 Codex 请求在 token 进入 refresh 窗口后
-/// 各自并发 refresh:并发会抢同一 `workbuddy-oauth.json.tmp` temp 文件(互相 unlink/rename
-/// 致一方失败)+ 上游 refresh 每次轮换 refresh token(并发调用互相使对方的旧 refresh token
-/// 失效)。对齐 gemini `service::ensure_valid_access_token` 的单飞模式(codex review P2)。
+/// 进程级 single-flight refresh 锁 —— 防多请求在 token 进入 refresh 窗口后各自并发 refresh:
+/// 上游 refresh 每次**轮换** refresh token,并发调用会互相使对方刚拿的旧 refresh token 失效。
+/// (账号文件已是 per-account + 唯一 temp 写,不再有 temp 互撞问题;此锁是全局单飞 —— 跨账号
+/// refresh 也被串行,over-serialize 但单用户下 refresh 罕见、无正确性问题。)对齐 gemini
+/// `service::ensure_valid_access_token`(codex review P2)。
 fn refresh_mutex() -> &'static tokio::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -244,7 +248,13 @@ pub async fn ensure_valid_workbuddy_token(
     if !cred.should_refresh() {
         return Ok(cred.access_token);
     }
-    let fresh = refresh_workbuddy_token(http, &cred.refresh_token).await?;
+    let mut fresh = refresh_workbuddy_token(http, &cred.refresh_token).await?;
+    // 续期只换 token —— 本地账号专属 device_id 必须保留(否则 refresh 后设备指纹丢失、风控隔离失效);
+    // nickname 上游 refresh 不一定回带,也沿用旧值。
+    fresh.device_id = cred.device_id.clone();
+    if fresh.nickname.is_none() {
+        fresh.nickname = cred.nickname.clone();
+    }
     store.save(&fresh)?;
     Ok(fresh.access_token)
 }
