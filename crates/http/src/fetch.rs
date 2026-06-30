@@ -10,8 +10,8 @@
 //! "关闭" 档不在这里 (关闭 = 根本不暴露抓取工具, 由上层判定)。
 //!
 //! ## HTML→markdown (MOC-145)
-//! HTML 内容统一经 [`html_to_markdown`] (htmd, Turndown 思路) 转 markdown 后返回: 比原始
-//! HTML 省 token、更干净。判定走 content-type (curl/wreq 有响应头) + body 嗅探兜底
+//! HTML 内容统一经 [`html_content_to_text`] ([`markdown_or_empty`] = htmd, Turndown 思路) 转
+//! markdown 后返回: 比原始 HTML 省 token、更干净。判定走 content-type (curl/wreq 有响应头) + body 嗅探兜底
 //! (headless 渲染后恒 HTML)。非 HTML (JSON / 纯文本 API 响应) 原样透传, 不破坏结构。
 //!
 //! ## 结构化返回值 [`WebFetchOutcome`] (MOC-181)
@@ -118,6 +118,10 @@ pub async fn web_fetch(
     backend: WebFetchBackend,
     url: &str,
 ) -> Result<WebFetchOutcome, WebFetchError> {
+    // 抓取前 URL 归一 (借鉴 WorkBuddy/CodeBuddy WebFetch normalizeUrl): GitHub blob 代码浏览页
+    // → raw.githubusercontent.com 直链, curl 直接拿文件原文、省一次升档 (见 normalize_fetch_url)。
+    let url = normalize_fetch_url(url);
+    let url = url.as_str();
     // 客户端重定向跟随 (MOC-139): curl/reqwest 只跟 HTTP 3xx, **不跟 HTML meta refresh / JS
     // location** —— 这类页 (如绕 Twitter/Substack title-card feud 的跳转页) curl 拿到的是正文
     // 极少的占位页。占位页 + 解析出重定向 target → 换 URL 重抓 (防循环 + 记 trail)。
@@ -148,11 +152,7 @@ pub async fn web_fetch(
     // 内容按**重定向后的最终 URL** (current) 抽取 —— base url 决定相对链接解析。
     let content = if f.is_html {
         let capped = cap_bytes(&f.body, MAX_HTML_INPUT_BYTES);
-        // 先抽正文 (剥 nav/页眉/页脚/侧栏/广告), 抽取不可靠则回退整页 —— 绝不丢内容。
-        match extract_main_content(&capped, &current) {
-            Some(main) => html_to_markdown(&main),
-            None => html_to_markdown(&capped),
-        }
+        html_content_to_text(&capped, &current)
     } else {
         f.body
     };
@@ -256,7 +256,7 @@ fn precheck_response(
 }
 
 /// 正文抽取 (MOC-152, dom_smoothie / readability.js 移植): 剥 nav/页眉/页脚/侧栏/广告,
-/// 返回正文 article 的清洗后 HTML (交给 [`html_to_markdown`] 转 markdown)。
+/// 返回正文 article 的清洗后 HTML (交给 [`markdown_or_empty`] 转 markdown)。
 ///
 /// 返回 `None` = 抽取不可靠 / 不适用 → 调用方回退整页 (**绝不丢内容**):
 /// - 非文章页 (搜索结果 / 应用 dashboard / API JSON 列表): readability `GrabFailed` —— 预期, 静默;
@@ -861,11 +861,12 @@ fn id_attr_matches(lower: &str, mount: &str) -> bool {
     false
 }
 
-/// 粗算 HTML 去掉 `<script>`/`<style>` 块 + 所有标签后的可见非空白字符数 (启发式, char-safe,
-/// 不求精确 DOM)。用于 [`is_js_shell`]。
-fn visible_text_len(html: &str) -> usize {
+/// 收集 HTML 标签外的可见文本 (剥 `<script>`/`<style>` 块 + 所有标签; **保留** noscript 等其它
+/// 标签内文本)。char-safe 启发式, 不求精确 DOM; 标签边界插一个空格防相邻标签文本粘连。给
+/// [`visible_text_len`] 与 JS 外壳 meta 兜底 (保留正文、剥 script 噪声) 复用。
+fn visible_text(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
-    let mut out = 0usize;
+    let mut out = String::new();
     let mut i = 0usize;
     let n = html.len();
     while i < n {
@@ -888,16 +889,26 @@ fn visible_text_len(html: &str) -> usize {
                 Some(rel) => i += rel + 1,
                 None => break,
             }
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' '); // 标签边界分隔, 防词粘连
+            }
             continue;
         }
         // 标签外的可见字符 (char-safe 推进)。
         let ch = html[i..].chars().next().unwrap_or(' ');
-        if !ch.is_whitespace() {
-            out += 1;
-        }
+        out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// 粗算 HTML 可见非空白字符数 (= [`visible_text`] 的非空白字符计数, 启发式, char-safe)。用于
+/// [`is_js_shell`]。空白边界分隔符不计入 (只数非空白), 故与旧实现计数等价。
+fn visible_text_len(html: &str) -> usize {
+    visible_text(html)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .count()
 }
 
 /// 是否按 HTML 处理 (→ 转 markdown)。content-type 权威: 明确非 HTML (JSON/纯文本) 即
@@ -1191,22 +1202,193 @@ fn resolve_url(target: &str, base_url: &str) -> Option<String> {
         .map(|u| u.to_string())
 }
 
-/// HTML→markdown (htmd, Turndown 思路)。剥 script/style/noscript/svg 噪声; 转换失败或
-/// 转出空 (纯 JS 骨架等) → 回退原 HTML, 绝不丢内容。
-fn html_to_markdown(html: &str) -> String {
+/// HTML 正文 → 给模型的文本, 多级兜底 (绝不丢内容):
+/// ① readability 抽到正文 → markdown 直接返回 (文章页, 维持旧行为);
+/// ② 抽不出正文 + 命中 JS 外壳特征 ([`is_js_shell`]: 可见文本极少 + SPA 骨架 / bundle) → 抽
+///    og/meta 元数据兜底 (借鉴 WorkBuddy WebFetch extractMetaContent): 这类页 markdown 多半是
+///    噪声外壳 / 光秃标题, 而 `<head>` 常 SSR 了 og/meta, 回标题+摘要更有用。**保留页面可见文本**
+///    (含 noscript 等被 htmd 剥掉的标签内文本) 附在 meta 后 —— 绝不丢内容;
+/// ③ 其余 (非外壳的正常页 / 短静态页) → 整页 markdown 原样; 转不出则回退原 HTML, 绝不丢内容。
+fn html_content_to_text(html: &str, url: &str) -> String {
+    // ① 文章页: 信任 readability 抽取结果。
+    if let Some(main) = extract_main_content(html, url) {
+        if let Some(md) = markdown_or_empty(&main) {
+            return md;
+        }
+    }
+    let md = markdown_or_empty(html);
+    // ② SPA 外壳 / 正文靠 JS 渲染 (抽不出正文 + shell 特征): 抽 og/meta 元数据兜底。
+    //    仅对真外壳触发 —— 正常短静态页 (status / snippet) 不命中 is_js_shell, 不受影响。
+    if is_js_shell(html) {
+        if let Some(meta) = extract_meta_fallback(html) {
+            // 外壳的 markdown 多半只是光秃标题, 且 htmd 会剥掉 noscript 等标签内文本; 用 visible_text
+            // 取页面全部可见文本 (保留 noscript 等, 只剥 script/style 噪声) 作正文, 未被 meta 覆盖则
+            // 附在 meta 后 —— 既给干净标题+摘要, 又不丢任何可见正文 (维持"绝不丢内容"不变式)。
+            let body = visible_text(html);
+            let body = body.trim();
+            if body.is_empty() || meta.contains(body) {
+                return meta;
+            }
+            return format!("{meta}\n\n{body}");
+        }
+    }
+    // ③ 正常页 markdown 原样; 转不出 → 回退原 HTML。
+    md.unwrap_or_else(|| html.to_string())
+}
+
+/// htmd 转 markdown, 剥 script/style/noscript/svg。转出空 (trim 后, 纯 JS 骨架等) 返回 `None`
+/// 让调用方决定兜底; 转换器真报错留 stderr 痕迹 (便于发现 htmd 对某类 HTML 的系统性失败) 后也按空处理。
+fn markdown_or_empty(html: &str) -> Option<String> {
     let converter = htmd::HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "noscript", "svg"])
         .build();
     match converter.convert(html) {
-        Ok(md) if !md.trim().is_empty() => md,
-        // 转出空 (纯 JS 骨架等) 是预期, 静默回退原文。
-        Ok(_) => html.to_string(),
-        // 转换器真报错是非预期: 留 stderr 痕迹以便发现 htmd 对某类 HTML 的系统性失败。
+        Ok(md) if !md.trim().is_empty() => Some(md),
+        Ok(_) => None,
         Err(e) => {
-            eprintln!("[webfetch] html→markdown 转换失败, 回退原 HTML: {e}");
-            html.to_string()
+            eprintln!("[webfetch] html→markdown 转换失败: {e}");
+            None
         }
     }
+}
+
+/// 抓取前 URL 归一 (借鉴 WorkBuddy/CodeBuddy WebFetch normalizeUrl)。当前只做一项零破坏重写:
+/// GitHub blob 代码浏览页 → raw 直链 (见 [`normalize_github_blob`])。非该形态 URL 原样返回。
+fn normalize_fetch_url(url: &str) -> String {
+    normalize_github_blob(url).unwrap_or_else(|| url.to_string())
+}
+
+/// `github.com/{owner}/{repo}/blob/{ref}/{path}` → `raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}`。
+/// blob 页是 JS 渲染的代码浏览器, curl/wreq 只拿到 SPA 外壳、要升 headless 才出内容; 重写成 raw
+/// 直链后 curl 直接拿文件原文 (纯文本、更干净、省一次升档)。仅精确匹配 `github.com` 主机 + `/blob/`
+/// 段且其后有文件路径; 解析失败 / 非该形态 (如 `/tree/` 目录页、`gist.`、已是 raw) → `None` (原样)。
+fn normalize_github_blob(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+    // 期望 path 段: owner / repo / "blob" / ref / path...(ref 后至少 1 段文件路径)。
+    // path_segments 产出仍带 percent-encoding 的原始段, join 回去保留编码 (分支名/路径含特殊字符不坏)。
+    let segs: Vec<&str> = parsed.path_segments()?.filter(|s| !s.is_empty()).collect();
+    if segs.len() < 5 || segs[2] != "blob" {
+        return None;
+    }
+    let owner = segs[0];
+    let repo = segs[1];
+    let rest = segs[3..].join("/"); // ref + 文件路径
+    Some(format!(
+        "https://raw.githubusercontent.com/{owner}/{repo}/{rest}"
+    ))
+}
+
+/// 从原始 HTML 抽页面元数据 (title / description / og:title / og:description / keywords),
+/// 格式化成给模型的纯文本。SPA 外壳 / 正文靠 JS 渲染、markdown 转出为空时兜底 —— 这类页通常
+/// SSR 了 `<head>` 里的 og/meta, 至少回标题+摘要 (借鉴 WorkBuddy WebFetch extractMetaContent)。
+/// og:title/description 与已抽的 title/description **值精确相等**时去重。一条都没抽到返回 `None`。
+fn extract_meta_fallback(html: &str) -> Option<String> {
+    // 只 lowercase 一次, 传给各 helper —— 避免每个 helper 各自 lowercase 整文 (大页最多 ~7 次)。
+    let lower = html.to_ascii_lowercase();
+    let title = extract_title(html, &lower);
+    let desc = extract_meta_content(html, &lower, "name", "description");
+    let og_title = extract_meta_og(html, &lower, "og:title");
+    let og_desc = extract_meta_og(html, &lower, "og:description");
+    let keywords = extract_meta_content(html, &lower, "name", "keywords");
+
+    let mut out: Vec<String> = Vec::new();
+    if let Some(t) = &title {
+        out.push(format!("Title: {t}"));
+    }
+    if let Some(d) = &desc {
+        out.push(format!("Description: {d}"));
+    }
+    // og 与 plain 值**精确相等**才去重 (substring 去重会把"恰为子串"的不同 og 值误删)。
+    if let Some(t) = &og_title {
+        if title.as_deref() != Some(t.as_str()) {
+            out.push(format!("OG Title: {t}"));
+        }
+    }
+    if let Some(d) = &og_desc {
+        if desc.as_deref() != Some(d.as_str()) {
+            out.push(format!("OG Description: {d}"));
+        }
+    }
+    if let Some(k) = &keywords {
+        out.push(format!("Keywords: {k}"));
+    }
+    (!out.is_empty()).then(|| out.join("\n\n"))
+}
+
+/// 抽 `<title>...</title>` 文本 (decode 常见 HTML 实体, trim)。**限定在 `<head>` 内找**(无 head
+/// 标签则全文), 避免 body 内 inline SVG `<title>` 误命中。`lower` = `html` 的 ascii-lowercase
+/// (偏移对齐, 调用方一次性算好)。空 → `None`。
+fn extract_title(html: &str, lower: &str) -> Option<String> {
+    let scope = lower.find("</head>").unwrap_or(lower.len());
+    let s = lower[..scope].find("<title")?;
+    let open_end = lower[s..].find('>')? + s + 1;
+    let close = lower[open_end..].find("</title>")? + open_end;
+    let t = html[open_end..close].trim();
+    (!t.is_empty()).then(|| decode_html_entities(t))
+}
+
+/// 抽 og 元数据 (键可能是 `property="og:x"` 或 `name="og:x"`, 两种都查)。`lower` 同 [`extract_title`]。
+fn extract_meta_og(html: &str, lower: &str, key_val: &str) -> Option<String> {
+    extract_meta_content(html, lower, "property", key_val)
+        .or_else(|| extract_meta_content(html, lower, "name", key_val))
+}
+
+/// 抽第一个键属性 (`key_attr`=`key_val`) 命中的 `<meta>` 标签的 `content` 值 (属性顺序无关,
+/// 复用 [`tag_attr_value`] 解析单 tag, decode HTML 实体)。`key_attr` 通常是 `name` / `property`。
+/// `lower` = `html` 的 ascii-lowercase(`to_ascii_lowercase` 不改字节长度, 故 `lower[start..end]`
+/// 与 `html[start..end]` 偏移对齐), 调用方一次性算好传入。
+fn extract_meta_content(html: &str, lower: &str, key_attr: &str, key_val: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        // 引号感知找 tag 结束 `>` —— content 值含字面 `>` (如 `content="A > B"`) 时不被首个 `>` 误截。
+        let end = meta_tag_end(lower, start);
+        from = end;
+        let tag = &html[start..end];
+        let tag_lower = &lower[start..end];
+        // 该 meta 的键属性值须等于 key_val, 否则跳过。
+        match tag_attr_value(tag, tag_lower, key_attr) {
+            Some(v) if v.eq_ignore_ascii_case(key_val) => {}
+            _ => continue,
+        }
+        if let Some(content) = tag_attr_value(tag, tag_lower, "content") {
+            let c = content.trim();
+            if !c.is_empty() {
+                return Some(decode_html_entities(c));
+            }
+        }
+    }
+    None
+}
+
+/// 从 `<meta` 起 (偏移 `start`) 找标签结束 `>` 的字节偏移 (返回结束 `>` 之后), **跳过引号内的 `>`**
+/// —— 属性值含字面 `>` 时不被误截。`lower` 已 ascii-lowercase。无结束 `>` → 串尾。
+fn meta_tag_end(lower: &str, start: usize) -> usize {
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    let mut i = start;
+    let mut quote: Option<u8> = None;
+    while i < n {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'>' => return i + 1,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    n
 }
 
 #[cfg(test)]
@@ -1369,11 +1551,11 @@ mod tests {
     }
 
     #[test]
-    fn html_to_markdown_basic_and_skip() {
+    fn markdown_or_empty_basic_and_skip() {
         let html = "<html><head><style>.x{color:red}</style></head>\
             <body><h1>Title</h1><p>Hello <b>world</b></p>\
             <script>var leak='SHOULD_NOT_APPEAR';</script></body></html>";
-        let md = html_to_markdown(html);
+        let md = markdown_or_empty(html).expect("应转出 markdown");
         assert!(md.contains("Title"), "缺标题: {md}");
         assert!(md.contains("world"), "缺正文: {md}");
         // script/style 内容必须被剥掉
@@ -1382,11 +1564,182 @@ mod tests {
     }
 
     #[test]
-    fn html_to_markdown_empty_falls_back_to_raw() {
-        // 转出空时回退原文, 不丢内容。
-        let raw = "<div></div>";
-        let out = html_to_markdown(raw);
+    fn markdown_or_empty_none_and_content_falls_back_to_raw() {
+        // 转出空 → None (让调用方决定兜底)。
+        assert_eq!(markdown_or_empty("<div></div>"), None);
+        // 无正文、无 meta 时 html_content_to_text 回退原 HTML, 不丢内容。
+        let out = html_content_to_text("<div></div>", "https://e.com");
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn normalize_github_blob_rewrites_to_raw() {
+        // 标准 blob 文件页 → raw 直链。
+        assert_eq!(
+            normalize_fetch_url("https://github.com/owner/repo/blob/main/src/lib.rs"),
+            "https://raw.githubusercontent.com/owner/repo/main/src/lib.rs"
+        );
+        // 多级路径 + 带行号 fragment(raw 忽略 #L 锚, 丢弃无害)。
+        assert_eq!(
+            normalize_fetch_url("https://github.com/o/r/blob/v1.2.3/a/b/c.md#L10-L20"),
+            "https://raw.githubusercontent.com/o/r/v1.2.3/a/b/c.md"
+        );
+        // www.github.com 同样处理。
+        assert_eq!(
+            normalize_fetch_url("https://www.github.com/o/r/blob/main/f.txt"),
+            "https://raw.githubusercontent.com/o/r/main/f.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_github_blob_leaves_others_untouched() {
+        // /tree/ 目录页不是文件, 不重写。
+        for u in [
+            "https://github.com/owner/repo/tree/main/src",
+            "https://github.com/owner/repo",           // 仓库首页
+            "https://github.com/owner/repo/blob/main", // ref 后无文件路径
+            "https://gist.github.com/owner/abc123",    // gist 非 github.com 主机
+            "https://raw.githubusercontent.com/o/r/main/f.rs", // 已是 raw
+            "https://example.com/owner/repo/blob/main/f.rs", // 非 github 主机
+            "not a url",
+        ] {
+            assert_eq!(normalize_fetch_url(u), u, "不应改写: {u}");
+        }
+    }
+
+    #[test]
+    fn extract_meta_fallback_picks_title_and_og() {
+        let html = "<html><head>\
+            <title>Example &amp; Co</title>\
+            <meta name=\"description\" content=\"A short summary.\">\
+            <meta property=\"og:title\" content=\"OG Heading\">\
+            <meta content=\"OG body text\" property=\"og:description\">\
+            <meta name='keywords' content='a, b, c'>\
+            </head><body><div id=root></div><script>app()</script></body></html>";
+        let out = extract_meta_fallback(html).expect("应抽到 meta");
+        assert!(out.contains("Title: Example & Co"), "标题/实体: {out}");
+        assert!(out.contains("Description: A short summary."), "描述: {out}");
+        assert!(out.contains("OG Title: OG Heading"), "og:title: {out}");
+        assert!(
+            out.contains("OG Description: OG body text"),
+            "属性顺序反转的 og:description 也要抽到: {out}"
+        );
+        assert!(out.contains("Keywords: a, b, c"), "keywords: {out}");
+    }
+
+    #[test]
+    fn extract_meta_fallback_dedups_og_against_plain() {
+        // og:description 与 description 同文本时去重, 不重复输出。
+        let html = "<head><meta name=\"description\" content=\"same text\">\
+            <meta property=\"og:description\" content=\"same text\"></head>";
+        let out = extract_meta_fallback(html).unwrap();
+        assert_eq!(out, "Description: same text");
+    }
+
+    #[test]
+    fn extract_meta_fallback_none_when_absent() {
+        assert_eq!(
+            extract_meta_fallback("<html><body><p>hi</p></body></html>"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_meta_fallback_keeps_distinct_og_that_is_substring() {
+        // og:title 值是 title 行的子串但语义不同 —— 精确去重应保留它 (旧 substring 去重会误删)。
+        let html = "<head><title>GitHub - owner/repo: A great tool</title>\
+            <meta property=\"og:title\" content=\"owner/repo\"></head>";
+        let out = extract_meta_fallback(html).unwrap();
+        assert!(
+            out.contains("Title: GitHub - owner/repo: A great tool"),
+            "{out}"
+        );
+        assert!(
+            out.contains("OG Title: owner/repo"),
+            "子串但不同的 og:title 应保留: {out}"
+        );
+    }
+
+    #[test]
+    fn extract_meta_content_handles_gt_in_value() {
+        // content 值含字面 '>' 不应把 meta tag 截断丢失 (引号感知 tag 结束)。
+        let html = "<head><meta property=\"og:description\" content=\"A > B comparison\"></head>";
+        let lower = html.to_ascii_lowercase();
+        assert_eq!(
+            extract_meta_og(html, &lower, "og:description").as_deref(),
+            Some("A > B comparison")
+        );
+    }
+
+    #[test]
+    fn extract_title_ignores_body_svg_title() {
+        // body 内 inline SVG <title> 不应被当成页面标题 —— 限定在 <head> 内找。
+        let html = "<html><head><title>Real Page</title></head>\
+            <body><svg><title>icon</title></svg></body></html>";
+        let lower = html.to_ascii_lowercase();
+        assert_eq!(extract_title(html, &lower).as_deref(), Some("Real Page"));
+    }
+
+    #[test]
+    fn html_content_to_text_shell_preserves_noscript_body() {
+        // JS 外壳 + <noscript> 兜底正文: htmd 会剥掉 noscript, 但 visible_text 保留 —— 绝不丢内容。
+        let shell = "<html><head><title>App</title>\
+            <meta property=\"og:description\" content=\"summary\"></head>\
+            <body><noscript>Important fallback content here for users.</noscript>\
+            <div id=\"root\"></div><script src=\"/app.js\"></script></body></html>";
+        let out = html_content_to_text(shell, "https://e.com/app");
+        assert!(
+            out.contains("OG Description: summary"),
+            "应回 og 摘要: {out}"
+        );
+        assert!(
+            out.contains("Important fallback content here"),
+            "noscript 正文不能丢: {out}"
+        );
+        assert!(!out.contains("<script"), "不应漏出脚本噪声: {out}");
+    }
+
+    #[test]
+    fn html_content_to_text_meta_fallback_for_spa_shell() {
+        // SPA 外壳: 正文靠 JS, 但 head 里 SSR 了 og → markdown 转出为空, 走 meta 兜底。
+        let shell = "<html><head><title>SPA Page</title>\
+            <meta property=\"og:description\" content=\"server-rendered summary\"></head>\
+            <body><div id=\"root\"></div><script>render()</script></body></html>";
+        let out = html_content_to_text(shell, "https://e.com/app");
+        assert!(out.contains("Title: SPA Page"), "应回标题: {out}");
+        assert!(
+            out.contains("OG Description: server-rendered summary"),
+            "应回 og 摘要: {out}"
+        );
+        assert!(!out.contains("<script"), "不应漏出脚本: {out}");
+    }
+
+    #[test]
+    fn html_content_to_text_short_static_page_not_meta_polluted() {
+        // 短静态页 (非 SPA 外壳: 无骨架挂载点 / 无 bundle 脚本) 不触发 meta 兜底, markdown 原样,
+        // 不被 "Title:" 前缀污染 (防 over-reach, 锁定非破坏行为)。
+        let html = "<html><head><title>Status</title></head>\
+            <body><p>All systems operational right now.</p></body></html>";
+        let out = html_content_to_text(html, "https://e.com/status");
+        assert!(out.contains("All systems operational"), "应保留正文: {out}");
+        assert!(
+            !out.contains("Title:"),
+            "短静态页不应被 meta 兜底污染: {out}"
+        );
+    }
+
+    #[test]
+    fn html_content_to_text_normal_article_uses_markdown() {
+        let html = "<html><body><article><h1>Real Title</h1>\
+            <p>This is a sufficiently long paragraph of real article body content so that \
+            readability and markdown conversion keep it as the primary content output.</p>\
+            </article></body></html>";
+        let out = html_content_to_text(html, "https://e.com/post");
+        assert!(out.contains("Real Title"), "正文标题: {out}");
+        assert!(
+            out.contains("sufficiently long paragraph"),
+            "正文段落: {out}"
+        );
     }
 
     #[test]
