@@ -118,7 +118,14 @@ pub(crate) fn heal_with_preset_index(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
-        let Some(preset) = pick_matching_preset(candidates, &user_name, &user_api_format) else {
+        let user_auth_scheme = obj
+            .get("authScheme")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let Some(preset) =
+            pick_matching_preset(candidates, &user_name, &user_api_format, &user_auth_scheme)
+        else {
             continue;
         };
 
@@ -440,6 +447,7 @@ fn pick_matching_preset<'a>(
     candidates: &'a [Map<String, Value>],
     user_name: &str,
     user_api_format: &str,
+    user_auth_scheme: &str,
 ) -> Option<&'a Map<String, Value>> {
     if candidates.len() == 1 {
         return candidates.first();
@@ -455,6 +463,24 @@ fn pick_matching_preset<'a>(
                 .unwrap_or(false)
         }) {
             return Some(p);
+        }
+    }
+    // 1.5 authScheme 唯一匹配 — 同 baseUrl + 同 apiFormat 的双 preset(如 workbuddy /
+    //     workbuddy-login:bearer vs workbuddy_oauth)靠 authScheme 区分,否则下面 apiFormat
+    //     fallback 会挑到第一个(API-key preset),把账号登录 provider 的 authScheme 覆盖成
+    //     bearer、OAuth 路失效(codex review P2)。仅当恰好一个候选 authScheme 命中时采用。
+    let uas = user_auth_scheme.trim().to_lowercase();
+    if !uas.is_empty() {
+        let mut hits = candidates.iter().filter(|p| {
+            p.get("authScheme")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase() == uas)
+                .unwrap_or(false)
+        });
+        if let Some(p) = hits.next() {
+            if hits.next().is_none() {
+                return Some(p);
+            }
         }
     }
     // 2. apiFormat 匹配 — user provider 用 antigravity_oauth 想要 antigravity preset
@@ -478,6 +504,34 @@ fn pick_matching_preset<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── pick_matching_preset authScheme 判别(codex review P2)────────────
+
+    #[test]
+    fn pick_matching_preset_disambiguates_same_baseurl_by_auth_scheme() {
+        // workbuddy / workbuddy-login 同 baseUrl + 同 apiFormat,只 authScheme 不同。
+        // healing 必须靠 authScheme 区分,否则把账号登录 provider 的 authScheme 覆盖成 bearer。
+        let mk = |id: &str, scheme: &str| {
+            let mut m = Map::new();
+            m.insert("id".into(), json!(id));
+            m.insert("name".into(), json!(id));
+            m.insert("apiFormat".into(), json!("openai_chat"));
+            m.insert("authScheme".into(), json!(scheme));
+            m
+        };
+        let candidates = vec![
+            mk("workbuddy", "bearer"),
+            mk("workbuddy-login", "workbuddy_oauth"),
+        ];
+        // 账号登录 provider 即使被改名(name 不命中),authScheme 也能命中 login preset
+        let p = pick_matching_preset(&candidates, "我的 WB", "openai_chat", "workbuddy_oauth")
+            .expect("应命中 login preset");
+        assert_eq!(p.get("id").unwrap(), "workbuddy-login");
+        // API-key provider:authScheme=bearer → 命中 API-key preset(不被 OAuth preset 抢)
+        let p2 = pick_matching_preset(&candidates, "随便起的名", "openai_chat", "bearer")
+            .expect("应命中 API-key preset");
+        assert_eq!(p2.get("id").unwrap(), "workbuddy");
+    }
 
     // ── normalize_base_url ───────────────────────────────────────────
 

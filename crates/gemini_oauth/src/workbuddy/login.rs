@@ -217,12 +217,29 @@ pub async fn refresh_workbuddy_token(
     Ok(token_to_cred(data))
 }
 
+/// 进程级 single-flight refresh 锁 —— 防多个 Codex 请求在 token 进入 refresh 窗口后
+/// 各自并发 refresh:并发会抢同一 `workbuddy-oauth.json.tmp` temp 文件(互相 unlink/rename
+/// 致一方失败)+ 上游 refresh 每次轮换 refresh token(并发调用互相使对方的旧 refresh token
+/// 失效)。对齐 gemini `service::ensure_valid_access_token` 的单飞模式(codex review P2)。
+fn refresh_mutex() -> &'static tokio::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// 请求前确保有效 access token:load → 过期则 refresh + 落盘 → 返回 access token。
 /// 无本地凭证 → `NotLoggedIn`(forward 据此映射 needs_login,提示用户重登)。
 pub async fn ensure_valid_workbuddy_token(
     http: &reqwest::Client,
     store: &super::token::WorkbuddyCredentialStore,
 ) -> Result<String, WorkbuddyError> {
+    // 第一次 load(无锁):大多数情况 token 没过期,直接返避免 mutex contention。
+    let cred = store.load()?.ok_or(WorkbuddyError::NotLoggedIn)?;
+    if !cred.should_refresh() {
+        return Ok(cred.access_token);
+    }
+    // 过期窗口内 — 进 single-flight critical section。
+    let _guard = refresh_mutex().lock().await;
+    // 拿到锁后**重新 load**:若并发请求已 refresh 过,这里直接复用新 token,跳过自己的 refresh。
     let cred = store.load()?.ok_or(WorkbuddyError::NotLoggedIn)?;
     if !cred.should_refresh() {
         return Ok(cred.access_token);

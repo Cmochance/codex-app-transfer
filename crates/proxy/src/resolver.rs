@@ -319,6 +319,10 @@ impl ProviderResolver for StaticResolver {
             // z.ai/bigmodel:上游 base 按 provider 钉死(`api.z.ai/api/anthropic` /
             // `open.bigmodel.cn/api/anthropic`),不允许用户 baseUrl 漂移
             AuthScheme::ZaiOauth(zai_provider) => zai_provider.config().model_base.to_string(),
+            // WorkBuddy 账号登录:access token scoped 给 copilot.tencent.com,强制 pin 官方
+            // 网关 base,防 user 把 authScheme=workbuddy_oauth 配到任意 baseUrl 致账号 token
+            // 外泄到非官方 host(codex review P2)。
+            AuthScheme::WorkbuddyOauth => "https://copilot.tencent.com/v2".to_string(),
             _ => provider.base_url.clone(),
         };
 
@@ -329,7 +333,10 @@ impl ProviderResolver for StaticResolver {
         // `…/api/anthropic` 拼成缺 `/v1` 的错误 URL。让 path 与 forced base 同源根治
         // (bot P2)。cloudcode/antigravity 走 gemini_cli adapter、path 逻辑不同,不动。
         let mut forwarded_provider = provider.clone();
-        if matches!(auth_scheme, AuthScheme::ZaiOauth(_)) {
+        if matches!(
+            auth_scheme,
+            AuthScheme::ZaiOauth(_) | AuthScheme::WorkbuddyOauth
+        ) {
             forwarded_provider.base_url = upstream_base.clone();
         }
 
