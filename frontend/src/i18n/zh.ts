@@ -671,6 +671,9 @@ export default {
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",
+  "settings.workbuddyQuotaGuardThreshold": "WorkBuddy 账号切换阈值",
+  "settings.workbuddyQuotaGuardThresholdHint":
+    "WorkBuddy 账号池剩余积分低于此值时自动切到下一个有额度的账号(默认 20)。",
   "settings.codexStashEnabled": "Codex 内启用草稿暂存",
   "settings.codexStashEnabledHint":
     "仅通过本应用启动 Codex 时生效，可暂存输入框草稿，随后恢复到输入框或直接发送。",
@@ -1009,6 +1012,13 @@ export default {
   "oauth.loggedInAs": "已登录:{email}",
   "oauth.notLoggedIn": "未登录",
   "oauth.loginFailed": "登录失败",
+  "workbuddyPool.saveFirst": "先保存该 provider 再添加账号",
+  "workbuddyPool.noAccounts": "暂无账号,点「添加账号」登录",
+  "workbuddyPool.addAccount": "添加账号",
+  "workbuddyPool.current": "当前",
+  "workbuddyPool.setCurrent": "设为当前",
+  "workbuddyPool.remove": "移除",
+  "workbuddyPool.exhausted": "额度不足",
   "providerForm.apiFormat": "协议格式",
   "providerForm.authScheme": "鉴权方式",
   "providerForm.modelMapSection": "模型映射",

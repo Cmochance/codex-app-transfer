@@ -584,6 +584,11 @@ function onPort(key: 'proxyPort' | 'adminPort', e: Event) {
   const v = Number((e.target as HTMLInputElement).value)
   if (Number.isFinite(v) && v > 0) void persist({ [key]: v })
 }
+// WorkBuddy 账号池配额守护阈值:剩余积分低于此值自动切换账号(默认 20)。
+function onWbThreshold(e: Event) {
+  const v = Number((e.target as HTMLInputElement).value)
+  if (Number.isFinite(v) && v >= 0) void persist({ workbuddyQuotaGuardThreshold: v })
+}
 // 更新地址写死本仓库(不可自定义);后端 DEFAULT_UPDATE_URL 同样指向它
 const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
 </script>
@@ -643,6 +648,18 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     <SettingsGroup :title="t('settings.groupCodexIntegration')">
       <SettingsRow :title="t('settings.codexQuotaEnabled')" :description="t('settings.codexQuotaEnabledHint')">
         <AppSwitch v-model="codexQuotaEnabled" />
+      </SettingsRow>
+      <SettingsRow
+        :title="t('settings.workbuddyQuotaGuardThreshold')"
+        :description="t('settings.workbuddyQuotaGuardThresholdHint')"
+      >
+        <input
+          type="number"
+          class="settings-num"
+          :value="store.num('workbuddyQuotaGuardThreshold', 20)"
+          min="0"
+          @change="onWbThreshold"
+        />
       </SettingsRow>
       <SettingsRow :title="t('settings.codexStashEnabled')" :description="t('settings.codexStashEnabledHint')">
         <AppSwitch v-model="codexStashEnabled" />
