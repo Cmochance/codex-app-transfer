@@ -8,15 +8,17 @@
 //!     "CycleCapacitySizePrecise":"500", "CycleCapacityRemainPrecise":"246.38000003",
 //!     "CycleEndTime":"2026-06-30 23:59:59", ... }, ... ] }}}}`。
 //!
-//! 网页 `codebuddy.cn/profile/usage` 把账号分两组显示,本模块逐字对齐:
-//! - **基础体验包** = `CapacityType==4`(个人体验版,按 cycle 月度刷新)→ monthly 槽 bar;
-//! - **活动赠送包** = 其余(`CapacityType==1` 国内运营裂变包等,多子包)→ 聚合成
+//! 网页 `codebuddy.cn/profile/usage` 把账号分两组显示,本模块对齐(面板空间紧,标签缩短):
+//! - **基础包**(网页「基础体验包」)= `CapacityType==4`(个人体验版,按 cycle 月度刷新)→ monthly 槽 bar;
+//! - **额外包**(网页「活动赠送包」)= 其余(`CapacityType==1` 国内运营裂变包等,多子包)→ 聚合成
 //!   [`ProviderQuota::aggregate`] 一条 bar(used/size/remain 累加)。
 //!
-//! bar 的明细文案显**绝对量**(`253.62 / 500 · 246.38 剩余`),与网页一致;百分比按**剩余**
-//! (项目额度 bar 统一「剩余」语义,满额=100,与网页「已用填充」方向相反但数字一致)。
+//! bar 的明细文案只显「已用 / 总额」(`253.62 / 500`)—— 剩余可从二者推出、且进度条本身=剩余
+//! 比例,不重复显「X 剩余」省空间;刷新时间由注入器在末尾拼。百分比按**剩余**(项目额度 bar
+//! 统一「剩余」语义,满额=100,与网页「已用填充」方向相反但数字一致)。
 
 use crate::provider_quota::{ProviderQuota, QuotaWindow, RollingWindows};
+use codex_app_transfer_adapters::core::language::{current_language, Language};
 use serde_json::Value;
 
 /// fetch 失败分类(对称 trae/glm):区别「鉴权失效(清缓存)」与「瞬时错(留旧)」。
@@ -80,12 +82,9 @@ fn credit_bar(label: &str, agg: &Agg, reset: Option<String>) -> QuotaWindow {
     } else {
         0.0
     };
-    let detail = format!(
-        "{} / {} · {} 剩余",
-        fmt_num(agg.used),
-        fmt_num(agg.size),
-        fmt_num(agg.remain)
-    );
+    // 明细只显「已用 / 总额」—— 剩余已可从二者推出(且进度条本身就是剩余比例),不再重复显
+    // 「X 剩余」省空间(用户反馈)。刷新时间由 quota_bar 在末尾拼「· MM-DD HH:MM 刷新」。
+    let detail = format!("{} / {}", fmt_num(agg.used), fmt_num(agg.size));
     QuotaWindow::credit_bar(label, pct, detail, reset)
 }
 
@@ -94,6 +93,11 @@ fn credit_bar(label: &str, agg: &Agg, reset: Option<String>) -> QuotaWindow {
 /// `CapacityType==4` → 基础体验包(monthly 槽,带下次刷新);其余聚合成活动赠送包
 /// ([`ProviderQuota::aggregate`])。两组都拿不到 → 空 `ProviderQuota`(不显额度行)。
 pub fn parse_workbuddy_quota(json: &Value) -> ProviderQuota {
+    // 标签跟随用户语言(settings.language;adapters 全局,默认 en)。拆 pure 内层方便测两语言。
+    parse_workbuddy_quota_in(json, current_language())
+}
+
+fn parse_workbuddy_quota_in(json: &Value, lang: Language) -> ProviderQuota {
     let Some(accounts) = json
         .pointer("/data/Response/Data/Accounts")
         .and_then(Value::as_array)
@@ -129,11 +133,16 @@ pub fn parse_workbuddy_quota(json: &Value) -> ProviderQuota {
         }
     }
 
+    let zh = lang == Language::Chinese;
     let mut rolling = RollingWindows::default();
     if base.size > 0.0 {
-        rolling.monthly = Some(credit_bar("基础体验包", &base, base_reset));
+        let label = if zh { "基础包" } else { "Base" };
+        rolling.monthly = Some(credit_bar(label, &base, base_reset));
     }
-    let aggregate = (gift.size > 0.0).then(|| credit_bar("活动赠送包", &gift, None));
+    let aggregate = (gift.size > 0.0).then(|| {
+        let label = if zh { "额外包" } else { "Bonus" };
+        credit_bar(label, &gift, None)
+    });
 
     ProviderQuota {
         rolling,
@@ -203,12 +212,12 @@ mod tests {
 
     #[test]
     fn base_pkg_maps_to_monthly_bar_with_exact_numbers() {
-        let q = parse_workbuddy_quota(&sample());
-        let base = q.rolling.monthly.as_ref().expect("基础体验包进 monthly 槽");
-        assert_eq!(base.label, "基础体验包");
+        let q = parse_workbuddy_quota_in(&sample(), Language::Chinese);
+        let base = q.rolling.monthly.as_ref().expect("基础包进 monthly 槽");
+        assert_eq!(base.label, "基础包");
         // 剩余 246.38 / 500 = 49.276%
         assert!((base.remaining_percent - 49.276).abs() < 0.01);
-        assert_eq!(base.detail.as_deref(), Some("253.62 / 500 · 246.38 剩余"));
+        assert_eq!(base.detail.as_deref(), Some("253.62 / 500"));
         // 下次刷新 = CycleEndTime + 1s = 2026-07-01 00:00:00 (+08:00)
         assert_eq!(
             base.reset_rfc3339.as_deref(),
@@ -218,13 +227,26 @@ mod tests {
 
     #[test]
     fn gift_pkgs_aggregate_into_aggregate_bar() {
-        let q = parse_workbuddy_quota(&sample());
-        let gift = q.aggregate.as_ref().expect("赠送包进 aggregate");
-        assert_eq!(gift.label, "活动赠送包");
+        let q = parse_workbuddy_quota_in(&sample(), Language::Chinese);
+        let gift = q.aggregate.as_ref().expect("额外包进 aggregate");
+        assert_eq!(gift.label, "额外包");
         // 2000 + 1350 = 3350,全剩
         assert_eq!(gift.remaining_percent, 100.0);
-        assert_eq!(gift.detail.as_deref(), Some("0 / 3350 · 3350 剩余"));
+        assert_eq!(gift.detail.as_deref(), Some("0 / 3350"));
         assert!(gift.reset_rfc3339.is_none(), "赠送包不显刷新时间");
+    }
+
+    #[test]
+    fn labels_follow_language_en() {
+        // 英文语言:基础包→Base、额外包→Bonus(明细数字与刷新词的 i18n 在注入器 quota_bar)。
+        let q = parse_workbuddy_quota_in(&sample(), Language::English);
+        assert_eq!(q.rolling.monthly.as_ref().unwrap().label, "Base");
+        assert_eq!(q.aggregate.as_ref().unwrap().label, "Bonus");
+        // 明细仍是语言中性的「已用 / 总额」
+        assert_eq!(
+            q.rolling.monthly.as_ref().unwrap().detail.as_deref(),
+            Some("253.62 / 500")
+        );
     }
 
     #[test]
@@ -250,7 +272,7 @@ mod tests {
         let q = parse_workbuddy_quota(&j);
         assert!(q.rolling.monthly.is_none(), "无 type=4 → 无基础体验包 bar");
         let gift = q.aggregate.as_ref().expect("仍显赠送包");
-        assert_eq!(gift.detail.as_deref(), Some("10 / 100 · 90 剩余"));
+        assert_eq!(gift.detail.as_deref(), Some("10 / 100"));
     }
 
     #[test]
@@ -265,7 +287,7 @@ mod tests {
             (base.remaining_percent - 80.0).abs() < 0.01,
             "500-100=400 → 剩 80%"
         );
-        assert_eq!(base.detail.as_deref(), Some("100 / 500 · 400 剩余"));
+        assert_eq!(base.detail.as_deref(), Some("100 / 500"));
     }
 
     #[test]
