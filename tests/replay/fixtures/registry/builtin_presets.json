@@ -594,6 +594,7 @@
   {
     "id": "workbuddy",
     "name": "WorkBuddy（APIKEY）",
+    "gray": true,
     "baseUrl": "https://copilot.tencent.com/v2",
     "docsUrl": "https://www.codebuddy.ai",
     "authScheme": "bearer",
@@ -649,6 +650,7 @@
   {
     "id": "workbuddy-login",
     "name": "WorkBuddy（Login）",
+    "gray": true,
     "baseUrl": "https://copilot.tencent.com/v2",
     "docsUrl": "https://www.codebuddy.ai",
     "authScheme": "workbuddy_oauth",
