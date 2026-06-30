@@ -1494,7 +1494,18 @@ async fn fetch_workbuddy_quota(
                 }
             }
             Err(e) => {
-                tracing::debug!(uid = %acct.uid, error = %e, "[Quota] WorkBuddy 账号额度查询瞬时失败,跳过守护更新");
+                // Auth(401/403):该账号 token 在网关侧已失效(本地 expiry 前被吊销),
+                // 标记 1h 退避让选择器跳过它(配额守护 + 转发路径共同闭环);Transient 留旧缓存。
+                match &e {
+                    QuotaError::Auth(_) => {
+                        let until = workbuddy::token::unix_now_ms() + 3600 * 1000;
+                        let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
+                        tracing::warn!(uid = %acct.uid, error = %e, "[Quota] WorkBuddy 账号额度查询鉴权失败 → 标记 1h 退避");
+                    }
+                    QuotaError::Transient(_) => {
+                        tracing::debug!(uid = %acct.uid, error = %e, "[Quota] WorkBuddy 账号额度查询瞬时失败,跳过守护更新");
+                    }
+                }
             }
         }
     }

@@ -88,7 +88,7 @@ src-tauri/gen/
 
 # Vue/Vite frontend (Stage 1 起 frontend/ 是 Vite 项目; dist 被 src-tauri
 # include_dir! 编译期嵌入, 由 npm run build 生成, 不入仓)
-frontend/node_modules/
+frontend/node_modules
 frontend/dist/
 frontend/.vite/
 

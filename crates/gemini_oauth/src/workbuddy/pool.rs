@@ -76,26 +76,63 @@ pub async fn select_serving_account(
     }
     let pool_store = WorkbuddyPoolStore::for_provider(provider_id)?;
     let mut pool = pool_store.load()?;
-    let chosen =
-        choose_serving_uid(&uids, &pool, unix_now_ms()).ok_or(WorkbuddyError::NotLoggedIn)?;
-    // sticky 切换才落盘(避免每请求写 _pool.json)
-    if pool.active_uid.as_deref() != Some(chosen.as_str()) {
-        pool.active_uid = Some(chosen.clone());
-        pool_store.save(&pool)?;
+    // 反应式失败转移:选中账号 refresh token 被网关拒(Business)或凭证丢失(NotLoggedIn)
+    // 时,标记该账号短退避耗尽(5 min)并重试池里下一个账号,避免单账号失效撞死整个池。
+    // Http / Token(Serde)类是基础设施错误(网络抖动 / 文件系统),不会因换账号自愈,直接返回。
+    // `tried` 记录本轮已试过的账号,防止 choose_serving_uid 全耗尽兜底又选回刚失败的账号死循环。
+    let mut last_err = WorkbuddyError::NotLoggedIn;
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        // 从候选里排除本轮已试过的(choose_serving_uid 不感知 tried,这里过滤后传入)
+        let candidates: Vec<String> = uids
+            .iter()
+            .filter(|u| !tried.contains(*u))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return Err(last_err); // 池里所有账号本轮都试过且失败
+        }
+        let chosen = choose_serving_uid(&candidates, &pool, unix_now_ms())
+            .ok_or(WorkbuddyError::NotLoggedIn)?;
+        tried.insert(chosen.clone());
+        // sticky 切换才落盘(避免每请求写 _pool.json)
+        if pool.active_uid.as_deref() != Some(chosen.as_str()) {
+            pool.active_uid = Some(chosen.clone());
+            pool_store.save(&pool)?;
+        }
+        let store = WorkbuddyCredentialStore::for_account(provider_id, &chosen)?;
+        let cred = store.load()?.ok_or(WorkbuddyError::NotLoggedIn)?;
+        match ensure_valid_workbuddy_token(http, &store).await {
+            Ok(token) => {
+                // device_id 正常恒 Some(add_account/迁移已补);老凭证兜底全局 device-id。
+                let device_id = cred
+                    .device_id
+                    .clone()
+                    .unwrap_or_else(super::workbuddy_device_id);
+                return Ok(ServingAccount {
+                    uid: chosen,
+                    token,
+                    device_id,
+                });
+            }
+            Err(e)
+                if matches!(
+                    e,
+                    WorkbuddyError::Business { .. } | WorkbuddyError::NotLoggedIn
+                ) =>
+            {
+                // 账号级失效:标记 5 min 退避(网关拒 refresh 短期不会自愈,但不永久 bench
+                // —— 用户可能重登修复),刷新 pool 后重试下一账号。
+                last_err = e;
+                let until = unix_now_ms() + 5 * 60 * 1000;
+                pool.exhausted_until.insert(chosen.clone(), until);
+                pool_store.save(&pool)?;
+                tracing::warn!(uid = %chosen, error = %last_err, "[Pool] 账号 refresh 失败 → 标记 5min 退避,重试下一账号");
+                continue;
+            }
+            Err(e) => return Err(e), // Http / Token 等基础设施错误,换账号无益
+        }
     }
-    let store = WorkbuddyCredentialStore::for_account(provider_id, &chosen)?;
-    let cred = store.load()?.ok_or(WorkbuddyError::NotLoggedIn)?;
-    let token = ensure_valid_workbuddy_token(http, &store).await?;
-    // device_id 正常恒 Some(add_account/迁移已补);老凭证兜底全局 device-id。
-    let device_id = cred
-        .device_id
-        .clone()
-        .unwrap_or_else(super::workbuddy_device_id);
-    Ok(ServingAccount {
-        uid: chosen,
-        token,
-        device_id,
-    })
 }
 
 /// 登录成功后**加账号入池**:分配/复用本账号 device_id → 写 `<uid>.json` → 更新池
@@ -289,5 +326,38 @@ mod tests {
         // 全耗尽:a 到 9000,b 到 7000 → 选 b(最快解禁)
         let p = pool_with(Some("a"), &[("a", 9000), ("b", 7000)]);
         assert_eq!(choose_serving_uid(&uids, &p, 1000).as_deref(), Some("b"));
+    }
+
+    /// 验证 `select_serving_account` 反应式失败转移的防死循环核心:
+    /// 账号 A refresh 失败被标记 5min 退避后,全耗尽兜底本会选 A(最快解禁);
+    /// 但 `tried` 过滤掉 A 后,候选只剩 B,choose_serving_uid 必须选 B。
+    #[test]
+    fn tried_filter_prevents_deadloop_on_failover() {
+        let mut tried = std::collections::HashSet::new();
+        tried.insert("a".to_string());
+        // A 被标记耗尽到 now+5min(9000),B 耗尽到更晚(9500)—— 不过滤会选 A
+        let p = pool_with(Some("a"), &[("a", 9000), ("b", 9500)]);
+        let now = 1000_i64;
+
+        // 不过滤:全耗尽兜底选 A(min exhausted_until)—— 这正是死循环根源
+        let uids_all = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            choose_serving_uid(&uids_all, &p, now).as_deref(),
+            Some("a"),
+            "不过滤时全耗尽兜底会选回刚失败的 A"
+        );
+
+        // 过滤掉 tried={a}:候选只剩 B,即使 B 也耗尽也必须选 B(避免死循环)
+        let candidates: Vec<String> = uids_all
+            .iter()
+            .filter(|u| !tried.contains(*u))
+            .cloned()
+            .collect();
+        assert!(!candidates.is_empty(), "候选非空(还有 B 没试)");
+        assert_eq!(
+            choose_serving_uid(&candidates, &p, now).as_deref(),
+            Some("b"),
+            "tried 过滤后必须选 B,不能死循环回 A"
+        );
     }
 }
