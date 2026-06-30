@@ -56,12 +56,16 @@ const INSTALL_SCRIPT: &str = r##"
   // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
   // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
   // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
-  var VERSION = 4; // 加「Stash 面板在场时让位坐到其前」的占位协调 → bump,升级后免重启 Codex 即覆盖旧注入
+  var VERSION = 5; // bump:quota 行 CSS 改动(.cql nowrap)+ 明细精简 → 升级后免重启 Codex 即覆盖旧注入
   if (window.__catQuotaInstalled) {
     if (window.__catQuotaVersion === VERSION) return;
     try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
     var __stale = document.getElementById('cat-quota-entry');
     if (__stale) __stale.remove();
+    // 版本变时也移除旧样式 —— 否则 ensureStyle() 见旧 #cat-quota-style 仍在即 bail,
+    // CSS 改动(如 .cql nowrap)在已注入的 Codex 窗口上不生效(codex review P2)。
+    var __staleStyle = document.getElementById('cat-quota-style');
+    if (__staleStyle) __staleStyle.remove();
   }
   window.__catQuotaVersion = VERSION;
   window.__catQuotaLast = null;
@@ -94,7 +98,7 @@ const INSTALL_SCRIPT: &str = r##"
       '#cat-quota-entry .cqb{padding:5px 16px;display:flex;flex-direction:column;gap:5px}' +
       '#cat-quota-entry .cqb .cqt{display:flex;align-items:center;justify-content:space-between;gap:10px}' +
       // 行标签:内容区常规字重/字号(不大不粗),跟随主题 ink 主色
-      '#cat-quota-entry .cql{font-size:13.5px;font-weight:400;color:var(--color-token-text-primary,#ededed)}' +
+      '#cat-quota-entry .cql{font-size:13.5px;font-weight:400;color:var(--color-token-text-primary,#ededed);white-space:nowrap;flex:0 0 auto}' +
       '#cat-quota-entry .cqd{font-size:12.5px;color:var(--color-token-text-secondary,#8c8782);font-variant-numeric:tabular-nums;white-space:nowrap}' +
       '#cat-quota-entry .cqk{height:5px;border-radius:3px;background:rgba(128,128,128,.22);overflow:hidden}' +
       // 进度条:开壁纸主题 → 取注入的 --cl-accent(随壁纸调);没开主题 → 回退贴合
@@ -717,12 +721,20 @@ fn fmt_reset_local(rfc3339: Option<&str>) -> Option<String> {
 /// 单条额度 bar(5h / weekly):显**剩余**百分比(满额=100,条满)+ 绝对重置时间点;
 /// 剩余 ≤10% 标红预警(`hot`,由 JS 上色——额度类红色判定与 used 类相反,故显式传)。
 fn quota_bar(w: &QuotaWindow) -> serde_json::Value {
+    use codex_app_transfer_adapters::core::language::{current_language, Language};
     let pct = w.remaining_percent.round() as i64;
-    // 明细文案:有自定义明细(WorkBuddy 积分包「253.62 / 500 · 246.38 剩余」)优先用它,
-    // 否则用「剩余%」;两者都可再拼上绝对重置时间点。
+    // 明细文案:有自定义明细(WorkBuddy 积分包「253.62 / 500」)优先用它,否则用「剩余%」;
+    // 两者都可再拼上绝对重置时间点。「刷新」词跟随 settings.language(i18n)。
     let head = w.detail.clone().unwrap_or_else(|| format!("{pct}%"));
     let detail = match fmt_reset_local(w.reset_rfc3339.as_deref()) {
-        Some(t) => format!("{head} · {t} 刷新"),
+        Some(t) => {
+            let word = if current_language() == Language::Chinese {
+                "刷新"
+            } else {
+                "refresh"
+            };
+            format!("{head} · {t} {word}")
+        }
         None => head,
     };
     json!({"kind":"bar","cls":"quota","label":w.label,"pct":pct,"detail":detail,"hot":pct <= 10})
@@ -1363,7 +1375,7 @@ async fn fetch_trae_quota(
     }
 }
 
-/// 取 WorkBuddy 积分额度(基础体验包 + 活动赠送包)。非 WorkBuddy → 清缓存 + None。
+/// 取 WorkBuddy 积分额度(基础包 + 额外包)。非 WorkBuddy → 清缓存 + None。
 /// token:API-key 直用粘贴 key;账号登录走 `ensure_valid_workbuddy_token`(含 refresh + 落盘),
 /// 未登录/refresh 失效 → 清缓存。45s 缓存,指纹按 (provider id, uid=JWT sub) —— 不按 token
 /// (每次 refresh 都变,按 token 会让续期后紧跟的瞬时失败误清缓存,对齐 Trae)。
@@ -1844,6 +1856,8 @@ mod tests {
         assert!(REMOVE_SCRIPT.contains("cat-quota-entry"));
         assert!(REMOVE_SCRIPT.contains("disconnect"));
         assert!(REMOVE_SCRIPT.contains("cat-quota-style"));
+        // 版本变重装时必须也移除旧 #cat-quota-style(否则 ensureStyle bail、CSS 改动不生效)
+        assert!(INSTALL_SCRIPT.contains("__staleStyle"));
     }
 
     #[test]
@@ -1886,7 +1900,8 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("token/s")); // 单位不缩写成 tok/s
                                                      // ④ 额度重置用绝对时间点(含「刷新」)而非剩余时长
         let d5h = rows[0]["detail"].as_str().unwrap();
-        assert!(d5h.contains("刷新") && d5h.contains(':'));
+        // 「刷新」词跟随语言(zh 刷新 / en refresh);测试默认语言态,断言放宽到两者皆可。
+        assert!((d5h.contains("刷新") || d5h.contains("refresh")) && d5h.contains(':'));
         // 两条额度 bar 行有 label/detail
         for r in &rows[0..2] {
             assert!(r["label"].is_string() && r["detail"].is_string());
@@ -1974,7 +1989,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
                                                      // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
         assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
-        assert!(INSTALL_SCRIPT.contains("var VERSION = 4")); // bump:Stash 面板在场时让位占位协调
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 5")); // bump:quota 行 CSS(.cql nowrap)+ 明细精简
     }
 
     #[test]
@@ -2016,7 +2031,11 @@ mod tests {
         assert_eq!(rows[0]["label"], "5 小时额度");
         assert_eq!(rows[0]["pct"], 94, "显剩余 94%(满额=100)");
         assert_eq!(rows[0]["hot"], false, "剩余充足不标红");
-        assert!(rows[0]["detail"].as_str().unwrap().contains("刷新"));
+        let d0 = rows[0]["detail"].as_str().unwrap();
+        assert!(
+            d0.contains("刷新") || d0.contains("refresh"),
+            "重置词跟随语言"
+        );
         assert_eq!(rows[1]["label"], "每周额度");
         assert_eq!(rows[1]["pct"], 8);
         assert_eq!(rows[1]["hot"], true, "剩余 ≤10% 标红预警");
@@ -2058,35 +2077,33 @@ mod tests {
 
     #[test]
     fn quota_rows_renders_workbuddy_aggregate_bar_after_rolling() {
-        // WorkBuddy:基础体验包(monthly 槽)+ 活动赠送包(aggregate)→ 2 条 bar,
-        // 聚合 bar 排在滚动 bar 之后;custom detail 显绝对量;体验包拼刷新时间。
+        // WorkBuddy:基础包(monthly 槽)+ 额外包(aggregate)→ 2 条 bar,
+        // 聚合 bar 排在滚动 bar 之后;custom detail 显绝对量;基础包拼刷新时间。
         use crate::provider_quota::{QuotaWindow, RollingWindows};
         let q = ProviderQuota {
             rolling: RollingWindows {
                 monthly: Some(QuotaWindow::credit_bar(
-                    "基础体验包",
+                    "基础包",
                     49.0,
-                    "253.62 / 500 · 246.38 剩余",
+                    "253.62 / 500",
                     Some("2026-07-01T00:00:00+08:00".into()),
                 )),
                 ..Default::default()
             },
-            aggregate: Some(QuotaWindow::credit_bar(
-                "活动赠送包",
-                100.0,
-                "0 / 3350 · 3350 剩余",
-                None,
-            )),
+            aggregate: Some(QuotaWindow::credit_bar("额外包", 100.0, "0 / 3350", None)),
             ..Default::default()
         };
         let rows = quota_rows(Some(&q));
-        assert_eq!(rows.len(), 2, "体验包 + 赠送包 两条 bar");
-        assert_eq!(rows[0]["label"], "基础体验包");
+        assert_eq!(rows.len(), 2, "基础包 + 额外包 两条 bar");
+        assert_eq!(rows[0]["label"], "基础包");
         let d0 = rows[0]["detail"].as_str().unwrap();
         assert!(d0.contains("253.62 / 500"), "custom 明细显绝对量");
-        assert!(d0.contains("刷新"), "体验包拼上刷新时间");
-        assert_eq!(rows[1]["label"], "活动赠送包");
-        assert_eq!(rows[1]["detail"], "0 / 3350 · 3350 剩余");
+        assert!(
+            d0.contains("刷新") || d0.contains("refresh"),
+            "基础包拼刷新时间(跟随语言)"
+        );
+        assert_eq!(rows[1]["label"], "额外包");
+        assert_eq!(rows[1]["detail"], "0 / 3350");
         assert_eq!(rows[1]["pct"], 100);
     }
 
