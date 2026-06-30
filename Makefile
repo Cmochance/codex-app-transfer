@@ -19,10 +19,14 @@ help:
 mac-app:
 	npm --prefix frontend ci
 	npm --prefix frontend run build
-	CARGO_TARGET_DIR=target cargo tauri build --bundles app
-	mkdir -p dist/mac
-	rm -rf "dist/mac/Codex App Transfer.app"
-	cp -R "src-tauri/target/release/bundle/macos/Codex App Transfer.app" "dist/mac/Codex App Transfer.app"
+	# 不硬编 CARGO_TARGET_DIR —— 继承 cargo 配置/环境的 target-dir(本机 .cargo/config.toml
+	# 可把 main + 所有 worktree 统一到一个 target 避免重复占盘;无配置时退回默认 workspace
+	# target)。bundle 落在实际 target 下,用 cargo metadata 定位,不假设 src-tauri/target。
+	cargo tauri build --bundles app
+	@TARGET_DIR=$$(cargo metadata --no-deps --format-version 1 | python3 -c 'import sys,json;print(json.load(sys.stdin)["target_directory"])'); \
+	mkdir -p dist/mac; \
+	rm -rf "dist/mac/Codex App Transfer.app"; \
+	cp -R "$$TARGET_DIR/release/bundle/macos/Codex App Transfer.app" "dist/mac/Codex App Transfer.app"
 	@echo ""
 	@echo "✓ Built: dist/mac/Codex App Transfer.app"
 
