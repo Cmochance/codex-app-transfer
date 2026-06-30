@@ -38,6 +38,10 @@ const ICON_MAP: Record<string, IconSpec> = {
   // Trae(字节 TRAE SOLO CN);id/baseUrl 含 trae,无其它 provider 含此串,无歧义。
   // Phase 1 用 bootstrap 图标兜底(真实 logo 留 polish follow-up)。
   trae: { icon: 'bi-lightning-charge-fill' },
+  // WorkBuddy(腾讯 CodeBuddy);workbuddy / workbuddy-login 两个 provider 的 id/name 均含
+  // workbuddy,无其它 provider 含此串,无歧义。官方品牌标(从 WorkBuddy.app renderer 提取的
+  // logo-workbuddy.svg,64×64 方形带渐变)。
+  workbuddy: { logo: 'assets/providers/workbuddy.svg' },
 }
 
 // 逐字移植 computeIcon: 拼 id+name+baseUrl+apiFormat → normalize(_/空格→-)→ 子串匹配 ICON_MAP
