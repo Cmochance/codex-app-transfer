@@ -2042,7 +2042,17 @@ async fn build_and_send_upstream(
     // `X-Conversation-*`。入站 Codex 同名头已在上方按 `injects_workbuddy_headers` strip,
     // 这里独占注入(对齐 ZCode/Grok 的"代码层独占注入指纹"模式)。
     if injects_workbuddy_headers {
-        let model_id = resolved.rewritten_model.as_deref().unwrap_or_default();
+        // X-Model-ID 优先用 rewrite 后的真实模型;若没 rewrite(user 直接 -m 真实模型名,
+        // resolved.rewritten_model=None)从请求体 model 字段取,避免发空 X-Model-ID 被上游
+        // 错误归类 / 拒(codex review P2)。
+        let body_model = serde_json::from_slice::<serde_json::Value>(&plan_body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+        let model_id = resolved
+            .rewritten_model
+            .as_deref()
+            .or(body_model.as_deref())
+            .unwrap_or_default();
         for (name, value) in
             codex_app_transfer_gemini_oauth::workbuddy::workbuddy_source_headers(model_id)
         {
