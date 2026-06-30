@@ -174,7 +174,11 @@ fn parse_pack_list(root: &serde_json::Value) -> Option<ProviderQuota> {
         let _ = saw_premium;
         return None;
     }
-    Some(ProviderQuota { rolling, stats })
+    Some(ProviderQuota {
+        rolling,
+        stats,
+        ..Default::default()
+    })
 }
 
 /// 兜底:国际 SaaS `quota_snapshots.{chat,completions,premium_interactions}`。
@@ -220,7 +224,11 @@ fn parse_quota_snapshots(root: &serde_json::Value) -> Option<ProviderQuota> {
     if stats.is_empty() && rolling.is_empty() {
         return None;
     }
-    Some(ProviderQuota { rolling, stats })
+    Some(ProviderQuota {
+        rolling,
+        stats,
+        ..Default::default()
+    })
 }
 
 /// 调 `ide_user_ent_usage` 取额度。`api_host` = `https://api.trae.cn`(含 scheme)。

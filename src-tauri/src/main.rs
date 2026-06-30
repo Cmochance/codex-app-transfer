@@ -32,6 +32,7 @@ mod trae_quota;
 mod web_session_quota;
 #[cfg(target_os = "windows")]
 mod windows_msix;
+mod workbuddy_quota;
 
 use std::sync::Arc;
 
