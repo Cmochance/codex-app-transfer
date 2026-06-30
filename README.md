@@ -5,7 +5,7 @@
 >
 > 本项目当前**仅对 Kimi For Coding、Xiaomi MiMo(Token Plan)两家供应商完成了端到端真机实际测试**。
 >
-> 其他已内置的 chat-completions 兼容供应商(包括 **DeepSeek、Kimi(月之暗面)、Xiaomi MiMo(Pay for Token)、智谱 GLM、智谱 GLM Coding、GLM（Z.ai）(zai-login)、GLM（BigModel）(bigmodel-login)、阿里云百炼(API Key / Token Plan)、MiniMax、OpenCode Go**)**未做长期真机回归**,仅停留在单元测试 + 偶发用户反馈层面。
+> 其他已内置的 chat-completions 兼容供应商(包括 **DeepSeek、Kimi(月之暗面)、Xiaomi MiMo(Pay for Token)、智谱 GLM、智谱 GLM Coding、GLM（Z.ai）(zai-login)、GLM（BigModel）(bigmodel-login)、阿里云百炼(API Key / Token Plan)、MiniMax、OpenCode Go、WorkBuddy(腾讯 CodeBuddy)**)**未做长期真机回归**,仅停留在单元测试 + 偶发用户反馈层面。
 >
 > 如果你愿意**提供其他供应商的 API key 用于测试**,将万分感激!可通过 **QQ:`3216202644`** 或邮箱联系作者,作者保证 **API key 仅用于本项目实际测试**。
 
@@ -165,6 +165,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Xiaomi MiMo(Token Plan / Pay for Token) | ✅ | ✅ | ✅ | **已切原生 responses 协议直连** |
 | MiniMax M3(1M)/ M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` 转 user 防 400(v2.1.6);M3 上下文 1M;compact 截断工具参数保持合法 JSON(#356) |
 | OpenCode Go(`opencode.ai/zen/go/v1`,openai_chat) | ✅ | ✅ | ✅ | 低成本开源编程模型订阅($5 首月/$10 月);GLM/Kimi/DeepSeek/MiMo 系走 /chat/completions;MiniMax/Qwen 系走 /messages(不在此 preset);5h/周/月三档套餐用量经控制台 session 显示(见下方用量说明) |
+| WorkBuddy(腾讯 CodeBuddy,`copilot.tencent.com/v2`,openai_chat) | 🧪 | 🧪 | 🧪 | 复用桌面端登录 token(~1 年期 Keycloak Bearer)直连,纯 bearer 无需额外头;协议走通用 openai_chat adapter(同 DeepSeek/MiniMax);**当前仅冒烟(单轮直连各模型回包正常),多轮/autocompact/tool 修复长期真机回归待补**。实测可用 id:deepseek-v4-pro/flash、glm-5.2/5.1/5v-turbo、minimax-m3、kimi-k2.7/k2.6、hy3-preview、auto;渠道(如中国移动 Token Plan)开通子集不同,Claude(default-1.x)等可能未开通 |
 | Google AI Studio(`gemini_native`) | ✅ | ✅ | ✅ | Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` 自动选 |
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | 浏览器登录 Google 一次,免 API key |
 | Anthropic Messages(custom Claude-compatible) | ✅(PR #153) | ✅(PR #153) | ✅(PR #153) | `apiFormat=anthropic_messages`,Claude preset 待真实验证后开放 |
