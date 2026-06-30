@@ -1379,11 +1379,27 @@ async fn fetch_trae_quota(
 /// token:API-key 直用粘贴 key;账号登录走 `ensure_valid_workbuddy_token`(含 refresh + 落盘),
 /// 未登录/refresh 失效 → 清缓存。45s 缓存,指纹按 (provider id, uid=JWT sub) —— 不按 token
 /// (每次 refresh 都变,按 token 会让续期后紧跟的瞬时失败误清缓存,对齐 Trae)。
+/// 账号池配额守护阈值:总剩余 < 此值即切下一个账号(`settings.workbuddyQuotaGuardThreshold`,
+/// 默认 20)。读不到 / 非法 → 20。
+fn workbuddy_guard_threshold() -> f64 {
+    crate::admin::registry_io::load()
+        .ok()
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("workbuddyQuotaGuardThreshold"))
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(20.0)
+}
+
 async fn fetch_workbuddy_quota(
     http: &Option<reqwest::Client>,
     cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
 ) -> Option<ProviderQuota> {
-    use crate::workbuddy_quota::{fetch_workbuddy_quota_summary, QuotaError};
+    use crate::workbuddy_quota::{
+        fetch_workbuddy_quota_summary, fetch_workbuddy_resource, guard_metrics,
+        parse_workbuddy_quota, QuotaError,
+    };
     use codex_app_transfer_gemini_oauth::workbuddy;
     const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
     let Some((provider_id, api_key)) = active_workbuddy_provider() else {
@@ -1391,56 +1407,147 @@ async fn fetch_workbuddy_quota(
         return None;
     };
     let http = http.as_ref()?;
-    // 取 token:API-key 直接用;账号登录走 ensure_valid(含 refresh + 落盘)。
-    let token = match api_key {
-        Some(k) => k,
-        None => {
-            let store = match workbuddy::WorkbuddyCredentialStore::from_home_env() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!(error = %e, "[Quota] WorkBuddy store 构造失败 → 清额度缓存");
-                    *cache = None;
-                    return None;
-                }
-            };
-            match workbuddy::ensure_valid_workbuddy_token(http, &store).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!(provider_id, error = %e, "[Quota] WorkBuddy 无有效 token(未登录/refresh 失效)→ 清额度缓存");
-                    *cache = None;
-                    return None;
-                }
+
+    // ── API-key 单账号路(无池):保持原行为(单账号、无守护切换)──
+    if let Some(key) = api_key {
+        let uid = workbuddy::user_id_from_jwt(&key).unwrap_or_default();
+        let fp = quota_fingerprint(&[&provider_id, &uid]);
+        if let Some((cfp, q, at)) = cache.as_ref() {
+            if *cfp == fp && at.elapsed() < QUOTA_TTL {
+                return Some(q.clone());
             }
         }
-    };
-    let uid = workbuddy::user_id_from_jwt(&token).unwrap_or_default();
-    let fp = quota_fingerprint(&[&provider_id, &uid]);
+        return match fetch_workbuddy_quota_summary(http, &key).await {
+            Ok(q) => {
+                *cache = Some((fp, q.clone(), std::time::Instant::now()));
+                Some(q)
+            }
+            Err(QuotaError::Auth(s)) => {
+                tracing::debug!(status = %s, "[Quota] WorkBuddy(API-key) quota 鉴权失败 → 清缓存");
+                *cache = None;
+                None
+            }
+            Err(QuotaError::Transient(e)) => {
+                tracing::debug!(error = %e, "[Quota] WorkBuddy(API-key) quota 瞬时失败,留旧缓存");
+                match cache.as_mut() {
+                    Some((cfp, q, at)) if *cfp == fp => {
+                        *at = std::time::Instant::now();
+                        Some(q.clone())
+                    }
+                    _ => {
+                        *cache = None;
+                        None
+                    }
+                }
+            }
+        };
+    }
+
+    // ── 账号登录池路:遍历每账号查额度 → **配额守护**(总剩余<阈值标记耗尽 / 否则清除)→
+    //    展示当前服务账号的额度。守护更新 exhausted_until 即驱动 forward.rs 选择器自动切换。
+    let threshold = workbuddy_guard_threshold();
+    let accounts = workbuddy::pool::list_pool(&provider_id).unwrap_or_default();
+    if accounts.is_empty() {
+        *cache = None;
+        return None;
+    }
+    let active_uid = accounts.iter().find(|a| a.is_active).map(|a| a.uid.clone());
+    // 缓存指纹按 active uid:切账号即刷新展示。
+    let fp = quota_fingerprint(&[&provider_id, active_uid.as_deref().unwrap_or("")]);
     if let Some((cfp, q, at)) = cache.as_ref() {
         if *cfp == fp && at.elapsed() < QUOTA_TTL {
             return Some(q.clone());
         }
     }
-    match fetch_workbuddy_quota_summary(http, &token).await {
-        Ok(q) => {
+
+    let mut active_quota = None;
+    for acct in &accounts {
+        let Ok(store) = workbuddy::WorkbuddyCredentialStore::for_account(&provider_id, &acct.uid)
+        else {
+            continue;
+        };
+        let token = match workbuddy::ensure_valid_workbuddy_token(http, &store).await {
+            Ok(t) => t,
+            Err(e) => {
+                // 单账号续期失败不影响别的账号(也不动它的耗尽标记)。
+                tracing::debug!(uid = %acct.uid, error = %e, "[Quota] WorkBuddy 账号续期失败,跳过");
+                continue;
+            }
+        };
+        match fetch_workbuddy_resource(http, &token).await {
+            Ok(json) => {
+                let m = guard_metrics(&json);
+                if m.total_remaining < threshold {
+                    // 标记耗尽到下次刷新(无基础包则 +6h 退避周期重查)。
+                    let until = m
+                        .next_refresh_ms
+                        .unwrap_or_else(|| workbuddy::token::unix_now_ms() + 6 * 3600 * 1000);
+                    let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
+                    tracing::debug!(uid = %acct.uid, remaining = m.total_remaining, threshold, "[Quota] WorkBuddy 账号剩余低于阈值 → 标记耗尽切换");
+                } else {
+                    let _ = workbuddy::pool::clear_exhausted(&provider_id, &acct.uid);
+                }
+                if active_uid.as_deref() == Some(acct.uid.as_str()) {
+                    active_quota = Some(parse_workbuddy_quota(&json));
+                }
+            }
+            Err(e) => {
+                tracing::debug!(uid = %acct.uid, error = %e, "[Quota] WorkBuddy 账号额度查询瞬时失败,跳过守护更新");
+            }
+        }
+    }
+
+    match active_quota {
+        Some(q) => {
             *cache = Some((fp, q.clone(), std::time::Instant::now()));
             Some(q)
         }
-        Err(QuotaError::Auth(s)) => {
-            tracing::debug!(status = %s, "[Quota] WorkBuddy quota 鉴权失败 → 清额度缓存");
-            *cache = None;
-            None
-        }
-        Err(QuotaError::Transient(e)) => {
-            tracing::debug!(error = %e, "[Quota] WorkBuddy quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
-            match cache.as_mut() {
-                Some((cfp, q, at)) if *cfp == fp => {
-                    *at = std::time::Instant::now();
-                    Some(q.clone())
-                }
-                _ => {
-                    *cache = None;
-                    None
-                }
+        None => match cache.as_mut() {
+            Some((cfp, q, at)) if *cfp == fp => {
+                *at = std::time::Instant::now();
+                Some(q.clone())
+            }
+            _ => {
+                *cache = None;
+                None
+            }
+        },
+    }
+}
+
+/// 账号池配额守护(**独立于额度面板开关**):遍历当前 WorkBuddy 池每账号查额度,总剩余 <
+/// 阈值标记耗尽 / 否则清除 —— 驱动 forward.rs 选择器自动切换。面板关闭时由 daemon 直接调,
+/// 确保「额度守护自动切换」不依赖额度面板是否打开(面板开则 fetch_workbuddy_quota 已含守护)。
+async fn run_workbuddy_guard(http: &Option<reqwest::Client>) {
+    use crate::workbuddy_quota::{fetch_workbuddy_resource, guard_metrics};
+    use codex_app_transfer_gemini_oauth::workbuddy;
+    let Some((provider_id, api_key)) = active_workbuddy_provider() else {
+        return;
+    };
+    if api_key.is_some() {
+        return; // API-key 单账号无池,无需守护
+    }
+    let Some(http) = http.as_ref() else {
+        return;
+    };
+    let threshold = workbuddy_guard_threshold();
+    for acct in workbuddy::pool::list_pool(&provider_id).unwrap_or_default() {
+        let Ok(store) = workbuddy::WorkbuddyCredentialStore::for_account(&provider_id, &acct.uid)
+        else {
+            continue;
+        };
+        let Ok(token) = workbuddy::ensure_valid_workbuddy_token(http, &store).await else {
+            continue;
+        };
+        if let Ok(json) = fetch_workbuddy_resource(http, &token).await {
+            let m = guard_metrics(&json);
+            if m.total_remaining < threshold {
+                let until = m
+                    .next_refresh_ms
+                    .unwrap_or_else(|| workbuddy::token::unix_now_ms() + 6 * 3600 * 1000);
+                let _ = workbuddy::pool::set_exhausted(&provider_id, &acct.uid, until);
+            } else {
+                let _ = workbuddy::pool::clear_exhausted(&provider_id, &acct.uid);
             }
         }
     }
@@ -1790,6 +1897,9 @@ pub async fn run_quota_daemon() {
         // tokenize,不在热路径白算 breakdown(默认关 → 绝大多数请求免算)。
         codex_app_transfer_adapters::responses::set_breakdown_enabled(enabled);
         if !enabled {
+            // 额度面板关闭时仍跑 WorkBuddy 账号池守护:自动切换是后端能力,不依赖面板显示。
+            // (面板开启时 fetch_workbuddy_quota 已含守护,故只在这里补关闭分支。)
+            run_workbuddy_guard(&quota_http).await;
             if needs_remove {
                 match push_remove().await {
                     Ok(()) => needs_remove = false,
