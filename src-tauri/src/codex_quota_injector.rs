@@ -66,6 +66,10 @@ const INSTALL_SCRIPT: &str = r##"
     // CSS 改动(如 .cql nowrap)在已注入的 Codex 窗口上不生效(codex review P2)。
     var __staleStyle = document.getElementById('cat-quota-style');
     if (__staleStyle) __staleStyle.remove();
+    // 旧版若正开着缓存趋势浮层,它挂在 document.body(不在被删的面板里)、且旧 __cqTrendPop 引用随
+    // 本轮 IIFE 重置丢失 → 会成关不掉的孤儿。重装时一并清掉(pre-push review)。
+    var __staleTp = document.querySelectorAll('.cqtrendpop');
+    for (var __i = 0; __i < __staleTp.length; __i++) { try { __staleTp[__i].remove(); } catch (e) {} }
   }
   window.__catQuotaVersion = VERSION;
   window.__catQuotaLast = null;
@@ -746,6 +750,19 @@ const REMOVE_SCRIPT: &str = r#"
   delete window.__catQuotaSig;
   delete window.__catQuotaVersion;
   delete window.__catQuotaInstalled;
+  // [MOC-204 扩展] 拆掉缓存趋势浮层的 document/window 监听 + 删全局引用 + 移除可能开着的浮层。
+  // push_remove() 在用户**关闭额度面板**(正常路径)时也调 —— 不拆这三个 capture 监听会让它们在
+  // 第三方 app 的 document/window 上高频空转到页面 reload(pre-push review)。
+  try {
+    document.removeEventListener('pointerdown', window.__cqTrendDocDown, true);
+    document.removeEventListener('keydown', window.__cqTrendDocKey);
+    window.removeEventListener('scroll', window.__cqTrendScroll, true);
+  } catch (e) {}
+  delete window.__cqTrendDocDown;
+  delete window.__cqTrendDocKey;
+  delete window.__cqTrendScroll;
+  var __tp = document.querySelectorAll('.cqtrendpop');
+  for (var __i = 0; __i < __tp.length; __i++) { try { __tp[__i].remove(); } catch (e) {} }
   var n = document.getElementById('cat-quota-entry');
   if (n) n.remove();
   var s = document.getElementById('cat-quota-style');
@@ -881,7 +898,14 @@ fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
     // (== rollout 文件名 uuid);None / 该 uuid 无 rollout 文件(全新对话还没写盘 / 读不到 id)
     // → fail-closed 显「—」,绝不退 newest-mtime 串到别的对话。rollout 含全部历史轮次、compact
     // 已正确计入,不需发新对话。速率(token/s)由注入脚本实时从流式文本估算,payload 不带 rate。
-    let totals = session_id.and_then(codex_app_transfer_usage_tracker::session_totals_for_id);
+    // [MOC-204/230] 一次取回该对话「累计 + 逐轮命中率序列(≤24 桶)」—— 单 walk + 单 parse,热路径安全;
+    // 无 rollout / 全新对话 → 累计「—」+ 空序列(注入面板点「缓存命中」弹趋势折线,空则显「暂无缓存数据」)。
+    let (totals, series) = match session_id
+        .and_then(|id| codex_app_transfer_usage_tracker::session_usage_for_id(id, 24))
+    {
+        Some((t, s)) => (Some(t), s),
+        None => (None, Vec::new()),
+    };
     let cum_part = match totals {
         Some(t) if t.total_tokens > 0 => format!("累计 {}", fmt_tokens(t.total_tokens)),
         _ => "累计 —".to_string(),
@@ -890,11 +914,6 @@ fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
         Some(p) => format!("缓存命中 {}%", p.round() as i64),
         None => "缓存命中 —".to_string(),
     };
-    // [MOC-204 扩展] 逐轮命中率序列(≤24 桶,0–100)供注入面板点「缓存命中」弹趋势折线。
-    // 单文件 + mtime 缓存(cache_hit_series_for_id),热路径安全;无 rollout / 全新对话 → 空数组。
-    let series = session_id
-        .and_then(|id| codex_app_transfer_usage_tracker::cache_hit_series_for_id(id, 24))
-        .unwrap_or_default();
     let duo = json!({"kind": "duo", "cum": cum_part, "right": right, "series": series});
     vec![ctx, duo]
 }
@@ -2094,6 +2113,12 @@ mod tests {
         assert!(REMOVE_SCRIPT.contains("cat-quota-style"));
         // 版本变重装时必须也移除旧 #cat-quota-style(否则 ensureStyle bail、CSS 改动不生效)
         assert!(INSTALL_SCRIPT.contains("__staleStyle"));
+        // [MOC-204 扩展] 卸载(关面板)必须拆掉缓存趋势浮层的 document/window 监听 + 删全局引用 +
+        // 移除孤儿浮层;版本重装也要清孤儿浮层。漏任一即在第三方 app 泄漏监听/浮层(pre-push review)。
+        assert!(REMOVE_SCRIPT.contains("__cqTrendDocDown"));
+        assert!(REMOVE_SCRIPT.contains("removeEventListener"));
+        assert!(REMOVE_SCRIPT.contains("cqtrendpop"));
+        assert!(INSTALL_SCRIPT.contains("__staleTp")); // 重装清理块移除孤儿浮层
     }
 
     #[test]
