@@ -13,7 +13,7 @@
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
   <a href="CHANGELOG.md">Changelog</a> |
-  <a href="https://cmochance.github.io/codex-app-transfer/">Code Graph</a>
+  <a href="https://cmochance.github.io/codex-app-transfer/graph/">Code Graph</a>
 </p>
 
 <p align="center">
