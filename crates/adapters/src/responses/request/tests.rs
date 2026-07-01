@@ -4656,3 +4656,45 @@ fn glm_vision_variant_keeps_image_url() {
         "glm-5v 是视觉款,应保留 image_url"
     );
 }
+
+#[test]
+fn moc233_folded_tool_output_is_byte_stable_across_turns() {
+    // MOC-233 核心不变式:同一 (call_id, 内容) 的大 tool 输出,每轮被折叠成的历史消息必须**字节完全一致**。
+    // 否则 GLM / WorkBuddy 等按 Chat Completions messages 前缀做 prompt cache 的上游会从首条折叠消息起永久
+    // miss —— 旧实现每轮 new_artifact_id()(纳秒+计数)使 `Artifact ID:` 行每轮变,命中率从 ~95% 塌到 ~33%。
+    let store = crate::responses::artifact_store::ToolArtifactStore::new(
+        16,
+        std::time::Duration::from_secs(60),
+    );
+    // 超过 TOOL_OUTPUT_INLINE_MAX_CHARS(4000)才会触发折叠。
+    let raw = format!(
+        "Chunk ID: edd94a\nWall time: 0.0s\nOutput:\n{}",
+        "X".repeat(8000)
+    );
+
+    let turn_a = normalize_tool_output_for_context_with_store(
+        Some("call_5bc14df1"),
+        Value::String(raw.clone()),
+        Some(&store),
+    );
+    let turn_b = normalize_tool_output_for_context_with_store(
+        Some("call_5bc14df1"),
+        Value::String(raw.clone()),
+        Some(&store),
+    );
+
+    assert!(
+        turn_a.contains("[Tool output stored outside model context]"),
+        "超阈值大输出应被折叠"
+    );
+    assert_eq!(
+        turn_a, turn_b,
+        "同一折叠消息跨轮必须字节一致(MOC-233 前缀缓存前提)"
+    );
+    // 折叠文本里只应有一个稳定的 Artifact ID。
+    let ids: std::collections::HashSet<&str> = turn_a
+        .lines()
+        .filter_map(|line| line.strip_prefix("Artifact ID: "))
+        .collect();
+    assert_eq!(ids.len(), 1, "只应有一个稳定 artifact id");
+}
