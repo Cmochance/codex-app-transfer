@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: i64 = 1;
 const DEFAULT_PERSISTED_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -108,12 +108,13 @@ impl ToolArtifactStore {
 
     pub fn save(&self, call_id: Option<&str>, kind: &str, raw_content: &str) -> StoredToolArtifact {
         let now = unix_now();
+        let call_id = call_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
         let record = ToolArtifactRecord {
-            artifact_id: new_artifact_id(),
-            call_id: call_id
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned),
+            artifact_id: artifact_id_for(call_id.as_deref(), kind, raw_content),
+            call_id,
             kind: kind.to_owned(),
             raw_content: raw_content.to_owned(),
             original_chars: raw_content.chars().count(),
@@ -240,6 +241,11 @@ impl ToolArtifactStore {
 
     /// 把 record 写进共享 DB。`Ok(true)` = 已持久化;`Ok(false)` = 无 DB(未持久化, 由 caller
     /// 落内存兜底);`Err` = INSERT 失败(同样由 caller 落内存)。返回值供 [`save`] 标 `persisted`。
+    ///
+    /// MOC-233: `artifact_id` 现按内容确定性生成(见 [`artifact_id_for`]),同一 tool 输出跨轮/跨进程
+    /// 复用同一 id。故用 UPSERT 幂等落盘 —— 已存在(命中 PK)则只刷新 `last_access_unix`(续 TTL、不动
+    /// 原 `created_unix`/`access_count`),而非旧的每次 INSERT 新行:既让折叠进历史的消息字节稳定(不打断
+    /// 上游 prompt cache 前缀),又按内容天然去重、消除 `tool_artifacts.db` 同内容重复行膨胀。
     fn persist_save(&self, record: &ToolArtifactRecord) -> rusqlite::Result<bool> {
         let mut guard = self.db.lock().expect("artifact store db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
@@ -249,7 +255,8 @@ impl ToolArtifactStore {
             "INSERT INTO tool_artifacts \
              (artifact_id, call_id, kind, raw_content, original_chars, original_lines, \
               created_unix, last_access_unix, access_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0) \
+             ON CONFLICT(artifact_id) DO UPDATE SET last_access_unix = excluded.last_access_unix",
             params![
                 &record.artifact_id,
                 record.call_id.as_deref(),
@@ -406,14 +413,27 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn new_artifact_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("tool_artifact_{nanos:x}_{seq:x}")
+/// 内容确定性 artifact id:同一 `(call_id, kind, raw_content)` → 同一 id(SHA-256 前 16 字节 hex)。
+///
+/// MOC-233 根因修复:旧实现 `tool_artifact_{纳秒}_{计数}` 每次 save 都生成新 id,导致同一条历史 tool
+/// 输出每轮被重折叠成不同字节(仅 `Artifact ID:` 行变),打断 GLM / WorkBuddy 等按 messages 前缀做
+/// prompt cache 的上游 —— 缓存从首条折叠消息起永久 miss、命中率从 ~95% 塌到 ~33%。改为内容寻址后,
+/// 折叠进历史的消息跨轮字节稳定,前缀缓存可继续增长;并让 DB 按内容天然去重(配合 persist_save 的
+/// UPSERT)。`call_id` 纳入 key 让不同 tool 调用即使输出相同也各自成档(与摘要里的 `Tool call ID:`
+/// 一致);缺失(id-less)时按空串归一,与 [`save`] 里 `call_id` 的 trim+去空归一保持一致。
+fn artifact_id_for(call_id: Option<&str>, kind: &str, raw_content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(call_id.map(str::trim).unwrap_or("").as_bytes());
+    hasher.update([0u8]);
+    hasher.update(kind.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(raw_content.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("tool_artifact_{hex}")
 }
 
 fn unix_now() -> i64 {
@@ -562,5 +582,59 @@ mod tests {
         assert_eq!(record.call_id.as_deref(), Some("call_b"));
         assert_eq!(record.kind, "web_or_search");
         assert_eq!(record.raw_content, "large web payload");
+    }
+
+    #[test]
+    fn artifact_id_is_content_deterministic() {
+        // MOC-233: 同一 (call_id, kind, raw) 每次 save 必须给同一 id —— 这是折叠进历史的 tool 消息
+        // 跨轮字节稳定、不打断上游 prompt cache 前缀的前提。旧实现(纳秒+计数)每次都变,故有此回归。
+        let store = ToolArtifactStore::new(8, Duration::from_secs(60));
+        let a = store.save(Some("call_x"), "command_output", "same raw payload");
+        let b = store.save(Some("call_x"), "command_output", "same raw payload");
+        assert_eq!(
+            a.artifact_id, b.artifact_id,
+            "同 (call_id,kind,content) 重复 save 必须同 id"
+        );
+        // 内容不同 → id 不同
+        let c = store.save(Some("call_x"), "command_output", "different payload");
+        assert_ne!(a.artifact_id, c.artifact_id);
+        // call_id 纳入 key:同内容不同 call → 不同档(与摘要 Tool call ID 一致)
+        let d = store.save(Some("call_y"), "command_output", "same raw payload");
+        assert_ne!(a.artifact_id, d.artifact_id);
+        assert!(a.artifact_id.starts_with("tool_artifact_"));
+    }
+
+    #[test]
+    fn persisted_save_is_idempotent_no_duplicate_rows() {
+        // MOC-233: 内容确定性 id + UPSERT → 同内容重复 save 只应 1 行(治 tool_artifacts.db 膨胀),
+        // 且回取仍命中全文。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        let (store, _warn) = ToolArtifactStore::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        let first = store.save(Some("call_z"), "command_output", "dedup me");
+        assert!(first.persisted);
+        for _ in 0..5 {
+            let again = store.save(Some("call_z"), "command_output", "dedup me");
+            assert_eq!(again.artifact_id, first.artifact_id);
+            assert!(again.persisted, "命中已存行仍算 persisted");
+        }
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_artifacts WHERE artifact_id = ?1",
+                params![first.artifact_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "同内容 6 次 save 只应留 1 行(UPSERT 去重)");
+        assert_eq!(
+            store.get(&first.artifact_id).unwrap().raw_content,
+            "dedup me"
+        );
     }
 }
