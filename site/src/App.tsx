@@ -92,7 +92,7 @@ export default function App() {
       <nav className="sticky top-0 z-50 border-b border-zinc-900 bg-zinc-950/80 backdrop-blur-md">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
           <div className="flex items-center gap-3">
-            <img src={`${P}icon.png`} alt="" className="h-7 w-7 rounded" />
+            <img src={`${P}icon-nav.png`} alt="" className="h-7 w-7 rounded" />
             <span className="font-semibold tracking-tight">Codex App Transfer</span>
             <span className="rounded-full border border-zinc-800 px-2 py-0.5 font-mono text-xs text-zinc-400">
               {VERSION}
@@ -303,12 +303,11 @@ export default function App() {
           <div className="mt-12 grid gap-6 md:grid-cols-2">
             {[
               { src: "providers.png", label: "Providers — presets + model mapping" },
-              { src: "settings.png", label: "Settings — ports, proxy, plugin unlock" },
               { src: "logs.png", label: "Logs — live request stream" },
               { src: "codex-chat.png", label: "Codex app — real model in the picker" },
             ].map((g) => (
               <figure key={g.src} className="app-frame">
-                <img src={`${P}${g.src}`} alt={g.label} className="w-full" />
+                <img src={`${P}${g.src}`} alt={g.label} className="w-full" loading="lazy" />
                 <figcaption className="border-t border-zinc-800 px-4 py-2.5 font-mono text-xs text-zinc-500">
                   {g.label}
                 </figcaption>
@@ -326,7 +325,7 @@ export default function App() {
           </p>
           <div className="mt-8 space-y-6">
             <figure className="app-frame mx-auto max-w-3xl">
-              <img
+              <img loading="lazy"
                 src={`${P}usage-breakdown.jpg`}
                 alt="Usage panel inside Codex"
                 className="w-full"
@@ -337,7 +336,7 @@ export default function App() {
             </figure>
             <div className="grid gap-6 md:grid-cols-2">
               <figure className="app-frame">
-                <img
+                <img loading="lazy"
                   src={`${P}stash-panel.png`}
                   alt="Stash panel"
                   className="w-full"
@@ -347,7 +346,7 @@ export default function App() {
                 </figcaption>
               </figure>
               <figure className="app-frame">
-                <img
+                <img loading="lazy"
                   src={`${P}stash-dropdown.png`}
                   alt="Stash quick restore"
                   className="w-full"
@@ -369,21 +368,21 @@ export default function App() {
           </p>
           <div className="mt-8 grid gap-6 md:grid-cols-2">
             <figure className="app-frame">
-              <img
-                src={`${P}theme-changli.jpg`}
-                alt="Changli theme"
-                className="w-full"
-              />
+                <img loading="lazy"
+                  src={`${P}theme-changli.jpg`}
+                  alt="Changli theme"
+                  className="w-full"
+                />
               <figcaption className="border-t border-zinc-800 px-4 py-2.5 font-mono text-xs text-zinc-500">
                 Changli
               </figcaption>
             </figure>
             <figure className="app-frame">
-              <img
-                src={`${P}theme-azurlane.jpg`}
-                alt="Azur Lane theme"
-                className="w-full"
-              />
+                <img loading="lazy"
+                  src={`${P}theme-azurlane.jpg`}
+                  alt="Azur Lane theme"
+                  className="w-full"
+                />
               <figcaption className="border-t border-zinc-800 px-4 py-2.5 font-mono text-xs text-zinc-500">
                 Azur Lane
               </figcaption>
@@ -482,7 +481,7 @@ export default function App() {
           <div className="flex flex-col items-start justify-between gap-8 md:flex-row md:items-center">
             <div>
               <div className="flex items-center gap-3">
-                <img src={`${P}icon.png`} alt="" className="h-8 w-8 rounded" />
+                <img src={`${P}icon-nav.png`} alt="" className="h-8 w-8 rounded" />
                 <span className="text-lg font-semibold">
                   Codex App Transfer
                 </span>
