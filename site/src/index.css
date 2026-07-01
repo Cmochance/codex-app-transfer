@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+:root {
+  --background: #09090b;
+  --foreground: #ededee;
+  --accent: #f97316;
+  --font-geist-sans: "Geist", system-ui, sans-serif;
+  --font-geist-mono: "Geist Mono", ui-monospace, monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+  background: var(--background);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(244, 244, 245, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(244, 244, 245, 0.035) 1px, transparent 1px);
+  background-size: 52px 52px;
+}
+
+.hero-glow {
+  background: radial-gradient(
+    ellipse 80% 50% at 50% -10%,
+    rgba(249, 115, 22, 0.14),
+    transparent 70%
+  );
+}
+
+.app-frame {
+  background: #0c0c0e;
+  border: 1px solid #27272a;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.02),
+    0 40px 80px -20px rgba(0, 0, 0, 0.65);
+}
+
+::selection {
+  background: rgba(249, 115, 22, 0.3);
+}
