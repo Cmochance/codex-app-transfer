@@ -134,11 +134,15 @@ fn totals_from_file(path: &std::path::Path) -> SessionTotals {
     totals
 }
 
-static SESSION_TOTALS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<String, (PathBuf, std::time::SystemTime, SessionTotals)>,
-    >,
-> = std::sync::OnceLock::new();
+/// `uuid → (rollout path, mtime, 累计)`(单会话累计缓存,mtime 变即失效)。
+type SessionTotalsCacheMap =
+    std::collections::HashMap<String, (PathBuf, std::time::SystemTime, SessionTotals)>;
+/// `(uuid, max_buckets) → (rollout path, mtime, 逐轮命中率序列)`(单会话趋势缓存)。
+type CacheSeriesCacheMap =
+    std::collections::HashMap<(String, usize), (PathBuf, std::time::SystemTime, Vec<u8>)>;
+
+static SESSION_TOTALS_CACHE: std::sync::OnceLock<std::sync::Mutex<SessionTotalsCacheMap>> =
+    std::sync::OnceLock::new();
 
 /// 按**会话 uuid** 取该对话累计(MOC-230 对话隔离)。在 `~/.codex/sessions/` 下找文件名以
 /// `-<session_id>.jsonl` 结尾的 rollout(rollout 文件名末尾就是会话 uuid,== session_meta
@@ -148,14 +152,17 @@ static SESSION_TOTALS_CACHE: std::sync::OnceLock<
 /// **fail-closed(对话隔离硬保证)**:uuid 无对应 rollout 文件(全新对话还没写盘 / id 不匹配)
 /// → `None`。caller 据此显「—」,**绝不**退回 newest-mtime —— 那会串到别的对话。文件名命中
 /// 本身即自验证 `session_id == 该文件 uuid`(命不中宁可不显也不猜)。
-pub fn session_totals_for_id(session_id: &str) -> Option<SessionTotals> {
+/// 按**会话 uuid** 找该对话 rollout 文件(文件名以 `-<uuid>.jsonl` 结尾)+ 其 mtime。
+/// 累计 [`session_totals_for_id`] 与逐轮 [`cache_hit_series_for_id`] 共用同一 uuid→file 解析
+/// (单文件,不走全量 `load_codex_events`)。**fail-closed**:无匹配 → `None`(caller 显「—」/
+/// 不显趋势,**绝不**退回 newest-mtime — 那会串到别的对话)。
+fn find_session_rollout(session_id: &str) -> Option<(PathBuf, std::time::SystemTime)> {
     if session_id.is_empty() {
         return None;
     }
     let dirs = codex_usage_paths().ok()?;
     let needle = format!("-{session_id}.jsonl");
-    let mut found: Option<(PathBuf, std::time::SystemTime)> = None;
-    'outer: for dir in &dirs {
+    for dir in &dirs {
         let mut files = Vec::new();
         walk(dir, &mut files);
         for f in files {
@@ -165,13 +172,16 @@ pub fn session_totals_for_id(session_id: &str) -> Option<SessionTotals> {
                 .is_some_and(|n| n.ends_with(&needle));
             if is_match {
                 if let Ok(mt) = std::fs::metadata(&f).and_then(|m| m.modified()) {
-                    found = Some((f, mt));
-                    break 'outer; // 会话 uuid 唯一,命中即取
+                    return Some((f, mt)); // 会话 uuid 唯一,命中即取
                 }
             }
         }
     }
-    let (path, mtime) = found?; // 无文件 → fail-closed None(不退 newest-mtime)
+    None
+}
+
+pub fn session_totals_for_id(session_id: &str) -> Option<SessionTotals> {
+    let (path, mtime) = find_session_rollout(session_id)?;
     let cache = SESSION_TOTALS_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some((p, mt, totals)) = cache.lock().unwrap().get(session_id) {
@@ -657,6 +667,74 @@ pub fn cache_series_for_conversation(session_id: &str) -> Result<Vec<CacheBucket
         })
         .collect();
     Ok(bucket_series(&points, 10))
+}
+
+static CACHE_SERIES_CACHE: std::sync::OnceLock<std::sync::Mutex<CacheSeriesCacheMap>> =
+    std::sync::OnceLock::new();
+
+/// 单个 rollout 文件 → 逐轮命中率(0–100)分桶序列。单文件解析(dedupe + 按 ts 升序 +
+/// [`bucket_series`]),每桶命中率 = `cached_input / input`(input=0 → 0)。
+fn hit_series_from_file(path: &std::path::Path, max_buckets: usize) -> Vec<u8> {
+    let mut events: Vec<CodexTokenUsageEvent> = Vec::new();
+    let sessions_dir = path.parent().unwrap_or(path);
+    let _ = visit_codex_session_file(sessions_dir, path, |event| {
+        events.push(event);
+        Ok(())
+    });
+    dedupe_events(&mut events);
+    // Codex rollout 同 session 内 ts 单调(对照 cache_series_for_conversation)。
+    events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    let points: Vec<(u64, u64, u64)> = events
+        .iter()
+        .map(|e| {
+            (
+                e.cached_input_tokens.min(e.input_tokens),
+                e.input_tokens,
+                e.output_tokens,
+            )
+        })
+        .collect();
+    bucket_series(&points, max_buckets)
+        .iter()
+        .map(|b| {
+            if b.input_tokens > 0 {
+                ((b.cached_input_tokens as f64 / b.input_tokens as f64) * 100.0).round() as u8
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// 某对话逐轮缓存命中率(0–100)序列,分桶成 ≤`max_buckets` 个点 —— 供 Codex Desktop 注入面板
+/// 点「缓存命中」弹趋势折线(MOC-204 扩展)。与 [`cache_series_for_conversation`](Usage tab 直方图)
+/// 不同:那个走 `load_codex_events` 全量解析(点击时按需调、可接受);本函数是 **单文件 +
+/// `(uuid,max)→(path,mtime,series)` 缓存**(镜像 [`session_totals_for_id`]),因此可安全用于
+/// daemon **每-tick 热路径**(空闲 tick 命中缓存、仅新轮次 mtime 变时重算单文件)。
+/// fail-closed:uuid 无 rollout → `None`(caller 不显趋势)。
+pub fn cache_hit_series_for_id(session_id: &str, max_buckets: usize) -> Option<Vec<u8>> {
+    if max_buckets == 0 {
+        return None;
+    }
+    let (path, mtime) = find_session_rollout(session_id)?;
+    let cache =
+        CACHE_SERIES_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = (session_id.to_string(), max_buckets);
+    if let Some((p, mt, series)) = cache.lock().unwrap().get(&key) {
+        if p == &path && *mt == mtime {
+            return Some(series.clone()); // 文件没变,复用
+        }
+    }
+    let series = hit_series_from_file(&path, max_buckets);
+    {
+        let mut guard = cache.lock().unwrap();
+        // 同 SESSION_TOTALS_CACHE:超 64 条整体清空,防长寿 daemon 无界增长。
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(key, (path, mtime, series.clone()));
+    }
+    Some(series)
 }
 
 #[cfg(test)]

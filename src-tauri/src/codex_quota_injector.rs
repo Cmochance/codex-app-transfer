@@ -56,7 +56,7 @@ const INSTALL_SCRIPT: &str = r##"
   // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
   // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
   // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
-  var VERSION = 5; // bump:quota 行 CSS 改动(.cql nowrap)+ 明细精简 → 升级后免重启 Codex 即覆盖旧注入
+  var VERSION = 7; // bump:缓存命中趋势浮层去掉左侧竖排标题(仅留 y 刻度 + 折线)→ 升级后免重启 Codex 即覆盖旧注入
   if (window.__catQuotaInstalled) {
     if (window.__catQuotaVersion === VERSION) return;
     try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
@@ -125,7 +125,18 @@ const INSTALL_SCRIPT: &str = r##"
       '#cat-quota-entry .cqbdpc{color:var(--color-token-text-tertiary,rgba(238,241,247,.5));width:48px;text-align:right;font-variant-numeric:tabular-nums}' +
       // [MOC-231] payload 非当前活动会话时,隐藏 breakdown caret + 下拉(对齐 refreshDuo 的 uuid 守卫,防切对话 1 tick stale 串显)
       '#cat-quota-entry .cqb.cqbdmismatch .cqbdcaret{display:none}' +
-      '#cat-quota-entry .cqb.cqbdmismatch .cqbd{display:none}';
+      '#cat-quota-entry .cqb.cqbdmismatch .cqbd{display:none}' +
+      // [MOC-204 扩展] 「缓存命中」可点 → 弹逐轮趋势折线浮层(仅左轴 + 折线,固定宽度)。
+      // 浮层挂 document.body(逃离面板/弹窗 overflow),故选择器不 scope 到 #cat-quota-entry。
+      '#cat-quota-entry .cqcache.cqclk{cursor:pointer}' +
+      '#cat-quota-entry .cqcache.cqclk:hover{color:var(--color-token-text-primary,#ededed);text-decoration:underline}' +
+      '.cqtrendpop{position:fixed;z-index:2147483600;box-sizing:border-box;width:200px;padding:8px 10px;background:var(--color-token-dropdown-background,rgba(20,24,36,.97));border:1px solid rgba(128,128,128,.28);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.4)}' +
+      '.cqtrendpop .cqtp-chart{display:flex;align-items:stretch;gap:5px;height:76px}' +
+      '.cqtrendpop .cqtp-y{display:flex;flex-direction:column;justify-content:space-between;padding:1px 0;min-width:18px;font-size:10px;font-variant-numeric:tabular-nums;color:var(--color-token-text-tertiary,rgba(238,241,247,.5));text-align:right}' +
+      '.cqtrendpop svg{flex:1;height:100%;border-left:1px solid rgba(128,128,128,.28);border-bottom:1px solid rgba(128,128,128,.28)}' +
+      '.cqtrendpop .cqtp-grid{stroke:rgba(128,128,128,.22);stroke-width:.5;stroke-dasharray:2 2;vector-effect:non-scaling-stroke}' +
+      '.cqtrendpop .cqtp-line{fill:none;stroke:var(--cl-accent,#6c83c4);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}' +
+      '.cqtrendpop .cqtp-msg{font-size:11px;color:var(--color-token-text-tertiary,rgba(238,241,247,.56));text-align:center;padding:6px 2px}';
     (document.head || document.documentElement).appendChild(st);
   }
 
@@ -426,6 +437,8 @@ const INSTALL_SCRIPT: &str = r##"
       var patch = {};
       if (cumV.indexOf('—') < 0) patch.cum = cumV;
       if (cacheV.indexOf('—') < 0) patch.cacheRight = cacheV;
+      // [MOC-204 扩展] 逐轮趋势序列随本对话 payload 同步到元素 + 缓存(供 (re)load 即显)。
+      if (Array.isArray(duo.series)) { patch.series = duo.series; if (cacheEl) cacheEl.__series = duo.series; }
       usageCacheMerge(cid, patch);
     } else {
       // [MOC-231] payload 还不是本对话(daemon 1-tick / 冷启动还没 push 到本对话):
@@ -433,6 +446,7 @@ const INSTALL_SCRIPT: &str = r##"
       var c = usageCacheGet(cid);
       cumV = (c && c.cum) || '累计 —';
       cacheV = (c && c.cacheRight) || '缓存命中 —';
+      if (cacheEl) cacheEl.__series = (c && Array.isArray(c.series)) ? c.series : [];
     }
     if (cumEl && cumEl.textContent !== cumV) cumEl.textContent = cumV;
     if (cacheEl && cacheEl.textContent !== cacheV) cacheEl.textContent = cacheV;
@@ -493,6 +507,79 @@ const INSTALL_SCRIPT: &str = r##"
     return box;
   }
 
+  // ── [MOC-204 扩展] 点「缓存命中」→ 其正下方固定宽度浮层显示逐轮命中率折线(仅左轴 + 折线)──
+  var __cqTrendPop = null;
+  function closeCacheTrend() {
+    if (__cqTrendPop) { try { __cqTrendPop.remove(); } catch (e) {} __cqTrendPop = null; }
+  }
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  // viewBox 100×100 + preserveAspectRatio=none:点数(桶数)变化只改折线疏密,不改渲染宽度。
+  function buildTrendSvg(series) {
+    var svg = svgEl('svg', { viewBox: '0 0 100 100', preserveAspectRatio: 'none' });
+    var yOf = function(p) { return 2 + 96 * (1 - p / 100); }; // 上下各留 2 防描边裁切
+    [0, 50, 100].forEach(function(g) {
+      svg.appendChild(svgEl('line', { 'class': 'cqtp-grid', x1: 0, x2: 100, y1: yOf(g), y2: yOf(g) }));
+    });
+    var n = series.length;
+    var pts = series.map(function(p, i) {
+      p = Math.max(0, Math.min(100, +p || 0));
+      var x = n === 1 ? 50 : (100 * i) / (n - 1);
+      return x.toFixed(1) + ',' + yOf(p).toFixed(1);
+    }).join(' ');
+    svg.appendChild(svgEl('polyline', { 'class': 'cqtp-line', points: pts }));
+    return svg;
+  }
+  function toggleCacheTrend(anchor) {
+    if (__cqTrendPop) { closeCacheTrend(); return; } // 再点同一处 → 收起
+    var series = (anchor && anchor.__series) || [];
+    var pop = el('div', 'cqtrendpop');
+    if (!series.length) {
+      pop.appendChild(el('div', 'cqtp-msg', '暂无缓存数据'));
+    } else {
+      var chart = el('div', 'cqtp-chart');
+      var yax = el('div', 'cqtp-y');
+      yax.appendChild(el('span', null, '100'));
+      yax.appendChild(el('span', null, '50'));
+      yax.appendChild(el('span', null, '0'));
+      chart.appendChild(yax);
+      chart.appendChild(buildTrendSvg(series));
+      pop.appendChild(chart);
+    }
+    document.body.appendChild(pop);
+    // 定位:锚点正下方;贴视口边缘夹取;下方放不下 → 翻到上方。
+    var rc = anchor.getBoundingClientRect();
+    var w = pop.offsetWidth || 200, h = pop.offsetHeight || 96;
+    var left = Math.min(Math.max(8, rc.left), window.innerWidth - w - 8);
+    var top = rc.bottom + 6;
+    if (top + h > window.innerHeight - 8) top = rc.top - 6 - h;
+    pop.style.left = left + 'px';
+    pop.style.top = Math.max(8, top) + 'px';
+    __cqTrendPop = pop;
+  }
+  // 点浮层外(且非命中率本身)/ Esc / 滚动 → 关闭。具名挂 window:版本变重装时先移除旧的(幂等,防叠加)。
+  try {
+    document.removeEventListener('pointerdown', window.__cqTrendDocDown, true);
+    document.removeEventListener('keydown', window.__cqTrendDocKey);
+    window.removeEventListener('scroll', window.__cqTrendScroll, true);
+  } catch (e) {}
+  window.__cqTrendDocDown = function(e) {
+    if (!__cqTrendPop) return;
+    var tg = e.target;
+    if (__cqTrendPop.contains(tg)) return;
+    if (tg && tg.closest && tg.closest('.cqcache')) return; // 点命中率本身 → 由其 handler 开合
+    closeCacheTrend();
+  };
+  window.__cqTrendDocKey = function(e) { if (e.key === 'Escape') closeCacheTrend(); };
+  window.__cqTrendScroll = function() { closeCacheTrend(); };
+  document.addEventListener('pointerdown', window.__cqTrendDocDown, true);
+  document.addEventListener('keydown', window.__cqTrendDocKey);
+  window.addEventListener('scroll', window.__cqTrendScroll, true);
+
   function buildRow(r) {
     if (r && r.kind === 'duo') {
       // 左:实时速率(.cqrate,JS 刷)· 累计(payload);右:缓存命中(payload)
@@ -502,7 +589,14 @@ const INSTALL_SCRIPT: &str = r##"
       lw.appendChild(document.createTextNode(' · '));
       lw.appendChild(el('span', 'cqcum', r.cum || '累计 —'));
       d.appendChild(lw);
-      d.appendChild(el('span', 'r cqcache', r.right || ''));
+      // [MOC-204 扩展] 右侧缓存命中可点 → 弹逐轮趋势折线。series 存元素上,refreshDuo 每 tick 同步。
+      var cacheSpan = el('span', 'r cqcache cqclk', r.right || '');
+      cacheSpan.__series = Array.isArray(r.series) ? r.series : [];
+      cacheSpan.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        toggleCacheTrend(cacheSpan);
+      });
+      d.appendChild(cacheSpan);
       return d;
     }
     if (r && r.kind === 'ctx') {
@@ -796,7 +890,12 @@ fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
         Some(p) => format!("缓存命中 {}%", p.round() as i64),
         None => "缓存命中 —".to_string(),
     };
-    let duo = json!({"kind": "duo", "cum": cum_part, "right": right});
+    // [MOC-204 扩展] 逐轮命中率序列(≤24 桶,0–100)供注入面板点「缓存命中」弹趋势折线。
+    // 单文件 + mtime 缓存(cache_hit_series_for_id),热路径安全;无 rollout / 全新对话 → 空数组。
+    let series = session_id
+        .and_then(|id| codex_app_transfer_usage_tracker::cache_hit_series_for_id(id, 24))
+        .unwrap_or_default();
+    let duo = json!({"kind": "duo", "cum": cum_part, "right": right, "series": series});
     vec![ctx, duo]
 }
 
@@ -836,7 +935,7 @@ fn build_mock_payload() -> serde_json::Value {
             {"key":"system_prompt","tokens":86,"items":1}
         ]
     }}));
-    rows.push(json!({"kind":"duo","cum":"累计 128.5k","right":"缓存命中 67%"}));
+    rows.push(json!({"kind":"duo","cum":"累计 128.5k","right":"缓存命中 67%","series":[19,71,95,42,38,90,88]}));
     json!({ "header": "Usage", "title": "fixture", "rows": rows })
 }
 
@@ -2017,6 +2116,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_trend_popover_contract() {
+        // [MOC-204 扩展] 点「缓存命中」弹逐轮趋势折线:JS 侧函数 + CSS + 读 payload series 必须在场,
+        // 且真实 duo(local_usage_rows)带 series 数组 —— 任一侧漏改即挂。
+        assert!(INSTALL_SCRIPT.contains("function toggleCacheTrend"));
+        assert!(INSTALL_SCRIPT.contains("cqtrendpop"));
+        assert!(INSTALL_SCRIPT.contains("cqtp-line"));
+        assert!(INSTALL_SCRIPT.contains("r.series")); // buildRow 从 payload 取 series 存元素
+        assert!(INSTALL_SCRIPT.contains("cqcache cqclk")); // 命中率文本可点
+                                                           // daemon 侧:活动会话 duo 行必带 series(数组;无 rollout / 全新对话 → 空数组)
+        let rows = local_usage_rows(None);
+        let duo = rows.iter().find(|r| r["kind"] == "duo").expect("duo row");
+        assert!(duo["series"].is_array(), "duo 必带 series 数组");
+    }
+
+    #[test]
     fn mock_payload_matches_js_contract() {
         // [MOC-204 Phase 1] 锁 payload↔JS 契约:JS 按 rows[].kind 渲染 bar/duo,
         // bar 读 pct/cls/label/detail,duo 读 left/right;改任一侧不同步即挂这条。
@@ -2126,7 +2240,7 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
                                                      // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
         assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
-        assert!(INSTALL_SCRIPT.contains("var VERSION = 5")); // bump:quota 行 CSS(.cql nowrap)+ 明细精简
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 7")); // bump:缓存命中趋势浮层去掉左侧竖排标题
     }
 
     #[test]
