@@ -24,11 +24,9 @@
 //!     response.content_part.done
 //!   [if reasoning:]
 //!     response.reasoning_summary_part.added  ← summary_index=0
-//!     response.reasoning_summary_text.delta  ← 增量(summary 通道,旧版兼容)
-//!     response.reasoning_text.delta          ← 增量(content 通道,v26.608+ 渲染)
+//!     response.reasoning_summary_text.delta  ← 增量(summary 通道,官方 v26.623 实测唯一渲染通道)
 //!     response.reasoning_summary_text.done
 //!     response.reasoning_summary_part.done
-//!     response.reasoning_text.done           ← content 通道完毕
 //!   [if function_call:]
 //!     response.function_call_arguments.delta  ← 一次性 emit 完整 args(Gemini 不增量)
 //!     response.function_call_arguments.done
@@ -39,8 +37,9 @@
 //!
 //! Gemini → Responses 字段映射:
 //! - `candidates[].content.parts[].text` (thought≠true) → output_text.delta
-//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta(summary 通道)
-//!   + reasoning_text.delta(content 通道,v26.608+ 渲染);双发兼容新旧版 Codex
+//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta
+//!   (单发 summary 通道;官方 v26.623 实测 summary-only 正常显示,双发 content 通道
+//!   会致同一思考块重复更新闪烁,已移除)
 //! - `candidates[].content.parts[].functionCall {name, args}` → function_call output_item
 //!   (args 序列化成 JSON string 灌进 function_call_arguments.delta)
 //! - `candidates[].groundingMetadata` → output_text.annotation.added(在 message 内)
@@ -1384,7 +1383,11 @@ impl GeminiToResponsesConverter {
             }
             None => return,
         };
-        // summary 通道(保留,兼容旧版渲染)
+        // [单发 summary 通道] 实测官方 gpt-5.5(v26.623)reasoning 只发
+        // `reasoning_summary_text.delta`(不发 content 通道 `reasoning_text.delta`),
+        // 思考照常显示——当前 Codex 靠 summary 通道渲染。原双发(额外 content 通道)
+        // 会让 Codex 对同一思考块重复更新 → 整段闪烁重渲染,与 chat converter 同步
+        // 去掉 content 通道(见 responses/converter.rs emit_reasoning_delta 注释)。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1394,22 +1397,6 @@ impl GeminiToResponsesConverter {
                 "item_id": item_id,
                 "output_index": output_index,
                 "summary_index": 0,
-                "delta": delta,
-            }),
-        );
-        // [verify content 通道] 新版 Codex(v26.608+)渲染思考块认 reasoning_text
-        // (content_index),GPT 直连走此通道(本地 session 实证:GPT reasoning
-        // summary:[] 却正常显示);transfer 此前只发 summary→被新版废弃不渲染。
-        // 双发 content 对齐 GPT,summary 留作旧版兼容。
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_text.delta",
-            json!({
-                "type": "response.reasoning_text.delta",
-                "item_id": item_id,
-                "output_index": output_index,
-                "content_index": 0,
                 "delta": delta,
             }),
         );
@@ -1446,28 +1433,16 @@ impl GeminiToResponsesConverter {
                 },
             }),
         );
-        // [verify content 通道] 对齐 GPT:补发 reasoning_text.done(content_index)
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_text.done",
-            json!({
-                "type": "response.reasoning_text.done",
-                "item_id": rs.item_id,
-                "output_index": rs.output_index,
-                "content_index": 0,
-                "text": rs.text_acc,
-            }),
-        );
+        // [单发 summary 通道] 不再补发 content 通道 `reasoning_text.done`
+        // (对齐官方、消除重渲染,见 emit_reasoning_delta 处注释)。
         // [MOC-218 第三关] reasoning **item** 不带 `content` / `encrypted_content`:
         // OpenAI Responses 后端对 input 里 reasoning item 硬校验 `content` 数组
         // 长度必须 0(`array_above_max_length`,真 GPT 自家 rollout item 形态即
         // `{type, summary, encrypted_content}` 无 content)、`encrypted_content`
         // 假值有 MOC-13 invalid_encrypted_content 前科(null 行为未定义,缺失
         // 最安全)。item 会被 Codex 持久化进会话历史,切真 GPT 时原样上发 ——
-        // 必须出生即合规。当轮渲染不受影响:新版(v26.608+)读 SSE
-        // `reasoning_text.delta` content 通道事件(上方保留双发,MOC-203),
-        // 实证 GPT 直连 summary:[] 仍正常显示 = 渲染靠事件流不靠 item 字段。
+        // 必须出生即合规。当轮渲染靠 summary 通道 SSE 事件,不靠 item 字段
+        // (实证官方 v26.623 summary-only 正常显示)。
         let item = json!({
             "type": "reasoning",
             "status": "completed",
@@ -2912,21 +2887,16 @@ mod tests {
         let r = output.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(r["summary"][0]["text"], "thinking step");
 
-        // [MOC-203] content 通道双发(v26.608+ 渲染):delta/done + envelope content
-        assert!(names.contains(&"response.reasoning_text.delta".into()));
-        assert!(names.contains(&"response.reasoning_text.done".into()));
-        let text_done = events
-            .iter()
-            .map(|s| parse_event(s.as_str()))
-            .find(|(n, _)| n == "response.reasoning_text.done")
-            .unwrap();
-        assert_eq!(text_done.1["content_index"], 0);
-        // gemini 不注入 **Thinking** header,content 通道 = 原始思考文本
-        assert_eq!(text_done.1["text"], "thinking step");
+        // [单发 summary 通道] content 通道 reasoning_text.* 已移除(实测官方
+        // v26.623 summary-only 正常显示;双发致同一思考块重复更新闪烁)
+        assert!(
+            !names.contains(&"response.reasoning_text.delta".into())
+                && !names.contains(&"response.reasoning_text.done".into()),
+            "content 通道 reasoning_text 事件应已移除"
+        );
         // [MOC-218 第三关] item 不带 content / encrypted_content:OpenAI 后端
         // 对 input reasoning item 硬校验 content 数组长度 0,假 encrypted 有
-        // MOC-13 前科;content 通道只走 SSE 事件(上方断言),item 持久化形态
-        // 必须出生即合规(切真 GPT 历史原样上发)。
+        // MOC-13 前科;item 持久化形态必须出生即合规(切真 GPT 历史原样上发)。
         assert!(r.get("content").is_none(), "reasoning item 不得带 content");
         assert!(
             r.get("encrypted_content").is_none(),
