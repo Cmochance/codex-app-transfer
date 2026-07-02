@@ -215,6 +215,12 @@ pub struct GeminiToResponsesConverter {
 
     // ─ 终态 ─
     has_seen_tool_calls: bool,
+    /// 本响应是否出现过工具调用,用于给 assistant message item 定 `phase`
+    /// (commentary=铺垫/final_answer=最终答复;Codex Desktop 靠此整轮折叠进
+    /// "Working")。与 `has_seen_tool_calls` 区别:本 flag 在检测到 functionCall
+    /// part 的当刻(close_message 之前)即置真,保证被工具调用关闭的铺垫 message
+    /// 也判定为 commentary(实证官方 gpt-5.5:message item 顶层带 phase)。
+    saw_function_call: bool,
     final_finish_reason: Option<String>,
     final_usage: Option<Value>,
 
@@ -302,6 +308,7 @@ impl GeminiToResponsesConverter {
             closed_other_items: Vec::new(),
             pending_image_prompt: None,
             has_seen_tool_calls: false,
+            saw_function_call: false,
             final_finish_reason: None,
             final_usage: None,
             accumulated_safety_ratings: Vec::new(),
@@ -815,6 +822,9 @@ impl GeminiToResponsesConverter {
                     }
                     // functionCall part
                     if let Some(fc) = &part.function_call {
+                        // 本响应有工具调用 → 先于 close_message 记 flag,让被关闭的
+                        // 铺垫 message 判定为 commentary(见字段 doc)。
+                        self.saw_function_call = true;
                         // function_call 是独立 output item,关掉所有 message/reasoning
                         if self.open_message.is_some() {
                             self.close_message(out);
@@ -1172,6 +1182,18 @@ impl GeminiToResponsesConverter {
 
     // ───── message item ─────
 
+    /// assistant message item 的 `phase`:本响应含工具调用 → `commentary`
+    /// (铺垫,Codex 折叠进 Working);否则 `final_answer`(最终答复,展开)。
+    /// 仅在 close 时调用取权威值;open 时一律发 `commentary`(临时 final_answer
+    /// 会让 Codex 在每个工具轮的文本开始时提前折叠、工具调用到达后又展开)。
+    fn message_phase(&self) -> &'static str {
+        if self.saw_function_call {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+    }
+
     fn open_message(&mut self, out: &mut Vec<u8>) {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
@@ -1189,6 +1211,7 @@ impl GeminiToResponsesConverter {
                     "status": "in_progress",
                     "role": "assistant",
                     "content": [],
+                    "phase": "commentary",
                 },
             }),
         );
@@ -1297,6 +1320,8 @@ impl GeminiToResponsesConverter {
                 "text": msg.text_acc,
                 "annotations": msg.annotations_acc,
             }],
+            // 权威 phase(本响应工具调用已在 close 前记录)。
+            "phase": self.message_phase(),
         });
         emit_event(
             out,

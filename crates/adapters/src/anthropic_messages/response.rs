@@ -286,6 +286,12 @@ pub struct AnthropicMessagesToResponsesConverter {
     next_output_index: u32,
     open_blocks: BTreeMap<u32, OpenBlock>,
     closed_items: Vec<(u32, Value)>,
+    /// 本响应是否出现过 tool_use 块,用于给 assistant message item 定 `phase`
+    /// (commentary=铺垫/final_answer=最终答复;Codex Desktop 靠此整轮折叠进
+    /// "Working")。注:Anthropic 块序为 text 块先 stop、tool_use 块后 start,
+    /// 故"铺垫文本后跟工具调用"时文本块 close 早于本 flag 置真 → 退回临时
+    /// final_answer(不比缺 phase 差);纯文本答复(无 tool_use)可靠判 final_answer。
+    saw_function_call: bool,
     final_stop_reason: Option<String>,
     final_stop_sequence: Option<String>,
     final_usage: Option<Value>,
@@ -345,6 +351,7 @@ impl AnthropicMessagesToResponsesConverter {
             next_output_index: 0,
             open_blocks: BTreeMap::new(),
             closed_items: Vec::new(),
+            saw_function_call: false,
             final_stop_reason: None,
             final_stop_sequence: None,
             final_usage: None,
@@ -553,6 +560,21 @@ impl AnthropicMessagesToResponsesConverter {
         self.emit_failure(code, message, out);
     }
 
+    /// assistant message item 的 `phase`:本响应含工具调用 → `commentary`
+    /// (铺垫,Codex 折叠进 Working);否则 `final_answer`(最终答复,展开)。
+    /// 仅在 close 时调用取权威值;open 时一律发 `commentary`(临时 final_answer
+    /// 会让 Codex 在每个工具轮的文本开始时提前折叠、工具调用到达后又展开)。
+    /// 注:Anthropic 块序为 text 块先 stop、tool_use 块后 start,"铺垫文本+工具"
+    /// 场景下 close 时本 flag 仍未置真 → done 判 final_answer 偏早(该限制此前已
+    /// 记录,不比缺 phase 差;纯文本答复判定可靠)。
+    fn message_phase(&self) -> &'static str {
+        if self.saw_function_call {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+    }
+
     fn open_text(&mut self, index: u32, initial_text: &str, out: &mut Vec<u8>) {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
@@ -570,6 +592,7 @@ impl AnthropicMessagesToResponsesConverter {
                     "status": "in_progress",
                     "role": "assistant",
                     "content": [],
+                    "phase": "commentary",
                 },
             }),
         );
@@ -635,6 +658,7 @@ impl AnthropicMessagesToResponsesConverter {
                 "text": text.text_acc,
                 "annotations": [],
             }],
+            "phase": self.message_phase(),
         });
         emit_event(
             out,
@@ -746,6 +770,8 @@ impl AnthropicMessagesToResponsesConverter {
     }
 
     fn open_tool_call(&mut self, index: u32, block: &Value, out: &mut Vec<u8>) {
+        // 本响应有工具调用 → 后续/同响应的 message 判 commentary(见字段 doc)。
+        self.saw_function_call = true;
         let item_id = format!("fc_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;

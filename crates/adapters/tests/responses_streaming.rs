@@ -102,11 +102,9 @@ const KIMI_REASONING_LIFECYCLE: &[&str] = &[
     "response.reasoning_summary_part.added",
     "response.reasoning_summary_text.delta", // open_reasoning 注入的 `**Thinking**\n\n` prefix
     "response.reasoning_summary_text.delta", // 上游真实 reasoning_content delta(summary 通道)
-    "response.reasoning_text.delta",         // 同 delta 双发 content 通道(v26.608+ 渲染,无 header)
     "response.reasoning_summary_text.done",
     "response.reasoning_summary_part.done",
-    "response.reasoning_text.done", // content 通道收尾
-    "response.output_item.done",    // reasoning close
+    "response.output_item.done", // reasoning close
     "response.completed",
 ];
 
@@ -129,13 +127,15 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
         .unwrap();
     assert_eq!(summary_done.1["text"], "**Thinking**\n\nThe");
 
-    // content 通道收尾文本 = 纯思考(无注入 prefix)
-    let text_done = events
-        .iter()
-        .find(|(n, _)| n == "response.reasoning_text.done")
-        .unwrap();
-    assert_eq!(text_done.1["text"], "The");
-    assert_eq!(text_done.1["content_index"], 0);
+    // [单发 summary 通道] 不再发 content 通道 `reasoning_text.*`(对齐官方 v26.623、
+    // 消除重渲染);断言其确实不出现
+    assert!(
+        !events
+            .iter()
+            .any(|(n, _)| n == "response.reasoning_text.delta"
+                || n == "response.reasoning_text.done"),
+        "content 通道 reasoning_text 事件应已移除"
+    );
 
     // completed: incomplete + max_output_tokens(finish_reason=length),
     // output 里只有 reasoning item,没有 message item
