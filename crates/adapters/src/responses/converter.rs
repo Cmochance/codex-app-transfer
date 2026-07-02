@@ -20,8 +20,8 @@
 //!         emit response.created (一次)
 //!                    │
 //!         首次 reasoning_content delta:
-//!           reasoning open → reasoning.summary_text.delta*(summary 通道,旧版兼容)
-//!                          + reasoning_text.delta*(content 通道,v26.608+ 渲染)
+//!           reasoning open → reasoning.summary_text.delta*(单发 summary 通道,
+//!                            当前 Codex 靠此渲染;不发 content 通道 reasoning_text.delta)
 //!         首次 content delta:
 //!           if reasoning 还开着 → reasoning close
 //!           message open → output_text.delta*
@@ -1474,8 +1474,7 @@ impl ChatToResponsesConverter {
         // 但 Kimi for Coding / DeepSeek thinking 等纯文本流默认无 `**`,
         // 不补 prefix 就会被整段隐藏。详见
         // `docs/investigation/kimi-reasoning-truncation.md` §5.4 根因结论。
-        // header 只进 summary 通道;content 通道(reasoning_text)各 emit 点
-        // 统一用同一常量剥掉,保持纯思考。
+        // header 只进 summary 通道(当前单发 summary、不发 content 通道 reasoning_text)。
         const REASONING_HEADER: &str = crate::responses::request::CODEX_REASONING_PREFIX;
         self.reasoning_acc.push_str(REASONING_HEADER);
         emit_event(
@@ -3427,15 +3426,15 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             completed["output"][0]["summary"][0]["text"],
             "**Thinking**\n\npart1 part2"
         );
-        // [MOC-218 第三关] item 不带 content(content 通道只走 SSE 事件;多
-        // delta 拼接的纯思考文本由 reasoning_text.done 事件承载)
+        // [MOC-218 第三关] item 不带 content(纯思考文本走 summary 通道 SSE 事件,
+        // 单发 summary、不发 content 通道 reasoning_text)
         assert!(completed["output"][0].get("content").is_none());
     }
 
     /// MOC-203 交错修复锁定:reasoning 开着时来 tool_call,必须先完整闭合
-    /// reasoning(summary done → part done → reasoning_text done → item done)
-    /// 再开 function_call item。新版 Codex 渲染要求 item 顺序闭合,交错的
-    /// reasoning 会被静默丢弃(思考块不显示)。
+    /// reasoning(summary done → part done → item done)再开 function_call item。
+    /// 新版 Codex 渲染要求 item 顺序闭合,交错的 reasoning 会被静默丢弃
+    /// (思考块不显示)。
     #[test]
     fn reasoning_then_tool_call_closes_reasoning_before_function_call_item() {
         let mut c = fixed();
@@ -3521,7 +3520,7 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
         // 两段 item id 不同(避免与已 done 的 item 撞 id)
         assert_ne!(output[0]["id"], output[2]["id"]);
         // [MOC-218 第三关] item 不带 content;各段独立思考文本经 SSE
-        // reasoning_text 事件与 summary 承载
+        // summary 通道事件承载(单发 summary、不发 content 通道 reasoning_text)
         assert!(output[0].get("content").is_none());
         assert!(output[2].get("content").is_none());
         assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink1");
