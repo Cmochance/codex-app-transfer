@@ -20,8 +20,8 @@
 //!         emit response.created (一次)
 //!                    │
 //!         首次 reasoning_content delta:
-//!           reasoning open → reasoning.summary_text.delta*(summary 通道,旧版兼容)
-//!                          + reasoning_text.delta*(content 通道,v26.608+ 渲染)
+//!           reasoning open → reasoning.summary_text.delta*(单发 summary 通道,
+//!                            当前 Codex 靠此渲染;不发 content 通道 reasoning_text.delta)
 //!         首次 content delta:
 //!           if reasoning 还开着 → reasoning close
 //!           message open → output_text.delta*
@@ -217,6 +217,14 @@ pub struct ChatToResponsesConverter {
     tool_calls: BTreeMap<u32, PendingToolCall>,
     /// fc_id 生成种子:`fc_<seed>_<openai_index>`;一次响应里固定不变
     fc_id_seed: String,
+    /// 本响应内是否出现过任意工具调用(function_call / apply_patch / tool_search)。
+    /// 用于给 assistant message item 定 `phase`:含工具调用的响应里,message 是
+    /// 铺垫/中间叙述(harmony `commentary` 通道)→ `commentary`;纯文本响应
+    /// (无工具调用)是最终答复(`final`/final answer 通道)→ `final_answer`。
+    /// Codex Desktop 靠该字段把一轮的 reasoning+工具+commentary 折叠进 "Working",
+    /// 只展开 `final_answer` 那条(实证官方 gpt-5.5 wire:message item 顶层带
+    /// `"phase":"final_answer"`,`response.output_item.added/done` 都带)。
+    saw_function_call: bool,
 
     model: String,
     finish_reason: Option<String>,
@@ -299,6 +307,7 @@ impl ChatToResponsesConverter {
             think_tag_buffer: String::new(),
             tool_calls: BTreeMap::new(),
             fc_id_seed,
+            saw_function_call: false,
             model: String::new(),
             finish_reason: None,
             usage: None,
@@ -630,6 +639,8 @@ impl ChatToResponsesConverter {
         // 也有 provider 在中间帧才补 id/name(我们持续合并)。
         let is_new = !self.tool_calls.contains_key(&openai_index);
         if is_new {
+            // 本响应出现工具调用 → message(若有)按 commentary 处理(见字段 doc)。
+            self.saw_function_call = true;
             // 开 tool_call item 前先 close 还开着的 reasoning,避免 reasoning 与
             // function_call item 在流里交错(reasoning.added → function_call.added
             // → reasoning.done)。新版 Codex(v26.608+)渲染要求 item 顺序闭合,
@@ -1184,6 +1195,10 @@ impl ChatToResponsesConverter {
             self.open_reasoning(out);
         }
         self.reasoning_acc.push_str(text);
+        // [单发 summary 通道] 实测官方 gpt-5.5(v26.623)reasoning 只发
+        // `reasoning_summary_text.delta`(不发 content 通道 `reasoning_text.delta`),
+        // 思考照常显示——当前 Codex 靠 summary 通道渲染。去掉旧 MOC-203 的 content 通道
+        // 双发,消除同一 reasoning 块的重复更新。按模型默认粒度逐 delta 直发(不累积)。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1193,21 +1208,6 @@ impl ChatToResponsesConverter {
                 "item_id": self.reasoning_id,
                 "output_index": self.reasoning_index,
                 "summary_index": 0,
-                "delta": text,
-            }),
-        );
-        // [content 通道] 新版 Codex(v26.608+)渲染思考块认 reasoning_text(content_index),
-        // 旧 summary 通道被废弃(GPT session 实证 summary:[] 却正常显示)。发纯思考
-        // 增量(不含 summary 侧的 **Thinking** CLI header)。summary 双发留作旧版兼容。
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_text.delta",
-            json!({
-                "type": "response.reasoning_text.delta",
-                "item_id": self.reasoning_id,
-                "output_index": self.reasoning_index,
-                "content_index": 0,
                 "delta": text,
             }),
         );
@@ -1224,6 +1224,7 @@ impl ChatToResponsesConverter {
             self.open_message(out);
         }
         self.text_acc.push_str(text);
+        // 按模型默认粒度逐 delta 直发(不累积,避免任意分块引起的冲突)。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1473,8 +1474,7 @@ impl ChatToResponsesConverter {
         // 但 Kimi for Coding / DeepSeek thinking 等纯文本流默认无 `**`,
         // 不补 prefix 就会被整段隐藏。详见
         // `docs/investigation/kimi-reasoning-truncation.md` §5.4 根因结论。
-        // header 只进 summary 通道;content 通道(reasoning_text)各 emit 点
-        // 统一用同一常量剥掉,保持纯思考。
+        // header 只进 summary 通道(当前单发 summary、不发 content 通道 reasoning_text)。
         const REASONING_HEADER: &str = crate::responses::request::CODEX_REASONING_PREFIX;
         self.reasoning_acc.push_str(REASONING_HEADER);
         emit_event(
@@ -1519,24 +1519,14 @@ impl ChatToResponsesConverter {
                 },
             }),
         );
-        // [content 通道] 补发 reasoning_text.done(content_index),纯思考(剥 **Thinking** header)
+        // [单发 summary 通道] 不再补发 content 通道 `reasoning_text.done`(对齐官方、
+        // 消除重渲染,见 emit_reasoning_delta 注释)。content_text 仍用于
+        // reasoning_history(剥 **Thinking** header 后的纯思考,供历史回灌)。
         let content_text = self
             .reasoning_acc
             .strip_prefix(crate::responses::request::CODEX_REASONING_PREFIX)
             .unwrap_or(&self.reasoning_acc)
             .to_string();
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_text.done",
-            json!({
-                "type": "response.reasoning_text.done",
-                "item_id": self.reasoning_id,
-                "output_index": self.reasoning_index,
-                "content_index": 0,
-                "text": content_text,
-            }),
-        );
         let reasoning_item = self.reasoning_item_completed();
         let reasoning_index = self.reasoning_index;
         emit_event(
@@ -1567,12 +1557,6 @@ impl ChatToResponsesConverter {
     }
 
     fn reasoning_item_completed(&self) -> Value {
-        // [MOC-218 第三关] item 不带 `content` / `encrypted_content`:OpenAI
-        // Responses 后端对 input 里 reasoning item 硬校验 content 数组长度必须
-        // 0(`array_above_max_length`),`encrypted_content` 假值有 MOC-13 前科;
-        // item 持久化进会话历史、切真 GPT 时原样上发,必须出生即合规。当轮
-        // 渲染靠 SSE `reasoning_text.delta` content 通道事件(保留双发,
-        // MOC-203),不靠 item 字段(GPT 直连 summary:[] 仍显示的实证)。
         json!({
             "type": "reasoning",
             "status": "completed",
@@ -1584,10 +1568,30 @@ impl ChatToResponsesConverter {
         })
     }
 
+    /// assistant message item 的 `phase`(harmony 通道语义):本响应含工具调用
+    /// → `commentary`(铺垫/中间叙述,Codex 折叠进 "Working");否则 `final_answer`
+    /// (最终答复,展开留下)。仅在 close([`message_item_completed`])调用 —— open
+    /// 时一律发 `commentary`(见 [`open_message`] 注释),close 时(工具调用
+    /// 已全部出现)以本函数的权威值为准 —— Codex 读 done /
+    /// completed item 的 phase 定最终渲染,added 的临时值不影响归类。
+    fn message_phase(&self) -> &'static str {
+        if self.saw_function_call {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+    }
+
     fn open_message(&mut self, out: &mut Vec<u8>) {
         self.message_open = true;
         self.message_index = self.next_output_index;
         self.next_output_index += 1;
+        // open 时一律发 `commentary`:此刻本响应的工具调用可能还没出现,若发临时
+        // final_answer,Codex 渲染器(Jb:任何非 commentary 消息 → 立即进入
+        // final_answer 相)会在每个工具轮的文本开始时提前折叠、工具调用到达后又
+        // 展开(每轮折叠/展开抖动)。commentary 让流式期间保持 Working;真最终
+        // 响应由 close 时 [`message_item_completed`] 的权威 phase 提升,折叠只在
+        // 最终结果收尾时触发一次。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1601,6 +1605,7 @@ impl ChatToResponsesConverter {
                     "role": "assistant",
                     "id": self.message_id,
                     "content": [],
+                    "phase": "commentary",
                 },
             }),
         );
@@ -1681,6 +1686,8 @@ impl ChatToResponsesConverter {
                 // 分支结构。
                 "annotations": Value::Array(self.active_annotations.clone()),
             }],
+            // 权威 phase(此时本响应工具调用已全部出现,判定终态准确)。
+            "phase": self.message_phase(),
         })
     }
 
@@ -3030,6 +3037,102 @@ mod tests {
         assert_eq!(final_msg["content"][0]["annotations"], json!([]));
     }
 
+    // ── message.phase(整轮折叠:Codex Desktop 靠此把过程折叠进 "Working")──
+    // 官方 gpt-5.5 实证:assistant message item 顶层带 `"phase"`,值
+    // `final_answer`(最终答复,展开)/ `commentary`(铺垫,折叠)。缺 phase 时
+    // Codex 走 legacy 兼容渲染、不做整轮折叠(见 MessagePhase.ts:providers 不一致
+    // → None 视作 phase unknown)。
+
+    #[test]
+    fn message_phase_final_answer_when_no_tool_call() {
+        // 纯文本响应(无工具调用)= 最终答复。open(added)一律临时 commentary
+        // (工具调用是否会出现此刻未知,临时 final_answer 会让 Codex 每轮提前折叠);
+        // done / response.completed 是权威 final_answer(Codex 据此定折叠)。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Paris."},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        let added = events
+            .iter()
+            .find(|(n, p)| n == "response.output_item.added" && p["item"]["type"] == "message")
+            .expect("message output_item.added");
+        assert_eq!(added.1["item"]["phase"], "commentary");
+
+        let done = events
+            .iter()
+            .find(|(n, p)| n == "response.output_item.done" && p["item"]["type"] == "message")
+            .expect("message output_item.done");
+        assert_eq!(done.1["item"]["phase"], "final_answer");
+
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let msg = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(msg["phase"], "final_answer");
+    }
+
+    #[test]
+    fn message_phase_commentary_when_response_has_tool_call() {
+        // 含工具调用的响应里的文本 = 铺垫/中间叙述(harmony commentary 通道)→
+        // phase=commentary,Codex 折叠进 Working 而非当最终答复。open(added)
+        // 一律临时 commentary(铺垫文本先于工具调用出现,若发临时 final_answer
+        // 会让 Codex 每轮提前折叠);done / completed 是权威 commentary。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Let me check the files."}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"exec_command","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        let added = events
+            .iter()
+            .find(|(n, p)| n == "response.output_item.added" && p["item"]["type"] == "message")
+            .expect("message output_item.added");
+        assert_eq!(added.1["item"]["phase"], "commentary");
+
+        let done = events
+            .iter()
+            .find(|(n, p)| n == "response.output_item.done" && p["item"]["type"] == "message")
+            .expect("message output_item.done");
+        assert_eq!(done.1["item"]["phase"], "commentary");
+
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        let msg = output
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(msg["phase"], "commentary");
+        // 合理性:本响应确有 function_call item(commentary 判定的前提)
+        assert!(
+            output.iter().any(|item| item["type"] == "function_call"),
+            "response should contain the function_call item"
+        );
+    }
+
     #[test]
     fn every_sse_event_has_monotonically_increasing_sequence_number() {
         // 借鉴 mimo2codex streamToSse.ts:71-72 sequence_number: state.nextSeq()。
@@ -3198,13 +3301,12 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
             vec![
                 "response.reasoning_summary_text.done",
                 "response.reasoning_summary_part.done",
-                "response.reasoning_text.done",
                 "response.output_item.done",
                 "response.completed",
             ],
             "reasoning-only completed turns should not inject synthetic assistant text"
         );
-        let completed = &events[4].1["response"];
+        let completed = &events[3].1["response"];
         let output = completed["output"].as_array().unwrap();
         assert_eq!(output.len(), 1, "output contains only the reasoning item");
         assert_eq!(output[0]["type"], "reasoning");
@@ -3238,7 +3340,6 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
                 "response.reasoning_summary_part.added",
                 "response.reasoning_summary_text.delta", // prefix `**Thinking**\n\n`(summary 通道)
                 "response.reasoning_summary_text.delta", // 上游 "think"(summary 通道)
-                "response.reasoning_text.delta",         // 上游 "think"(content 通道,新版渲染)
             ]
         );
         assert_eq!(ev1[2].1["item"]["type"], "reasoning");
@@ -3249,7 +3350,6 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert!(ev1[2].1["item"].get("encrypted_content").is_none());
         assert_eq!(ev1[4].1["delta"], "**Thinking**\n\n");
         assert_eq!(ev1[5].1["delta"], "think");
-        assert_eq!(ev1[6].1["delta"], "think"); // content 通道纯思考(无 header)
 
         // 第 2 chunk:content 出现,先关 reasoning 再开 message
         let out2 = c.feed(
@@ -3263,22 +3363,21 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
             vec![
                 "response.reasoning_summary_text.done",
                 "response.reasoning_summary_part.done",
-                "response.reasoning_text.done", // content 通道
-                "response.output_item.done",    // reasoning close
-                "response.output_item.added",   // message open
+                "response.output_item.done",  // reasoning close
+                "response.output_item.added", // message open
                 "response.content_part.added",
                 "response.output_text.delta",
             ]
         );
         // reasoning 关闭事件的 output_index = 0
-        assert_eq!(ev2[3].1["output_index"], 0);
+        assert_eq!(ev2[2].1["output_index"], 0);
         // [MOC-218 第三关] done item 不带 content / encrypted_content;思考
-        // 文本由上面的 reasoning_text.done 事件承载
-        assert!(ev2[3].1["item"].get("content").is_none());
-        assert!(ev2[3].1["item"].get("encrypted_content").is_none());
-        assert_eq!(ev2[3].1["item"]["summary"][0]["type"], "summary_text");
+        // 文本由 summary 通道事件承载
+        assert!(ev2[2].1["item"].get("content").is_none());
+        assert!(ev2[2].1["item"].get("encrypted_content").is_none());
+        assert_eq!(ev2[2].1["item"]["summary"][0]["type"], "summary_text");
         // message 打开事件的 output_index = 1
-        assert_eq!(ev2[4].1["output_index"], 1);
+        assert_eq!(ev2[3].1["output_index"], 1);
 
         // 第 3 chunk:finish + [DONE]
         let _ = c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
@@ -3327,15 +3426,15 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             completed["output"][0]["summary"][0]["text"],
             "**Thinking**\n\npart1 part2"
         );
-        // [MOC-218 第三关] item 不带 content(content 通道只走 SSE 事件;多
-        // delta 拼接的纯思考文本由 reasoning_text.done 事件承载)
+        // [MOC-218 第三关] item 不带 content(纯思考文本走 summary 通道 SSE 事件,
+        // 单发 summary、不发 content 通道 reasoning_text)
         assert!(completed["output"][0].get("content").is_none());
     }
 
     /// MOC-203 交错修复锁定:reasoning 开着时来 tool_call,必须先完整闭合
-    /// reasoning(summary done → part done → reasoning_text done → item done)
-    /// 再开 function_call item。新版 Codex 渲染要求 item 顺序闭合,交错的
-    /// reasoning 会被静默丢弃(思考块不显示)。
+    /// reasoning(summary done → part done → item done)再开 function_call item。
+    /// 新版 Codex 渲染要求 item 顺序闭合,交错的 reasoning 会被静默丢弃
+    /// (思考块不显示)。
     #[test]
     fn reasoning_then_tool_call_closes_reasoning_before_function_call_item() {
         let mut c = fixed();
@@ -3355,17 +3454,16 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             vec![
                 "response.reasoning_summary_text.done",
                 "response.reasoning_summary_part.done",
-                "response.reasoning_text.done", // content 通道
-                "response.output_item.done",    // reasoning 闭合在先
-                "response.output_item.added",   // function_call 打开在后
+                "response.output_item.done",  // reasoning 闭合在先
+                "response.output_item.added", // function_call 打开在后
                 "response.function_call_arguments.delta",
             ]
         );
-        assert_eq!(ev2[3].1["item"]["type"], "reasoning");
-        assert_eq!(ev2[4].1["item"]["type"], "function_call");
+        assert_eq!(ev2[2].1["item"]["type"], "reasoning");
+        assert_eq!(ev2[3].1["item"]["type"], "function_call");
         // reasoning 占 output_index 0,tool_call 严格在其后
-        assert_eq!(ev2[3].1["output_index"], 0);
-        assert_eq!(ev2[4].1["output_index"], 1);
+        assert_eq!(ev2[2].1["output_index"], 0);
+        assert_eq!(ev2[3].1["output_index"], 1);
 
         let _ =
             c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
@@ -3422,7 +3520,7 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
         // 两段 item id 不同(避免与已 done 的 item 撞 id)
         assert_ne!(output[0]["id"], output[2]["id"]);
         // [MOC-218 第三关] item 不带 content;各段独立思考文本经 SSE
-        // reasoning_text 事件与 summary 承载
+        // summary 通道事件承载(单发 summary、不发 content 通道 reasoning_text)
         assert!(output[0].get("content").is_none());
         assert!(output[2].get("content").is_none());
         assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink1");
@@ -4440,8 +4538,8 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"想想\",\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
         );
         let events = parse_emitted(&out);
-        // open_reasoning 注入一次 `**Thinking**\n\n` prefix delta(让 Codex CLI
-        // TUI 走 bold-header 显示分支),然后再 emit 上游 "想想" delta —— 总计 2 条。
+        // open_reasoning 注入一次 `**Thinking**\n\n` prefix delta,然后 emit 上游 "想想"
+        // delta —— 逐 delta 直发,共 2 条。
         let reasoning_deltas: Vec<&Value> = events
             .iter()
             .filter(|(n, _)| n == "response.reasoning_summary_text.delta")

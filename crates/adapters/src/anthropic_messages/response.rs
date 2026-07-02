@@ -557,6 +557,11 @@ impl AnthropicMessagesToResponsesConverter {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
+        // [MOC-293] 不发 message `phase`:Anthropic 块序为 text 块先 stop、tool_use
+        // 块后 start,close_text 时无法知道后面是否还有工具 → 若发 final_answer 会在
+        // 每个工具轮的铺垫文本收尾时误触发折叠、工具到达后又展开(比 main 无 phase 的
+        // 稳定态更差)。chat converter 因 message 只在流末 close(工具已知全)才安全。
+        // 该路径整轮折叠留 followup:需在 message_stop(stop_reason 已知)侧定终态 phase。
         emit_event(
             out,
             &mut self.sequence_number,
