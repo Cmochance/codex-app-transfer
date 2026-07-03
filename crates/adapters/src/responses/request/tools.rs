@@ -14,6 +14,20 @@ pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 /// (chat path) and MOC-217 (gemini/antigravity path).
 pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 
+/// [MOC-296] 追加到 `tool_search` description 末尾的「按名补搜」规则。
+///
+/// 上游 prompt 的发现指引有盲区(2026-07-03 wire 实证):连接器(openai-curated
+/// 如 Linear)工具全 defer 到 tool_search,但 description 里该源常只有 marketplace
+/// tagline(零工具名),泛泛的"工具可能没给全"指引又埋在 ~9KB 文本末尾;system
+/// prompt 也没有"被点名的工具先补搜"规则。结果:工具输出按名引用了未注入的工具
+/// (如 Linear 截断提示 "use `get_issue`")时,模型对照工具列表 → 判"不可用" →
+/// 卡死,实际 `tool_search("get_issue")` 精确名一搜必中(目录里一直有)。
+///
+/// chat 分支与 gemini_native 请求侧(MOC-217 复用先例)共用本常量;anthropic
+/// 请求侧复用 chat 转换自动覆盖;官方 GPT passthrough 不经此转换、不受影响。
+/// 只追加不改写上游原文(遵循"不做不必要剥除")。
+pub(crate) const TOOL_SEARCH_BY_NAME_HINT: &str = "\n\nIf a tool is referenced by name anywhere (for example a hint like \"use `get_issue`\") but is not in your current tool list, call `tool_search` with that exact tool name first — deferred tools only become available after being discovered here. Do not conclude a named tool is unavailable until an exact-name search has returned no match.";
+
 /// Chat-path replacement for Codex CLI's freeform `apply_patch` description.
 /// Original upstream text says "do not wrap the patch in JSON" because the
 /// Responses API freeform/lark grammar accepts raw text — but on the
@@ -350,6 +364,9 @@ pub fn convert_responses_tool_to_chat_tool(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // [MOC-296] 上游 description 末尾追加「按名补搜」规则(见常量 doc:
+            // 被点名未注入的连接器工具,模型须先 exact-name 补搜再判不可用)。
+            let description = format!("{description}{TOOL_SEARCH_BY_NAME_HINT}");
             let mut parameters = obj
                 .get("parameters")
                 .cloned()

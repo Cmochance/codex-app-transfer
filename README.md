@@ -179,7 +179,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | 阿里云百炼(Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | Responses 协议透传(custom) | — | — | — | 经本地代理 **1:1 字节透传**至上游(不再 direct 直连,MOC-234);适合 OpenAI 官方 / 原生 Responses 反代;⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
 
-> **MCP 工具(Codex 0.130+ `tool_search` 机制)**:Codex 0.130+ 把 server-side MCP 工具(`mcp__notion__*` / `mcp__linear__*` 等,以及内置 `cat-webfetch` 的 web_fetch / web_search)defer 到 `tool_search`,不再直接放进 `tools[]`。代理在 **chat 路径**与 **Gemini / Antigravity 路径**均已打通全链路 —— 从 `tool_search_output` 发现工具 → 注入下游 `tools[]` / `functionDeclarations` → 按 `namespace` 路由回上游(chat #293;Gemini/Antigravity MOC-217)。**上表所有 chat-compat + Gemini 系 provider 通用**;仅 Responses 协议透传(末行,经代理但 1:1 透传、不展平 namespace)不适用。此前 Gemini / Antigravity 路径漏接 `tool_search`,导致这些 provider 下所有 defer 的 MCP 工具(含内置 web_fetch / web_search)对模型不可见 —— MOC-217 已修复。
+> **MCP 工具(Codex 0.130+ `tool_search` 机制)**:Codex 0.130+ 把 server-side MCP 工具(`mcp__notion__*` / `mcp__linear__*` 等,以及内置 `cat-webfetch` 的 web_fetch / web_search)defer 到 `tool_search`,不再直接放进 `tools[]`。代理在 **chat 路径**与 **Gemini / Antigravity 路径**均已打通全链路 —— 从 `tool_search_output` 发现工具 → 注入下游 `tools[]` / `functionDeclarations` → 按 `namespace` 路由回上游(chat #293;Gemini/Antigravity MOC-217)。**上表所有 chat-compat + Gemini 系 provider 通用**;仅 Responses 协议透传(末行,经代理但 1:1 透传、不展平 namespace)不适用。此前 Gemini / Antigravity 路径漏接 `tool_search`,导致这些 provider 下所有 defer 的 MCP 工具(含内置 web_fetch / web_search)对模型不可见 —— MOC-217 已修复。另:代理会在 `tool_search` 的 description 末尾追加一条「按名补搜」规则(工具被按名引用但不在当前工具列表时,先用该名精确搜索再判不可用)—— 上游的发现指引对部分连接器(如 Linear)只有一句 tagline、无工具名可猜,模型遇到 "use `get_issue`" 这类提示会误判工具不存在(MOC-296)。
 
 ## 思考程度档位映射(chat 协议 `reasoning_effort`)
 

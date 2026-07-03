@@ -1192,12 +1192,16 @@ fn convert_tool_search_to_chat_function() {
     assert_eq!(tools.len(), 1, "tool_search 应转成 1 个 chat function tool");
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "tool_search");
+    let description = tools[0]["function"]["description"].as_str().unwrap();
     assert!(
-        tools[0]["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("BM25"),
+        description.contains("BM25"),
         "description 应完整透传 BM25 关键词"
+    );
+    // [MOC-296] 上游原文之后必须追加「按名补搜」规则(被点名未注入的连接器工具,
+    // 模型须先 exact-name 补搜再判不可用;Linear get_issue 案)。
+    assert!(
+        description.ends_with(tools::TOOL_SEARCH_BY_NAME_HINT),
+        "description 末尾应追加按名补搜规则"
     );
     let params = &tools[0]["function"]["parameters"];
     assert_eq!(params["type"], "object");
@@ -1217,7 +1221,11 @@ fn convert_tool_search_with_empty_description_does_not_panic() {
     let tools = out["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["function"]["name"], "tool_search");
-    assert_eq!(tools[0]["function"]["description"], "");
+    // [MOC-296] 空 description 也追加按名补搜规则(此时 description = 规则本身)。
+    assert_eq!(
+        tools[0]["function"]["description"],
+        tools::TOOL_SEARCH_BY_NAME_HINT
+    );
     assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
 }
 
