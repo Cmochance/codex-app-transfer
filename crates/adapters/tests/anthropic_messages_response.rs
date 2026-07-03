@@ -112,10 +112,24 @@ async fn text_stream_maps_to_responses_lifecycle() {
         .collect();
     assert_eq!(deltas, vec!["Hel", "lo"]);
 
+    // [MOC-295] message phase: added 一律 commentary(临时),done 时 stop_reason=end_turn
+    // → final_answer(权威,纯文本无工具调用)
+    let added = events
+        .iter()
+        .find(|(n, _)| n == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added.1["item"]["phase"], "commentary");
+    let done = events
+        .iter()
+        .find(|(n, _)| n == "response.output_item.done")
+        .unwrap();
+    assert_eq!(done.1["item"]["phase"], "final_answer");
+
     let completed = &events.last().unwrap().1["response"];
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["model"], "claude-3-5-sonnet-20241022");
     assert_eq!(completed["output"][0]["content"][0]["text"], "Hello");
+    assert_eq!(completed["output"][0]["phase"], "final_answer");
     assert_eq!(completed["usage"]["input_tokens"], 12);
     assert_eq!(completed["usage"]["output_tokens"], 2);
     assert_eq!(completed["usage"]["total_tokens"], 14);
@@ -355,4 +369,72 @@ async fn compact_response_extracts_anthropic_content_text() {
     let encrypted = parsed["output"][0]["encrypted_content"].as_str().unwrap();
     assert!(encrypted.contains("Anthropic Claude API"));
     assert!(!encrypted.contains("hidden"));
+}
+
+#[tokio::test]
+async fn text_then_tool_use_message_phase_is_commentary() {
+    // [MOC-295] text 块先 stop、tool_use 块后 start → close_text 时 stop_reason
+    // 未知,message done 延迟到收尾侧 emit。stop_reason=tool_use → phase=commentary。
+    let raw = Bytes::from_static(
+        br#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":1,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me check."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_42","name":"read_file","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+    );
+    let events = collect_events(convert_anthropic_messages_to_responses_stream(
+        input_stream(raw),
+        None,
+        None,
+        AnthropicToolNameMaps::default(),
+    ))
+    .await;
+
+    // message output_item.added → commentary(临时)
+    let added = events
+        .iter()
+        .find(|(n, _)| n == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added.1["item"]["type"], "message");
+    assert_eq!(added.1["item"]["phase"], "commentary");
+
+    // message output_item.done → commentary(权威,有工具调用)
+    let done = events
+        .iter()
+        .find(|(n, v)| n == "response.output_item.done" && v["item"]["type"] == "message")
+        .unwrap();
+    assert_eq!(done.1["item"]["phase"], "commentary");
+
+    // completed envelope output[] 的 message phase 一致
+    let completed = &events.last().unwrap().1["response"];
+    let msg_item = completed["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "message")
+        .unwrap();
+    assert_eq!(msg_item["phase"], "commentary");
 }

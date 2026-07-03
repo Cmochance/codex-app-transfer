@@ -286,6 +286,10 @@ pub struct AnthropicMessagesToResponsesConverter {
     next_output_index: u32,
     open_blocks: BTreeMap<u32, OpenBlock>,
     closed_items: Vec<(u32, Value)>,
+    /// close_text 时暂存的 message done 事件(per-block close 时 stop_reason 未知,
+    /// 无法给权威 phase)。收尾侧 `emit_terminal` / `emit_failure` flush 时
+    /// `final_stop_reason` 已确定,按 [`message_phase`] 定终态后 emit。
+    pending_message_done: Vec<(u32, Value)>,
     final_stop_reason: Option<String>,
     final_stop_sequence: Option<String>,
     final_usage: Option<Value>,
@@ -345,6 +349,7 @@ impl AnthropicMessagesToResponsesConverter {
             next_output_index: 0,
             open_blocks: BTreeMap::new(),
             closed_items: Vec::new(),
+            pending_message_done: Vec::new(),
             final_stop_reason: None,
             final_stop_sequence: None,
             final_usage: None,
@@ -541,6 +546,18 @@ impl AnthropicMessagesToResponsesConverter {
         }
     }
 
+    /// assistant message item 的 `phase`(harmony 通道语义):本响应含工具调用
+    /// → `commentary`(铺垫/中间叙述,Codex 折叠进 "Working");否则 `final_answer`
+    /// (最终答复,展开留下)。仅在收尾侧(`emit_terminal` flush pending done)调用 ——
+    /// `final_stop_reason` 此时已确定。`tool_use` → commentary;其余 → final_answer。
+    fn message_phase(&self) -> &'static str {
+        if self.final_stop_reason.as_deref() == Some("tool_use") {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+    }
+
     fn handle_error(&mut self, data: &Value, out: &mut Vec<u8>) {
         let code = data
             .pointer("/error/type")
@@ -557,11 +574,9 @@ impl AnthropicMessagesToResponsesConverter {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
-        // [MOC-293] 不发 message `phase`:Anthropic 块序为 text 块先 stop、tool_use
-        // 块后 start,close_text 时无法知道后面是否还有工具 → 若发 final_answer 会在
-        // 每个工具轮的铺垫文本收尾时误触发折叠、工具到达后又展开(比 main 无 phase 的
-        // 稳定态更差)。chat converter 因 message 只在流末 close(工具已知全)才安全。
-        // 该路径整轮折叠留 followup:需在 message_stop(stop_reason 已知)侧定终态 phase。
+        // [MOC-295] open 时一律发 `commentary`(临时):此刻 stop_reason 未知,若发
+        // final_answer 会在工具轮的文本开始时提前折叠。权威 phase 由收尾侧
+        // `emit_terminal` flush pending done 时按 `final_stop_reason` 给出。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -571,6 +586,7 @@ impl AnthropicMessagesToResponsesConverter {
                 "output_index": output_index,
                 "item": {
                     "type": "message",
+                   "phase": "commentary",
                     "id": item_id,
                     "status": "in_progress",
                     "role": "assistant",
@@ -630,6 +646,9 @@ impl AnthropicMessagesToResponsesConverter {
                 },
             }),
         );
+        // [MOC-295] 不在此 emit `output_item.done`:close_text 时 stop_reason 可能
+        // 还没到(message_stop 在 text 块之后),phase 无法确定。暂存 item,等收尾侧
+        // `emit_terminal` flush 时按 `message_phase()` 给权威 phase 再 emit。
         let item = json!({
             "type": "message",
             "id": text.item_id,
@@ -641,17 +660,29 @@ impl AnthropicMessagesToResponsesConverter {
                 "annotations": [],
             }],
         });
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.output_item.done",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": text.output_index,
-                "item": item.clone(),
-            }),
-        );
-        self.closed_items.push((text.output_index, item));
+        self.pending_message_done.push((text.output_index, item));
+    }
+
+    /// 收尾侧 flush pending message done:遍历 `pending_message_done`,给每条
+    /// message item 注入权威 `phase`(`message_phase()`),emit `output_item.done`,
+    /// 然后移入 `closed_items` 供 envelope `output[]` 使用。
+    fn flush_pending_message_done(&mut self, out: &mut Vec<u8>) {
+        let phase = self.message_phase();
+        let pending = std::mem::take(&mut self.pending_message_done);
+        for (output_index, mut item) in pending {
+            item["phase"] = json!(phase);
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item.clone(),
+                }),
+            );
+            self.closed_items.push((output_index, item));
+        }
     }
 
     fn open_reasoning(&mut self, index: u32, initial_text: &str, out: &mut Vec<u8>) {
@@ -888,6 +919,7 @@ impl AnthropicMessagesToResponsesConverter {
             self.emit_lifecycle_open(out);
         }
         self.close_all_blocks(out);
+        self.flush_pending_message_done(out);
         let (status, incomplete_details) = self.terminal_status(interrupted);
         let mut envelope = self.build_envelope(status);
         let mut items = self.closed_items.clone();
@@ -923,6 +955,7 @@ impl AnthropicMessagesToResponsesConverter {
             self.emit_lifecycle_open(out);
         }
         self.close_all_blocks(out);
+        self.flush_pending_message_done(out);
         let mut items = self.closed_items.clone();
         items.sort_by_key(|(idx, _)| *idx);
         let mut envelope = self.build_envelope("failed");
