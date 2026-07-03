@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 use crate::core::input::response_id_for_session;
 use crate::responses::request::tools::{
     APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT, APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT,
-    APPLY_PATCH_TOOL_NAME,
+    APPLY_PATCH_TOOL_NAME, TOOL_SEARCH_BY_NAME_HINT,
 };
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
@@ -718,6 +718,9 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                // [MOC-296] 上游 description 末尾追加「按名补搜」规则(共享常量,
+                // 与 chat 路径同一注入;见 tools.rs::TOOL_SEARCH_BY_NAME_HINT doc)。
+                let description = format!("{description}{TOOL_SEARCH_BY_NAME_HINT}");
                 // **Gemini-specific(与 chat 路径有意分歧)**:Codex 真机的 `tool_search` 工具
                 // **省略 `parameters`**(trace 实证:只有 type/execution/description)。chat 路径
                 // fallback 空 object schema 仍 work —— chat 模型能从 description 推断要传 BM25
@@ -765,7 +768,7 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 }
                 let mut func = Map::new();
                 func.insert("name".into(), Value::String("tool_search".into()));
-                func.insert("description".into(), Value::String(description.to_owned()));
+                func.insert("description".into(), Value::String(description));
                 func.insert("parameters".into(), parameters);
                 let mut wrapper = Map::new();
                 wrapper.insert("type".into(), Value::String("function".into()));
@@ -3551,6 +3554,21 @@ mod tests {
         assert!(
             names.contains(&"exec_command".to_owned()),
             "普通 function 也保留;实际:{names:?}"
+        );
+        // [MOC-296] gemini 路径同样追加「按名补搜」规则(与 chat 共享常量)。
+        let ts_desc = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.function_declarations.as_ref())
+            .flatten()
+            .find(|d| d.name == "tool_search")
+            .and_then(|d| d.description.as_deref())
+            .expect("tool_search functionDeclaration 必须有 description");
+        assert!(
+            ts_desc.contains("BM25") && ts_desc.ends_with(TOOL_SEARCH_BY_NAME_HINT),
+            "description 应为上游原文 + 按名补搜规则;实际:{ts_desc}"
         );
         // [MOC-217] Codex 真机省略 tool_search.parameters(本 case 也是)。Gemini 严格按 schema,
         // 空 properties 会让模型返 {} 而非 BM25 query → 发现不了工具 → 死循环。必须合成显式
