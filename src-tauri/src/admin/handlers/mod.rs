@@ -27,6 +27,7 @@ pub mod plugin_unlock;
 pub mod plugin_unlock_mode;
 pub mod providers;
 pub mod proxy;
+pub mod qoder_oauth;
 pub mod real_account;
 pub mod settings;
 pub mod skills_md;

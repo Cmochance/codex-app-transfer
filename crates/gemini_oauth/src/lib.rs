@@ -34,6 +34,7 @@ pub mod antigravity;
 pub mod cloud_code;
 pub mod constants;
 pub mod flow;
+pub mod qoder;
 pub mod service;
 pub mod token;
 pub mod trae;

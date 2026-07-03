@@ -168,6 +168,7 @@ const OAUTH_KIND_BY_AUTH: Record<string, OAuthKind> = {
   antigravity_oauth: 'antigravity',
   trae_oauth: 'trae',
   workbuddy_oauth: 'workbuddy',
+  qoder_oauth: 'qoder',
 }
 const oauthKind = computed<OAuthKind | null>(() => OAUTH_KIND_BY_AUTH[form.authScheme] ?? null)
 // grok-web 不是 OAuth, 走粘贴 grok.com SSO cookie。

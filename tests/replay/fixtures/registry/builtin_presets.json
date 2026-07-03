@@ -702,5 +702,29 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "qoder-login",
+    "name": "QoderWork CN（Login）",
+    "gray": true,
+    "baseUrl": "https://api2-v2.qoder.sh/model/v1",
+    "docsUrl": "https://qoder.com.cn",
+    "authScheme": "qoder_oauth",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "auto"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "QoderWork CN（阿里 Qoder 系）账号登录。点「登录」用 Qoder 账号在浏览器授权一次（纯客户端 PKCE device flow），app 自动轮询 openapi.qoder.com.cn/api/v1/deviceToken/poll 拿凭证并落盘（~/.codex-app-transfer/qoder-oauth.json），personal_token 过期前自动 refresh。模型走 OpenAI 兼容网关 api2-v2.qoder.sh（Bearer jobToken，由 personal_token 即时交换）。"
+      },
+      {
+        "type": "warning",
+        "text": "接入分两阶段：当前为阶段一（账号登录 + 凭证保存 + 自动 refresh）。模型出站路由（jobToken 交换注入 + 真实模型 id 列表 + TTL）在阶段二实测后接入 —— 登录成功后即可用于阶段二验证，此前经本 provider 的模型调用尚不可用。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]
