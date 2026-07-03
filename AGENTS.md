@@ -12,7 +12,7 @@
    **a. 接收新任务 → 判断工作环境**
    - 主仓 `~/alysechen/github/codex-app-transfer/` 永远 checkout `main` 不参与开发；所有 feature 任务一律在 sibling worktree（`codex-app-transfer-worktrees/<branch>/`）工作。
    - 若已在某个 worktree 中且任务与之相关，继续在该 worktree 上工作。
-   - 若已在某个 worktree 中但新任务与之无关，为新任务创建新的 worktree。此时需先检查旧 worktree 的状态（分支、未提交变更、关联 PR 状态等），并在新任务结束时向用户汇报旧 worktree 的详情，方便用户对旧 worktree 做决策。
+   - 若已在某个 worktree 中但新任务与之无关，**复用当前 worktree 开新分支**（不再创建新 worktree）：先确认旧任务已收尾（分支已 merge、PR 已关、工作区干净），再 `git fetch origin main` 同步最新，最后 `git checkout -b <new-branch> origin/main` 在当前 worktree 直接开新分支。这样省去重建 worktree 的开销，在 Codex Desktop 的单 worktree 模型下更合理。
 
    **b. 任务完成 → 提交 + 创建 PR + Review**
    - 完成开发后 push 到远端分支，创建 PR 并进行 review。后台监测 PR 状态（CI checks、review threads、merge state），出现失败或阻塞时主动处理。
@@ -33,8 +33,13 @@
    **e. 用户显式声明 merge → rebase + 完整清理**
    - **e0. （stacked PR only）解耦 child PR base**：merge 前若存在以本 PR head branch 为 base 的 open child PR，必须先 `gh pr edit <child> --base main`。否则 `gh pr merge --squash --delete-branch` 删 head branch 时 GitHub **会自动关闭** child PR（不是改 base，是 CLOSED + base ref 不存在），补救需 4 步 API mutation 重建 ref → reopen → 改 base → 删 ref。
    - **e1. Rebase**：先对目标分支执行 `rebase`；若无冲突或冲突少且简单，AI 自行解决后继续；若冲突较多或涉及复杂逻辑 / 重要决策，必须向用户提供解决方案并获得确认后再执行，**禁止自行决定修改方向**。**特殊情况**：child PR base 已被 squash 进 main 时 rebase 大概率假冲突（squash merge 不是 patch-identical 原始 commits）→ `git rebase --abort` → `git reset --hard origin/main` → cherry-pick 该 PR 独有 commits，**不要硬继续 rebase**。
-   - **e2. Merge + 远端 silent delete verify**：`gh pr merge <PR#> --squash --delete-branch` 后必须验证远端 ref 真删 —— **不能直接看 `git ls-remote` 的 exit code**（连接成功即 0，跟 ref 存不存在无关），改用 `git ls-remote --heads --exit-code origin <branch>`（ref 不存在时 exit 2）**或** `[ "$(git ls-remote --heads origin <branch> | wc -l)" -eq 0 ]`（stdout 0 行 = ref 不存在）；残留时手动 `git push origin --delete <branch>`（worktree 锁本地分支时 gh 也 skip remote delete，silent failure）。
-   - **e3. 本地清理**：`git worktree remove <path>` → `git branch -D <branch>` → `git worktree prune` → 清理 `src-tauri/target/release/bundle/macos/` 等 build 残留。
+  - **e2. Merge + 远端 silent delete verify**：`gh pr merge <PR#> --squash`（**不要带 `--delete-branch`**，sibling worktree 锁 main 导致 gh 内部 `git checkout main` 失败 → merge 本身报错 abort）后必须验证远端 ref 真删 —— **不能直接看 `git ls-remote` 的 exit code**（连接成功即 0，跟 ref 存不存在无关），改用 `git ls-remote --heads --exit-code origin <branch>`（ref 不存在时 exit 2）**或** `[ "$(git ls-remote --heads origin <branch> | wc -l)" -eq 0 ]`（stdout 0 行 = ref 不存在）；残留时手动 `git push origin --delete <branch>`。
+  - **e3. 本地清理（sibling worktree 专用顺序）**：Codex Desktop 管理的 worktree 无法在对话中 `git worktree remove`（目录归 Codex Desktop 生命周期管理），且 sibling worktree 不能 checkout `main`（主仓永远锁 main）。收尾后**复用当前 worktree 继续下一个任务**，不删除 worktree 目录。按以下顺序操作：
+    1. **在 worktree 内 detach 释放分支锁**：`git checkout --detach origin/main`（在当前 worktree 目录执行；fetch 后 origin/main 已是 merge 后最新）
+    2. **在主仓删本地分支**：`cd ~/alysechen/github/codex-app-transfer && git branch -D <branch>`（分支已无 worktree 锁定，删除成功）
+    3. **worktree 目录保留，复用于下一任务**：worktree 现处于 detached HEAD 指向 `origin/main`、工作区干净；下一个任务直接 `git checkout -b <new-branch> origin/main` 在当前 worktree 开新分支即可，无需新建 worktree。不要手动 `git worktree remove`（跟 Codex Desktop 管理冲突）
+    4. **可选 prune**：`cd ~/alysechen/github/codex-app-transfer && git worktree prune`（清理历史已移除 worktree 的 stale 元数据，不影响当前在用 worktree）
+    5. **清理 build 残留**：`src-tauri/target/release/bundle/macos/` 等
    - **e4. 回归 main + 同步**：`git checkout main` → `git pull --ff-only origin main`。
    - **e6. 关联 issue + Linear followup 更新**：`gh issue view <ISSUE#> --json state,closedByPullRequestsReferences` 验证是否被 PR `Closes #N` 自动关，否则手动 `gh issue close <N>`。**Linear followup（workspace Mochance / team Mochance / label Improvement）跟 GitHub issue 是两套独立系统**：本次 PR 实施掉的 Linear issue（MOC-N）用 `mcp__linear__save_issue` 改 `state=Done`，并在 issue body 末尾追加 resolved PR 链接。（历史 `docs/followup-tracker.md` 制度 2026-05-24 起停用，新工作流不再写本地 .md。`docs/` 整目录已 gitignored。）
 
