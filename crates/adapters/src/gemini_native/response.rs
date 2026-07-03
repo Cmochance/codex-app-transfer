@@ -208,6 +208,10 @@ pub struct GeminiToResponsesConverter {
     /// P0-E:已 close 的非 message/reasoning/function_call 类 items
     /// (image_generation_call / 等扩展 type),emit_completed 也按 output_index 排序
     closed_other_items: Vec<(u32, Value)>,
+    /// close_message 时暂存的 message done 事件(per-block close 时 `has_seen_tool_calls`
+    /// 可能还没到终态 —— functionCall part 可能在 text part 之后才出现)。
+    /// 收尾侧 `emit_completed` flush 时按 [`message_phase`] 定终态 phase 再 emit。
+    pending_message_done: Vec<(u32, Value)>,
     /// [MOC-210] proxy 出图履约从合成 `_casRevisedPrompt` part 暂存的 prompt,
     /// 紧随其后的 inlineData → emit_inline_data 取用填 revised_prompt 后清空。
     pending_image_prompt: Option<String>,
@@ -299,6 +303,7 @@ impl GeminiToResponsesConverter {
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
             closed_other_items: Vec::new(),
+            pending_message_done: Vec::new(),
             pending_image_prompt: None,
             has_seen_tool_calls: false,
             final_finish_reason: None,
@@ -1050,6 +1055,7 @@ impl GeminiToResponsesConverter {
         // 旧实现假设 reasoning < message < function_calls 顺序固定,但 Gemini 多轮
         // text→fc→text 序列会破这条假设。
         let mut all_items: Vec<(u32, Value)> = Vec::new();
+        self.flush_pending_message_done(out);
         all_items.extend(self.closed_messages.drain(..));
         all_items.extend(self.closed_reasonings.drain(..));
         all_items.extend(self.closed_other_items.drain(..));
@@ -1175,11 +1181,10 @@ impl GeminiToResponsesConverter {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
-        // [MOC-293] 不发 message `phase`:Gemini 流里 text→thought→functionCall
-        // 交错,close_message 常发生在 functionCall part 被处理之前,close 时无法
-        // 可靠判定后面是否还有工具 → 若发 final_answer 会在每个工具轮误触发折叠、
-        // 工具到达后又展开(比 main 无 phase 的稳定态更差)。chat converter 因
-        // message 只在流末 close(工具已知全)才安全。该路径整轮折叠留 followup。
+        // [MOC-295] open 时一律发 `commentary`(临时):此刻本响应的工具调用可能还没
+        // 出现(Gemini 流里 text→functionCall 交错),若发 final_answer 会在工具轮的
+        // 文本开始时提前折叠。权威 phase 由收尾侧 `emit_completed` flush pending done
+        // 时按 `has_seen_tool_calls` 给出。
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1189,6 +1194,7 @@ impl GeminiToResponsesConverter {
                 "output_index": output_index,
                 "item": {
                     "type": "message",
+                    "phase": "commentary",
                     "id": item_id,
                     "status": "in_progress",
                     "role": "assistant",
@@ -1291,6 +1297,9 @@ impl GeminiToResponsesConverter {
                 },
             }),
         );
+        // [MOC-295] 不在此 emit `output_item.done`:close_message 时 functionCall
+        // part 可能在后续才出现,`has_seen_tool_calls` 此刻不一定终态。暂存 item,
+        // 等收尾侧 `emit_completed` flush 时按 `message_phase()` 给权威 phase 再 emit。
         let item = json!({
             "type": "message",
             "id": msg.item_id,
@@ -1302,17 +1311,42 @@ impl GeminiToResponsesConverter {
                 "annotations": msg.annotations_acc,
             }],
         });
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.output_item.done",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": msg.output_index,
-                "item": item.clone(),
-            }),
-        );
-        self.closed_messages.push((msg.output_index, item));
+        self.pending_message_done.push((msg.output_index, item));
+    }
+
+    /// assistant message item 的 `phase`(harmony 通道语义):本响应含工具调用
+    /// → `commentary`(铺垫/中间叙述,Codex 折叠进 "Working");否则 `final_answer`
+    /// (最终答复,展开留下)。仅在收尾侧(`emit_completed` flush pending done)调用 ——
+    /// `has_seen_tool_calls` 此时已终态。注意不能用 `final_finish_reason`——
+    /// Gemini finishReason 恒为 STOP,不区分工具轮。
+    fn message_phase(&self) -> &'static str {
+        if self.has_seen_tool_calls {
+            "commentary"
+        } else {
+            "final_answer"
+        }
+    }
+
+    /// 收尾侧 flush pending message done:遍历 `pending_message_done`,给每条
+    /// message item 注入权威 `phase`(`message_phase()`),emit `output_item.done`,
+    /// 然后移入 `closed_messages` 供 envelope `output[]` 使用。
+    fn flush_pending_message_done(&mut self, out: &mut Vec<u8>) {
+        let phase = self.message_phase();
+        let pending = std::mem::take(&mut self.pending_message_done);
+        for (output_index, mut item) in pending {
+            item["phase"] = json!(phase);
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item.clone(),
+                }),
+            );
+            self.closed_messages.push((output_index, item));
+        }
     }
 
     // ───── reasoning item ─────
