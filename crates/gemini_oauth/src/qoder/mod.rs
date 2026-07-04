@@ -27,7 +27,10 @@ use std::sync::OnceLock;
 pub mod login;
 pub mod token;
 
-pub use login::{ensure_valid_personal_token, refresh_qoder_token, run_qoder_login, QoderError};
+pub use login::{
+    ensure_valid_personal_token, fetch_user_info, refresh_qoder_token, run_qoder_login, QoderError,
+    QoderUserInfo,
+};
 pub use token::{QoderCredential, QoderCredentialStore, QoderTokenError};
 
 /// 登录页 host(`getAuthBaseUrl` → `WEBSITE_DOMAIN`)。authUrl 打这个域。

@@ -233,6 +233,71 @@ pub async fn refresh_qoder_token(
     Ok(payload_to_cred(payload, machine_id))
 }
 
+/// QoderWork 用户信息 —— 阶段二 WASM 签名需要的 `uid` + 组织字段。
+/// 来自 `GET openapi.qoder.com.cn/api/v1/userinfo`(已真机实测 200,MOC-297)。
+#[derive(Debug, Clone, Default)]
+pub struct QoderUserInfo {
+    /// 用户唯一 id(响应 `id`/`user_id`/`uid`,喂 WASM 作 `Cosy-User`)。
+    pub uid: String,
+    /// 组织 id(个人账号为空串)。
+    pub organization_id: String,
+    /// 组织标签(WASM `user_info.organization_tags` 必须是数组)。
+    pub organization_tags: Vec<String>,
+    /// 昵称(`name`),UI 展示用。
+    pub nickname: Option<String>,
+}
+
+/// 拉取用户信息(`GET /api/v1/userinfo` + `Authorization: Bearer <device_token>`)。
+/// 阶段二出站前调,把 `uid`/`org` 喂给 [`codex_app_transfer_qoder_auth`] 生成签名。
+pub async fn fetch_user_info(
+    http: &reqwest::Client,
+    device_token: &str,
+) -> Result<QoderUserInfo, QoderError> {
+    let resp = http
+        .get(format!("{}/api/v1/userinfo", openapi_base()))
+        .header("Accept", "application/json")
+        .bearer_auth(device_token)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(QoderError::Business {
+            status: status.as_u16(),
+            msg: redact_snippet(&body),
+        });
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| QoderError::Parse("userinfo payload"))?;
+    let uid = ["id", "user_id", "uid"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .filter(|s| !s.is_empty())
+        .ok_or(QoderError::Parse("userinfo: missing uid"))?
+        .to_string();
+    let organization_id = v
+        .get("organization_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let organization_tags = v
+        .get("organization_tags")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let nickname = v.get("name").and_then(|x| x.as_str()).map(String::from);
+    Ok(QoderUserInfo {
+        uid,
+        organization_id,
+        organization_tags,
+        nickname,
+    })
+}
+
 /// 进程级 single-flight refresh 锁(防并发 refresh 互相作废轮换的 refresh_token)。
 fn refresh_mutex() -> &'static tokio::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
