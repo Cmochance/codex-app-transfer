@@ -18,9 +18,9 @@
 //! absent (default) = auto-review reuses the main model.
 
 use codex_app_transfer_registry::{
-    documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
-    reasoning_tiers_for_model, save_raw_config, strip_internal_model_suffix, ReasoningTierSpec,
-    CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
+    documented_context_window_scoped, load_raw_config, model_supports_1m_scoped,
+    normalize_model_mappings, reasoning_tiers_for_model_scoped, save_raw_config,
+    strip_internal_model_suffix, ReasoningTierSpec, CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
 };
 use serde_json::{json, Value};
 
@@ -134,6 +134,7 @@ pub fn catalog_models_for_provider(
         model_capabilities,
         None,
         None,
+        false,
     )
 }
 
@@ -145,6 +146,7 @@ pub fn catalog_models_for_provider(
 /// **[MOC-173]** `review_model_slot`:provider 已配置(映射非空)的槽位 key(如
 /// `gpt_5_4`),用作 auto-review(guardian 工具审批)的专用模型;`None` = 不写
 /// override = auto-review 复用主模型。详见 [`CatalogModel::auto_review_model_override`]。
+#[allow(clippy::too_many_arguments)]
 pub fn catalog_models_for_provider_with_display_names(
     provider_name: &str,
     default_model: &str,
@@ -153,6 +155,10 @@ pub fn catalog_models_for_provider_with_display_names(
     model_capabilities: Option<&Value>,
     display_names: Option<&Value>,
     review_model_slot: Option<&str>,
+    // [correctness review HIGH] 是否 QoderWork provider(authScheme qoder_oauth)。qoder 网关 key
+    // (`auto`/`gm51model` 等含通用别名)只在本 provider 上下文里解析 reasoning 档 + context,避免撞
+    // WorkBuddy 等同名 model。见 registry::qoder_catalog::is_qoder_auth_scheme。
+    is_qoder: bool,
 ) -> Vec<CatalogModel> {
     let default_model_clean = strip_internal_model_suffix(default_model);
     let default_model = default_model_clean.trim();
@@ -201,6 +207,7 @@ pub fn catalog_models_for_provider_with_display_names(
             default_model,
             supports_1m,
             model_capabilities,
+            is_qoder,
         );
         models.push(catalog_model(
             openai_id,
@@ -209,6 +216,7 @@ pub fn catalog_models_for_provider_with_display_names(
             context_window,
             display_names,
             review_override.clone(),
+            is_qoder,
         ));
     }
     // [MOC-154] 去掉旧 fallback entry(slug = default_model 实际模型名)。列表式下
@@ -228,6 +236,7 @@ fn context_window_for_model(
     default_model: &str,
     default_supports_1m: bool,
     model_capabilities: Option<&Value>,
+    is_qoder: bool,
 ) -> u64 {
     if clean_model.is_empty() {
         return DEFAULT_CONTEXT_WINDOW;
@@ -240,7 +249,9 @@ fn context_window_for_model(
     if let Some(n) = explicit_context_window(original_model, clean_model, model_capabilities) {
         return n;
     }
-    if let Some(n) = documented_context_window(clean_model) {
+    // documented context:qoder provider 才解析 qoder 网关 key(QoderWork 无 modelCapabilities,
+    // context 全靠 qoder_catalog 最大档);非 qoder 走全局表,不被 qoder 的 `auto`=180k 污染。
+    if let Some(n) = documented_context_window_scoped(clean_model, is_qoder) {
         return n;
     }
     // 2. 二档 fallback:default_model + supports_1m / known prefix / supports1m bool
@@ -250,7 +261,7 @@ fn context_window_for_model(
         } else {
             DEFAULT_CONTEXT_WINDOW
         }
-    } else if model_supports_1m(original_model, model_capabilities) {
+    } else if model_supports_1m_scoped(original_model, model_capabilities, is_qoder) {
         ONE_M_CONTEXT_WINDOW
     } else {
         DEFAULT_CONTEXT_WINDOW
@@ -282,6 +293,7 @@ fn explicit_context_window(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn catalog_model(
     slug: &str,
     provider_name: &str,
@@ -289,6 +301,7 @@ fn catalog_model(
     context_window: u64,
     display_names: Option<&Value>,
     auto_review_model_override: Option<String>,
+    is_qoder: bool,
 ) -> CatalogModel {
     let target = if default_model.is_empty() {
         slug
@@ -310,7 +323,9 @@ fn catalog_model(
         auto_review_model_override,
         // [MOC-241] 按上游真实 model id(target,= 该 slot 映射的模型)查可选思考档位表
         //(与 wire 层 registry::reasoning_effort_policy 同一张表,逐 slot 精确)。
-        reasoning_spec: reasoning_tiers_for_model(target),
+        // [correctness review HIGH] qoder 网关 key 只在 qoder provider 上下文里解析,避免 `auto`
+        // 撞 WorkBuddy 等同名 model 的 picker(见 registry::reasoning_tiers_for_model_scoped)。
+        reasoning_spec: reasoning_tiers_for_model_scoped(target, is_qoder),
     }
 }
 
@@ -750,6 +765,7 @@ mod tests {
             None,
             Some(&display_names),
             None,
+            false,
         );
         let dn = |slug: &str| {
             models
@@ -774,6 +790,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             no_names
@@ -804,6 +821,7 @@ mod tests {
             None,
             None,
             Some("gpt_5_4"),
+            false,
         );
         assert!(!models.is_empty());
         for m in &models {
@@ -834,6 +852,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         for m in &models {
             assert!(m.auto_review_model_override.is_none());
@@ -856,6 +875,7 @@ mod tests {
             None,
             None,
             Some("gpt_5_2"),
+            false,
         );
         for m in &models {
             assert!(
@@ -877,6 +897,7 @@ mod tests {
             None,
             None,
             Some("default"),
+            false,
         );
         for m in &models {
             assert!(
@@ -884,6 +905,55 @@ mod tests {
                 "default 槽不支持作审查槽位"
             );
         }
+    }
+
+    #[test]
+    fn qoder_catalog_scopes_reasoning_and_context_by_provider() {
+        // [correctness review HIGH] qoder provider(is_qoder=true):网关 key 解析 qoder 思考档 + 最大
+        // context(QoderWork 无 modelCapabilities,全靠 qoder_catalog)。非 qoder provider 喂同名的
+        // 通用别名 `auto` 时不得解析成 qoder(避免撞 WorkBuddy 等同名 model)。
+        let mappings = json!({
+            "default": "auto",
+            "gpt_5_5": "gm51model", // GLM-5.2:三档 effort + 1M
+            "gpt_5_4": "auto",      // 二元 + 180k
+        });
+        let qoder = catalog_models_for_provider_with_display_names(
+            "QoderWork CN",
+            "auto",
+            false,
+            Some(&mappings),
+            None,
+            None,
+            None,
+            true, // is_qoder
+        );
+        let gm = qoder.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        assert!(gm.reasoning_spec.is_some(), "gm51model 应有 qoder 思考档");
+        assert_eq!(gm.context_window, 1_000_000, "gm51model 最大 1M");
+        let au = qoder.iter().find(|m| m.slug == "gpt-5.4").unwrap();
+        assert!(au.reasoning_spec.is_some(), "qoder 的 auto 应有思考档");
+        assert_eq!(au.context_window, 180_000, "qoder 的 auto = 180k");
+
+        // 非 qoder provider(is_qoder=false):同一个 `auto` 不解析 qoder 档、context 不落 180k。
+        let other = catalog_models_for_provider_with_display_names(
+            "WorkBuddy",
+            "auto",
+            false,
+            Some(&mappings),
+            None,
+            None,
+            None,
+            false, // 非 qoder
+        );
+        let au2 = other.iter().find(|m| m.slug == "gpt-5.4").unwrap();
+        assert!(
+            au2.reasoning_spec.is_none(),
+            "非 qoder 的 auto 不应继承 qoder 思考档"
+        );
+        assert_ne!(
+            au2.context_window, 180_000,
+            "非 qoder 的 auto 不应继承 qoder 的 180k(应落 provider 默认)"
+        );
     }
 
     #[test]

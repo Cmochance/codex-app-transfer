@@ -55,7 +55,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::reasoning_tiers::reasoning_tiers_for_model;
+use crate::reasoning_tiers::{reasoning_tiers_for_model, reasoning_tiers_for_model_scoped};
 
 /// compact 路径 disable-thinking 的 wire 形态。
 ///
@@ -206,6 +206,17 @@ pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire>
     // 各模型的官方文档出处见 reasoning_tiers 表注释;下方 `__unsupported_model_anchors` 段保留
     // 「无解类 / 无 thinking 类」完整决策图。新增模型只改表一处。
     reasoning_tiers_for_model(model).and_then(|spec| spec.disable_wire)
+}
+
+/// 同 [`compact_disable_thinking_wire`],但 `is_qoder=true` 时也查 QoderWork scoped 档位表
+/// (网关 key `auto`/`gm51model` 等的 disable_wire = `ReasoningEffortNone`)。compact 侧由
+/// [`crate::reasoning_tiers`] 单一来源决定关思考 wire —— 非 qoder provider(is_qoder=false)对
+/// `auto` 返 `None`,不注入 disable(还原 WorkBuddy 等同名 provider 的原 compact 行为)。
+pub fn compact_disable_thinking_wire_scoped(
+    model: &str,
+    is_qoder: bool,
+) -> Option<DisableThinkingWire> {
+    reasoning_tiers_for_model_scoped(model, is_qoder).and_then(|spec| spec.disable_wire)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -463,7 +474,8 @@ mod tests {
     fn qoder_compact_disables_via_reasoning_effort_none() {
         // [MOC-297] compact 与 reasoning wire 共用 reasoning_tiers 的 disable_wire(单一真相)。
         // 故 qoder 模型 compact 关思考 = 写 reasoning_effort="none"(与 reasoning「none」档同一 wire),
-        // **无需 qoder compact 专门设置**。思考型 key 都命中;mmodel 非思考 → None(不注入)。
+        // **无需 qoder compact 专门设置**。qoder key 走 scoped(is_qoder=true);思考型 key 都命中;
+        // mmodel 非思考 → None(不注入)。
         for m in [
             "gm51model",
             "dmodel",
@@ -474,9 +486,22 @@ mod tests {
             "kmodel",
         ] {
             assert_eq!(
-                compact_disable_thinking_wire(m),
+                compact_disable_thinking_wire_scoped(m, true),
                 Some(DisableThinkingWire::ReasoningEffortNone),
                 "{m} compact 应写 reasoning_effort=none 关思考"
+            );
+            // [HIGH 回归防护] 非 qoder provider(is_qoder=false)对同名 key 不注入 disable ——
+            // 尤其 `auto` 撞 WorkBuddy,全局无 → None,还原其原 compact 行为。qoder key 已统一
+            // scoped,旧全局入口(compact_disable_thinking_wire)对它们一律 None。
+            assert_eq!(
+                compact_disable_thinking_wire_scoped(m, false),
+                None,
+                "{m} 非 qoder 不应注入 qoder disable"
+            );
+            assert_eq!(
+                compact_disable_thinking_wire(m),
+                None,
+                "{m} 旧全局入口对 qoder key 一律 None(qoder key 已 scoped)"
             );
         }
         // 注入后 compact chat body 带 reasoning_effort="none"(build_parameters 透传给 QoderWork)。

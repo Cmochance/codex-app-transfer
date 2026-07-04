@@ -9,7 +9,7 @@ use crate::account_pool::{self, PoolBackend, RefreshOutcome};
 pub use crate::account_pool::{PoolAccount, PoolError, PoolStorageError, ServingAccount};
 
 use super::login::{refresh_qoder_token, QoderError};
-use super::token::QoderCredential;
+use super::token::{merge_refreshed_cred, QoderCredential};
 use super::{qoder_machine_id, user_id_from_jwt, uuid_v4};
 
 /// QoderWork 的 [`PoolBackend`] 特化。
@@ -85,20 +85,10 @@ impl PoolBackend for QoderBackend {
         }
         let machine_id = cred.machine_id.clone().unwrap_or_else(qoder_machine_id);
         match refresh_qoder_token(http, &cred.refresh_token, machine_id).await {
-            Ok(mut fresh) => {
-                // refresh 响应通常不回昵称/uid/machine_id,回填保持稳定。
-                fresh.nickname = fresh.nickname.or(cred.nickname.clone());
-                fresh.uid = fresh.uid.or(cred.uid.clone());
-                fresh.machine_id = fresh.machine_id.or(cred.machine_id.clone());
-                // org 也回填(refresh 不回带,payload_to_cred 置 None)→ 保留登录时缓存的 org,
-                // 出站签名继续复用免打 /userinfo。
-                fresh.organization_id = fresh.organization_id.or(cred.organization_id.clone());
-                fresh.organization_tags =
-                    fresh.organization_tags.or(cred.organization_tags.clone());
-                // refresh_token 若上游不回带(不轮换),保留旧值——否则续期一次即清空、账号被 brick 需重登。
-                if fresh.refresh_token.is_empty() {
-                    fresh.refresh_token = cred.refresh_token.clone();
-                }
+            Ok(fresh) => {
+                // refresh 响应通常不回带 昵称/uid/machine_id/org/refresh_token → 逐字段用旧值兜底
+                //(refresh_token 空保留旧值防 brick、machine_id 保 per-account 隔离、org 保签名缓存)。
+                let fresh = merge_refreshed_cred(fresh, &cred);
                 let token = fresh.personal_token.clone();
                 account_pool::save_account(ns, provider_id, uid, &fresh)
                     .map_err(|e| RefreshOutcome::Infra(e.to_string()))?;

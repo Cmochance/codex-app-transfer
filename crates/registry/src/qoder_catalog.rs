@@ -87,6 +87,18 @@ pub fn qoder_max_context(key: &str) -> Option<u64> {
         .map(|m| m.max_context)
 }
 
+/// provider 的 `authScheme` 是否为 QoderWork(`qoder_oauth` 及历史别名)。
+///
+/// **为什么需要**:QoderWork 的网关 key 里有 `auto` / `l` 这类**通用别名**,与其它 provider
+/// (如 WorkBuddy 也用 `auto`)撞名。而 [`crate::reasoning_tiers`] / [`crate::model_context_policy`]
+/// 的思考档 + context 表是**按 model id 全局 keying、不看 provider**(MOC-241 假设 model id 全局唯一)。
+/// 若把 qoder 的 `auto` 塞进全局表,会静默改掉 WorkBuddy `auto` 的 reasoning/context(跨 provider 回归)。
+/// 故 qoder 的 key 只在**本 provider 上下文**里生效:catalog / wire / compact / supports_1m 四处消费点
+/// 都用本判据 scope,非 qoder provider 走全局表(qoder key → 无特殊档 = 各自 provider 原行为)。
+pub fn is_qoder_auth_scheme(auth_scheme: &str) -> bool {
+    matches!(auth_scheme.trim(), "qoder_oauth" | "qoder" | "qoder_cosy")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

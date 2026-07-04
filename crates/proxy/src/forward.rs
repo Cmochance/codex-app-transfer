@@ -2125,10 +2125,7 @@ async fn send_qoder_cosy(
                 reason: format!("qoder 凭证加载: {e}"),
                 needs_login: false,
             })?
-            .and_then(|c| match (c.uid, c.organization_id, c.organization_tags) {
-                (Some(u), Some(oid), Some(tags)) => Some((u, oid, tags)),
-                _ => None,
-            });
+            .and_then(|c| c.cached_user_info());
         match cached {
             Some(t) => t,
             None => {

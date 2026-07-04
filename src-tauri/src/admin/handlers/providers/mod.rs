@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codex_app_transfer_registry::{
-    model_supports_1m, normalize_model_mappings, strip_internal_model_suffix, RawConfig,
-    MODEL_ORDER,
+    model_supports_1m_scoped, normalize_model_mappings, qoder_catalog::is_qoder_auth_scheme,
+    strip_internal_model_suffix, RawConfig, MODEL_ORDER,
 };
 use serde_json::{json, Value};
 
@@ -43,7 +43,13 @@ pub(crate) fn provider_supports_1m(provider: &Value) -> bool {
         .and_then(|m| m.get("default"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    model_supports_1m(default_raw, provider.get("modelCapabilities"))
+    // qoder 网关 key(默认模型可能是 `auto` 或被 remap 成 `gm51model` 等)只在 qoder provider 上下文里
+    // 解析文档化 context —— 否则 QoderWork(无 modelCapabilities)的 1M key 会被判非 1M。
+    let is_qoder = provider
+        .get("authScheme")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_qoder_auth_scheme);
+    model_supports_1m_scoped(default_raw, provider.get("modelCapabilities"), is_qoder)
 }
 
 pub(crate) fn provider_default_model(provider: &Value) -> String {

@@ -49,7 +49,8 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::reasoning_tiers::reasoning_tiers_for_model;
+use crate::qoder_catalog::is_qoder_auth_scheme;
+use crate::reasoning_tiers::reasoning_tiers_for_model_scoped;
 use crate::schema::Provider;
 
 /// Codex `reasoning.effort` 转换成上游接受的字段形态.
@@ -321,10 +322,13 @@ pub fn apply_reasoning_effort(
     // - 选「不思考」(`none`/`off`/`disabled`)→ 用 `disable_wire` 关思考(`None` = 不可关,no-op);
     // - 选「思考开」深度档 → 用 `on_tier_wire`(DeepSeek = `HighMax` 写 `reasoning_effort`;
     //   `None` = 二元 provider GLM/Kimi/Qwen/MiMo/M3 不收 `reasoning_effort`,no-op = 模型默认思考)。
+    // qoder 网关 key(`auto`/`gm51model` 等)只在 qoder provider 上下文里解析成 qoder 档 —— 用
+    // authScheme scope,避免撞 WorkBuddy 等同名 model 的 `auto`(correctness review HIGH)。
+    let is_qoder = is_qoder_auth_scheme(&provider.auth_scheme);
     if let Some(spec) = body
         .get("model")
         .and_then(|v| v.as_str())
-        .and_then(reasoning_tiers_for_model)
+        .and_then(|m| reasoning_tiers_for_model_scoped(m, is_qoder))
     {
         if matches!(codex_effort, "none" | "off" | "disabled") {
             if let Some(wire) = spec.disable_wire {
@@ -348,6 +352,18 @@ mod tests {
 
     fn provider(id: &str) -> Provider {
         provider_full(id, id, "https://example.test")
+    }
+
+    /// QoderWork provider(authScheme=`qoder_oauth`)—— qoder 网关 key 只在这类 provider 上下文里
+    /// 解析成 qoder 思考档(scope 见 [`is_qoder_auth_scheme`])。
+    fn qoder_provider() -> Provider {
+        let mut p = provider_full(
+            "qoder-login",
+            "QoderWork CN",
+            "https://gateway.qoder.com.cn",
+        );
+        p.auth_scheme = "qoder_oauth".into();
+        p
     }
 
     fn provider_full(id: &str, name: &str, base_url: &str) -> Provider {
@@ -486,31 +502,77 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
     }
 
+    /// 构造带 `model` 的 body 跑 `apply_reasoning_effort`,provider = QoderWork(authScheme
+    /// qoder_oauth)—— qoder 网关 key 才在此上下文里解析成 qoder 档。
+    fn apply_qoder_model(model: &str, effort: &str) -> Value {
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String(model.into()));
+        apply_reasoning_effort(&mut body, &qoder_provider(), effort);
+        Value::Object(body)
+    }
+
     #[test]
     fn qoder_none_writes_reasoning_effort_none_depth_passes_through() {
         // [MOC-297] QoderWork:单字段控思考(实测 gateway.qoder.com.cn)。关思考=写
         // reasoning_effort="none"(**不是**删,也不是 thinking 顶级字段);深度档 high/max 透传。
-        // provider_id 随意——命中 reasoning_tiers 表即由 spec 完全决定 wire,不 fall-through。
+        // qoder 网关 key 只在 qoder provider(authScheme qoder_oauth)上下文里解析成 qoder 档。
         assert_eq!(
-            apply_model("qoder", "gm51model", "none")["reasoning_effort"],
+            apply_qoder_model("gm51model", "none")["reasoning_effort"],
             "none"
         );
         assert_eq!(
-            apply_model("qoder", "gm51model", "high")["reasoning_effort"],
+            apply_qoder_model("gm51model", "high")["reasoning_effort"],
             "high"
         );
         assert_eq!(
-            apply_model("qoder", "dmodel", "max")["reasoning_effort"],
+            apply_qoder_model("dmodel", "max")["reasoning_effort"],
             "max"
         );
         // 二元模型(kmodel/auto):none 关;max = 模型默认思考(on_tier=None,不写 effort)。
         assert_eq!(
-            apply_model("qoder", "kmodel", "none")["reasoning_effort"],
+            apply_qoder_model("kmodel", "none")["reasoning_effort"],
             "none"
         );
-        assert!(apply_model("qoder", "kmodel", "max")
+        assert!(apply_qoder_model("kmodel", "max")
             .get("reasoning_effort")
             .is_none());
+    }
+
+    #[test]
+    fn qoder_generic_alias_keys_do_not_leak_to_other_providers() {
+        // [correctness review HIGH] `auto` 是 qoder 网关 key,也是 WorkBuddy 的真实 model。
+        // 非 qoder provider(如 workbuddy)喂 `auto` **不得**命中 qoder 档 —— 否则会把 WorkBuddy
+        // auto 的 reasoning wire 静默改成 QODER_BINARY(none→reasoning_effort=none / 深度档丢弃)。
+        // 非 qoder provider 走全局表,`auto` 未入表 → fall-through 到 provider-名 keyed 的
+        // reasoning_effort_wire。workbuddy(openai_chat)的默认 wire 会透传 effort,而非 qoder 行为。
+        let wb = provider_full(
+            "workbuddy-login",
+            "WorkBuddy",
+            "https://copilot.tencent.com/v2",
+        );
+        for effort in ["none", "high", "max"] {
+            let mut body = Map::new();
+            body.insert("model".into(), Value::String("auto".into()));
+            apply_reasoning_effort(&mut body, &wb, effort);
+            // 关键:非 qoder 的 `auto` 绝不写 reasoning_effort="none"(那是 qoder disable_wire 行为)。
+            if effort == "none" {
+                assert_ne!(
+                    body.get("reasoning_effort").and_then(|v| v.as_str()),
+                    Some("none"),
+                    "WorkBuddy auto 'none' 不应走 qoder ReasoningEffortNone wire"
+                );
+            }
+            // 也不应带上 qoder 的 thinking 顶级字段(qoder 不用 thinking.type)——纯 provider 默认 wire。
+            assert!(
+                body.get("thinking").is_none() && body.get("chat_template_kwargs").is_none(),
+                "WorkBuddy auto effort={effort} 不应命中任何 qoder/GLM 特化 wire"
+            );
+        }
+        // 同一个 `auto`,在 qoder provider 上下文里则命中 qoder 档:none → reasoning_effort=none。
+        assert_eq!(
+            apply_qoder_model("auto", "none")["reasoning_effort"],
+            "none"
+        );
     }
 
     #[test]

@@ -158,6 +158,11 @@ static QODER_NO_THINKING: ReasoningTierSpec = ReasoningTierSpec {
 };
 
 /// model id(自动 trim + lowercase)→ 可选思考档位规格;`None` = 无特殊档位(用 Codex 默认 4 档)。
+///
+/// **全局表(不含 QoderWork)**:key 假定跨 provider 全局唯一的真实模型名(glm-5.2 / deepseek-v4-pro
+/// 等,同名 = 同底层模型 → 共用档位,MOC-241 设计)。QoderWork 的网关 key 有 `auto` / `l` 这类**通用
+/// 别名**(与 WorkBuddy 的 `auto` 撞名),不在此表 —— 见 [`reasoning_tiers_for_qoder_model`] +
+/// [`reasoning_tiers_for_model_scoped`],只在 qoder provider 上下文里生效,避免污染同名的其它 provider。
 pub fn reasoning_tiers_for_model(model: &str) -> Option<&'static ReasoningTierSpec> {
     let m = model.trim().to_ascii_lowercase();
 
@@ -190,13 +195,36 @@ pub fn reasoning_tiers_for_model(model: &str) -> Option<&'static ReasoningTierSp
             Some(&BINARY_ENABLE_THINKING)
         }
 
-        // QoderWork(阿里 Qoder)原始 model key(gm51model/dmodel/l 等,非人类可读,不撞上面
-        // 显示名分支):思考经 remoteChatAsk reasoning_effort 透传,档位取自 server model-list。
+        _ => None,
+    }
+}
+
+/// QoderWork(阿里 Qoder)原始 model key → 思考档位规格;`None` = 非 qoder key。
+///
+/// **provider-scoped**:qoder 网关 key(`auto`/`l`/`gm51model` 等)含通用别名,与其它 provider 撞名,
+/// 故**独立于全局表**、只在 qoder provider 上下文里查(见 [`reasoning_tiers_for_model_scoped`] +
+/// [`crate::qoder_catalog::is_qoder_auth_scheme`])。思考经 remoteChatAsk `reasoning_effort` 透传,
+/// 档位取自 QoderWork server model-list(MOC-297)。数据同源 [`crate::qoder_catalog::QODER_MODELS`]。
+pub fn reasoning_tiers_for_qoder_model(model: &str) -> Option<&'static ReasoningTierSpec> {
+    match model.trim().to_ascii_lowercase().as_str() {
         "gm51model" | "dmodel" | "dfmodel" => Some(&QODER_EFFORT),
         "auto" | "qmodel_latest" | "qmodel" | "l" | "kmodel" => Some(&QODER_BINARY),
         "mmodel" => Some(&QODER_NO_THINKING),
-
         _ => None,
+    }
+}
+
+/// 按 model id + **是否 qoder provider** 查思考档位。qoder provider 优先查 qoder 表(通用别名如
+/// `auto` 才解析成 qoder 档),再兜底全局表(qoder 也可能挂真实模型名);非 qoder 只查全局表
+/// (WorkBuddy 的 `auto` → 全局无 → `None`,回落各 provider 原行为,**不被 qoder 污染**)。
+pub fn reasoning_tiers_for_model_scoped(
+    model: &str,
+    is_qoder: bool,
+) -> Option<&'static ReasoningTierSpec> {
+    if is_qoder {
+        reasoning_tiers_for_qoder_model(model).or_else(|| reasoning_tiers_for_model(model))
+    } else {
+        reasoning_tiers_for_model(model)
     }
 }
 
@@ -368,25 +396,84 @@ mod tests {
 
     #[test]
     fn qoder_keys_map_to_qoder_specs() {
+        // qoder key 只在 qoder-scoped 表(reasoning_tiers_for_qoder_model / scoped is_qoder=true)里解析。
         // effort 模型(DeepSeek/GLM):none/high/max,reasoning_effort 透传(HighMax)
         for m in ["gm51model", "dmodel", "dfmodel"] {
-            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中"));
+            let s = reasoning_tiers_for_qoder_model(m).unwrap_or_else(|| panic!("{m} 应命中"));
             assert_eq!(efforts(s), vec!["none", "high", "max"], "{m}");
             assert_eq!(s.on_tier_wire, Some(ReasoningEffortWire::HighMax), "{m}");
+            // scoped(is_qoder=true) 等价
+            assert_eq!(reasoning_tiers_for_model_scoped(m, true), Some(s), "{m}");
         }
         // 二元思考(auto/Qwen/Kimi):none/max
         for m in ["auto", "qmodel_latest", "qmodel", "l", "kmodel"] {
-            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中"));
+            let s = reasoning_tiers_for_qoder_model(m).unwrap_or_else(|| panic!("{m} 应命中"));
             assert_eq!(efforts(s), vec!["none", "max"], "{m}");
         }
         // 非思考(MiniMax-M2.7):隐藏 picker(空档位)
-        let mm = reasoning_tiers_for_model("mmodel").unwrap();
+        let mm = reasoning_tiers_for_qoder_model("mmodel").unwrap();
         assert!(mm.levels.is_empty(), "mmodel 应隐藏 picker");
         // qoder 关思考 = 写 reasoning_effort="none"(实测 QoderWork 单字段控思考)
         assert_eq!(
-            reasoning_tiers_for_model("gm51model").unwrap().disable_wire,
+            reasoning_tiers_for_qoder_model("gm51model")
+                .unwrap()
+                .disable_wire,
             Some(DisableThinkingWire::ReasoningEffortNone)
         );
+    }
+
+    #[test]
+    fn qoder_generic_alias_keys_absent_from_global_table() {
+        // [HIGH 回归防护] qoder 的通用别名 key(`auto`/`l`)不得进全局表 —— 否则会撞 WorkBuddy 等
+        // 同名 model,静默改掉它们的 reasoning wire/picker/compact(correctness review HIGH)。
+        // 全局表对这些 key 必须返 None;非 qoder provider(is_qoder=false)scoped 亦然。
+        for m in ["auto", "l"] {
+            assert!(
+                reasoning_tiers_for_model(m).is_none(),
+                "{m} 不应在全局 reasoning_tiers 表(会污染同名 provider)"
+            );
+            assert!(
+                reasoning_tiers_for_model_scoped(m, false).is_none(),
+                "{m} 非 qoder provider 不应解析成 qoder 档"
+            );
+        }
+        // qoder 的机器名 key(gm51model 等)也一律不进全局表,统一走 qoder-scoped。
+        for m in [
+            "gm51model",
+            "dmodel",
+            "dfmodel",
+            "qmodel",
+            "qmodel_latest",
+            "kmodel",
+            "mmodel",
+        ] {
+            assert!(
+                reasoning_tiers_for_model(m).is_none(),
+                "{m} 全局表应为空(qoder key 统一 scoped)"
+            );
+        }
+    }
+
+    #[test]
+    fn every_qoder_model_has_reasoning_and_context() {
+        // [test-coverage review rate 7] 跨表一致性机械守卫:QODER_MODELS 是 QoderWork 的单一真相,
+        // 每个 key 必须在 qoder-scoped reasoning 档 + scoped context 两表都有归宿。加第 10 个模型忘同步
+        // 任一表 → 半坏(如 context 对但 reasoning 缺档、picker 塌成默认 4 档),正是本仓最想防的漂移。
+        use crate::model_context_policy::documented_context_window_scoped;
+        use crate::qoder_catalog::QODER_MODELS;
+        for m in QODER_MODELS {
+            assert!(
+                reasoning_tiers_for_qoder_model(m.key).is_some(),
+                "QODER_MODELS key `{}` 缺 qoder reasoning 档(reasoning_tiers_for_qoder_model 漏同步)",
+                m.key
+            );
+            assert_eq!(
+                documented_context_window_scoped(m.key, true),
+                Some(m.max_context),
+                "QODER_MODELS key `{}` 的 context 与 documented_context_window_scoped 不一致",
+                m.key
+            );
+        }
     }
 
     #[test]

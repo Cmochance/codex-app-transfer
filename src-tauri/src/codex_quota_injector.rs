@@ -1543,10 +1543,17 @@ async fn fetch_qoder_quota(
         return None;
     };
     let http = http.as_ref()?;
-    // 当前服务账号(sticky + 续期);池空 / 无凭证 → 无额度。
-    let acct = qoder::pool::select_serving_account(http, &provider_id)
-        .await
-        .ok()?;
+    // 当前服务账号(sticky + 续期);池空 → NotLoggedIn(正常「未登录」态,不留痕)。
+    // 其它错误(续期失败 / 存储 IO / 全账号退避)是真失败:留 debug 痕再返 None ——
+    // 否则登录用户额度一直不显示时无从诊断(与下方 QuotaError 分支的留痕一致)。
+    let acct = match qoder::pool::select_serving_account(http, &provider_id).await {
+        Ok(a) => a,
+        Err(qoder::pool::PoolError::NotLoggedIn) => return None,
+        Err(e) => {
+            tracing::debug!(error = %e, "[Quota] qoder 选服务账号失败 → 本 tick 无额度");
+            return None;
+        }
+    };
     let fp = quota_fingerprint(&[provider_id.as_str(), acct.uid.as_str()]);
     if let Some((cfp, q, at)) = cache.as_ref() {
         if *cfp == fp && at.elapsed() < QUOTA_TTL {

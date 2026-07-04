@@ -41,7 +41,8 @@
 //!   (`codex-rs/core/src/compact.rs:262`)。
 
 use bytes::Bytes;
-use codex_app_transfer_registry::{compact_disable_thinking_wire, Provider};
+use codex_app_transfer_registry::qoder_catalog::is_qoder_auth_scheme;
+use codex_app_transfer_registry::{compact_disable_thinking_wire_scoped, Provider};
 use futures_util::stream::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{json, Value};
@@ -440,7 +441,7 @@ pub(crate) fn build_compact_chat_request(
     super::request::set_compact_no_keep_recent(false);
     let chat_body = conversion?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
-    let mut chat_body = inject_compact_disable_thinking_if_supported(chat_body);
+    let mut chat_body = inject_compact_disable_thinking_if_supported(chat_body, provider);
     // 流式-only 网关(见 [`compact_requires_streaming`])的 compact chat 请求也必须 stream:true,
     // 否则上游拒(WorkBuddy 网关回 11101 "Non-stream chat request is currently not supported")。
     // 响应侧 collect_and_wrap_compact_body 自动检测 SSE 重组回非流式 chat completion,统一走下游
@@ -471,13 +472,21 @@ fn compact_requires_streaming(provider: &Provider) -> bool {
 /// `codex_app_transfer_registry::compact_thinking_policy` 模块顶部文档。
 /// 本函数只做 "查表 + 注入" 两步,**不在此处** inline 任何 provider / model 判定 —
 /// 加新模型走"加 registry entry + 加 registry 单测"路径,无需改本文件。
-fn inject_compact_disable_thinking_if_supported(mut chat_body: Value) -> Value {
+///
+/// `provider` 用于 scope QoderWork 的网关 key(`auto`/`gm51model` 等含通用别名,与 WorkBuddy 撞名):
+/// 只有 qoder provider(authScheme qoder_oauth)才把这些 key 解析成 qoder disable_wire
+/// (`reasoning_effort=none`),非 qoder provider 的同名 model 不受影响(correctness review HIGH)。
+fn inject_compact_disable_thinking_if_supported(
+    mut chat_body: Value,
+    provider: &Provider,
+) -> Value {
     let model_id = chat_body
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_owned();
-    if let Some(wire) = compact_disable_thinking_wire(&model_id) {
+    let is_qoder = is_qoder_auth_scheme(&provider.auth_scheme);
+    if let Some(wire) = compact_disable_thinking_wire_scoped(&model_id, is_qoder) {
         wire.inject(&mut chat_body);
     }
     chat_body
