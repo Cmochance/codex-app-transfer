@@ -42,6 +42,9 @@ const ICON_MAP: Record<string, IconSpec> = {
   // workbuddy,无其它 provider 含此串,无歧义。官方品牌标(从 WorkBuddy.app renderer 提取的
   // logo-workbuddy.svg,64×64 方形带渐变)。
   workbuddy: { logo: 'assets/providers/workbuddy.svg' },
+  // QoderWork CN(阿里 Qoder);preset id `qoder-login` / name「QoderWork CN」/ baseUrl
+  // gateway.qoder.com.cn 均含 `qoder`,无其它 provider 含此串,无歧义。官方 app 图标(icon-128.png,128²)。
+  qoder: { logo: 'assets/providers/qoder.png' },
 }
 
 // 逐字移植 computeIcon: 拼 id+name+baseUrl+apiFormat → normalize(_/空格→-)→ 子串匹配 ICON_MAP
