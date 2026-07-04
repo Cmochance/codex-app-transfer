@@ -807,6 +807,16 @@ pub async fn forward_handler(
         (st, hs, stream)
     };
 
+    // QoderCosy:上游 SSE 每帧是 `{headers, body, statusCodeValue, statusCode}` 信封,body 是
+    // stringified OpenAI chat.completion.chunk(实测,非加密)。先 unwrap 成标准 OpenAI SSE,
+    // 再交 openai_chat adapter 做 chat→responses 转换。
+    let upstream_stream = if matches!(resolved.auth_scheme, crate::resolver::AuthScheme::QoderCosy)
+    {
+        unwrap_qoder_cosy_stream(upstream_stream)
+    } else {
+        upstream_stream
+    };
+
     let response_plan = adapter.transform_response_stream(
         status,
         upstream_headers,
@@ -2177,6 +2187,65 @@ async fn send_qoder_cosy(
     let outbound_headers_snapshot = req.headers().clone();
     let resp = state.http.execute(req).await?;
     Ok((resp, outbound_headers_snapshot))
+}
+
+/// QoderCosy 响应流 unwrap:上游每 SSE 帧是 `{headers, body, statusCodeValue, statusCode}`
+/// 信封(MOC-297 实测,**非加密**),`body` 是 stringified OpenAI `chat.completion.chunk`。
+/// 逐帧提 `body` 重发成标准 OpenAI SSE(`data: <body>`),流尾补 `data: [DONE]`,再交下游
+/// openai_chat adapter 做 chat→responses 转换。
+fn unwrap_qoder_cosy_stream(
+    inner: codex_app_transfer_adapters::ByteStream,
+) -> codex_app_transfer_adapters::ByteStream {
+    use futures_util::StreamExt;
+    let s = futures_util::stream::unfold(
+        (inner, Vec::<u8>::new(), false),
+        |(mut inner, mut buf, ended)| async move {
+            loop {
+                // 提 buf 里所有完整行(\n 结尾),unwrap 后拼进 out。
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let s = String::from_utf8_lossy(&line);
+                    let Some(payload) = s.trim().strip_prefix("data:") else {
+                        continue;
+                    };
+                    let p = payload.trim();
+                    if p.is_empty() {
+                        continue;
+                    }
+                    if p == "[DONE]" {
+                        out.extend_from_slice(b"data: [DONE]\n\n");
+                        continue;
+                    }
+                    if let Ok(env) = serde_json::from_str::<serde_json::Value>(p) {
+                        if let Some(body) = env.get("body").and_then(|b| b.as_str()) {
+                            out.extend_from_slice(b"data: ");
+                            out.extend_from_slice(body.as_bytes());
+                            out.extend_from_slice(b"\n\n");
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    return Some((Ok(Bytes::from(out)), (inner, buf, ended)));
+                }
+                if ended {
+                    return None;
+                }
+                match inner.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => return Some((Err(e), (inner, buf, true))),
+                    None => {
+                        // 上游结束:补 [DONE] 收尾(下游 openai adapter 需要)。
+                        return Some((
+                            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                            (inner, Vec::new(), true),
+                        ));
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(s)
 }
 
 /// [#304] 本地记录 `session_id → 真实上游模型` 到 `~/.codex-app-transfer/session-models.jsonl`。
