@@ -40,6 +40,14 @@ impl PoolBackend for QoderBackend {
     }
 
     /// QoderWork 的设备指纹 = `machine_id`(签名 `Cosy-MachineId` 用)。
+    ///
+    /// **注意(已知局限,per-account 设备隔离未达成)**:qoder 的 machine_id 在登录 PKCE authUrl
+    /// 阶段就绑定进 device token,`run_qoder_login` 用全局 `qoder_machine_id()` 且 `payload_to_cred`
+    /// 预填,故 `add_account` 的 `cred_fingerprint` 恒 `Some(全局值)`、`new_fingerprint` 对 qoder 不触发
+    /// —— 池内多账号共用同一 `Cosy-MachineId`。多账号仍能跑(网关按 token/`Cosy-User` uid 区分、配额倍增
+    /// 有效),但通用池文档所述「每账号独立设备指纹」对 qoder 未实现。真正 per-account 隔离需每次登录前
+    /// 生成新 machine_id 并贯穿 authUrl+落盘+签名,且需真机新登录验证 token 绑定 —— 留作 followup,
+    /// 不在本 PR 内改(避免 ship 未验证的鉴权流改动)。
     fn cred_fingerprint(cred: &Self::Cred) -> Option<String> {
         cred.machine_id.clone()
     }
@@ -82,6 +90,10 @@ impl PoolBackend for QoderBackend {
                 fresh.nickname = fresh.nickname.or(cred.nickname.clone());
                 fresh.uid = fresh.uid.or(cred.uid.clone());
                 fresh.machine_id = fresh.machine_id.or(cred.machine_id.clone());
+                // refresh_token 若上游不回带(不轮换),保留旧值——否则续期一次即清空、账号被 brick 需重登。
+                if fresh.refresh_token.is_empty() {
+                    fresh.refresh_token = cred.refresh_token.clone();
+                }
                 let token = fresh.personal_token.clone();
                 account_pool::save_account(ns, provider_id, uid, &fresh)
                     .map_err(|e| RefreshOutcome::Infra(e.to_string()))?;

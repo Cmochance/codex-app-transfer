@@ -8,7 +8,7 @@
 //!
 //! transfer 用户模型威胁下**无法在纯 Rust 复刻**该私有签名(涉及内嵌 secret + 自定义
 //! canonicalization),故**内嵌官方 `.wasm`(`assets/qoder_auth_wasm_bg.wasm`,289KB)**
-//! 并用 wasmtime 驱动 —— 在 Rust 侧复刻 wasm-bindgen 的 31 个 host import + 内存
+//! 并用 wasmi 驱动 —— 在 Rust 侧复刻 wasm-bindgen 的 31 个 host import + 内存
 //! marshaling(本文件 [`imports`] 模块)。这些 import 实现逐条对照官方 glue
 //! (`qoder-worker-runtime.obf.mjs`)与本仓 POC(见 MOC-297)得到。
 //!
@@ -80,7 +80,7 @@ enum HeapVal {
     Global,
 }
 
-/// wasmtime `Store` 的 host 数据:堆 + `WASM_VECTOR_LEN` + 最近一次 WASM 抛错。
+/// wasmi `Store` 的 host 数据:堆 + `WASM_VECTOR_LEN` + 最近一次 WASM 抛错。
 struct HostState {
     heap: Vec<HeapVal>,
     heap_next: u32,
@@ -981,7 +981,7 @@ fn trap(e: wasmi::Error) -> QoderAuthError {
 mod tests {
     use super::*;
 
-    /// 冒烟测:验证 wasmtime 绑定能加载 WASM + 读回静态内嵌的 httpdns 常量。
+    /// 冒烟测:验证 wasmi 绑定能加载 WASM + 读回静态内嵌的 httpdns 常量。
     /// 期望值来自 Node POC 实测(MOC-297):account_id=183012。
     #[test]
     fn httpdns_statics_match_poc() {

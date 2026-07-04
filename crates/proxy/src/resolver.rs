@@ -553,6 +553,35 @@ mod tests {
             AuthScheme::parse("BigModel-OAuth"),
             AuthScheme::ZaiOauth(ZaiProvider::BigModel)
         );
+
+        // WorkbuddyOauth / QoderCosy(账号池系):别名误归 Bearer 会让 forward.rs 跳过各自
+        // 的账号池选择 + 签名分支 → 上游静默 401/破坏。QoderCosy 更严重:误归 Bearer 会同时
+        // 跳过 send_qoder_cosy WASM 签名 + unwrap_qoder_cosy_stream 信封解包 → 全链静默坏。
+        assert_eq!(
+            AuthScheme::parse("workbuddy_oauth"),
+            AuthScheme::WorkbuddyOauth
+        );
+        assert_eq!(
+            AuthScheme::parse("workbuddy_login"),
+            AuthScheme::WorkbuddyOauth
+        );
+        assert_eq!(AuthScheme::parse("qoder_oauth"), AuthScheme::QoderCosy);
+        assert_eq!(AuthScheme::parse("qoder"), AuthScheme::QoderCosy);
+        assert_eq!(AuthScheme::parse("qoder_cosy"), AuthScheme::QoderCosy);
+        assert_eq!(AuthScheme::parse("Qoder-OAuth"), AuthScheme::QoderCosy);
+    }
+
+    #[test]
+    fn qoder_cosy_forces_gateway_base_ignoring_provider_baseurl() {
+        // QoderCosy 的 upstream_base 钉死 gateway.qoder.com.cn,覆盖 user 保存的旧 baseUrl
+        // (qoder-login preset 历史 base 是废弃的 api2-v2 通道)。防 baseUrl 漂移 + device
+        // token 泄漏到 user 自定义 host(即便当前 send_qoder_cosy 硬编 gateway,此 pin 是纵深防御)。
+        let mut p = provider("qoder", "https://api2-v2.qoder.sh/model/v1", "");
+        p.auth_scheme = "qoder_oauth".into();
+        let r = StaticResolver::new(None, vec![p], Some("qoder".into()));
+        let parts = parts_with(&[]);
+        let resolved = r.resolve(&parts, b"{}").expect("qoder provider 应解析");
+        assert_eq!(resolved.upstream_base, "https://gateway.qoder.com.cn");
     }
 
     #[test]
