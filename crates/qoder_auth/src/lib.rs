@@ -638,7 +638,31 @@ impl QoderAuth {
     ) -> Result<PreparedRequest> {
         let mut g = self.inner.lock().unwrap();
         let ctx = g.new_context(machine_id, cosy_version, user_info_json, client_meta_json)?;
+        // 1st refresh:设入 device token 等。
         g.refresh_auth_fields(ctx, user_info_for_auth_json)?;
+        // **关键**:生成运行时 auth 字段(encrypt_user_info + key)——签名依赖它们,漏了签名
+        // 必被网关拒(Signature invalid,MOC-297 实测)。对齐官方 regenerateRuntimeFields:
+        // generate_runtime_auth_fields({uid, org, org_tags, data_policy}) → {encrypt_user_info, key}。
+        let uifa: serde_json::Value = serde_json::from_str(user_info_for_auth_json)
+            .map_err(|e| QoderAuthError::Wasm(format!("user_info_for_auth 非 JSON: {e}")))?;
+        let rt_input = serde_json::json!({
+            "uid": uifa.get("uid").cloned().unwrap_or(serde_json::Value::String(String::new())),
+            "organization_id": uifa.get("organization_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
+            "organization_tags": uifa.get("organization_tags").cloned().unwrap_or(serde_json::json!([])),
+            "data_policy_agreed": uifa.get("data_policy_agreed").cloned().unwrap_or(serde_json::Value::Bool(true)),
+        });
+        let rt_str = g.generate_runtime_auth_fields(&rt_input.to_string())?;
+        let rt: serde_json::Value = serde_json::from_str(&rt_str)
+            .map_err(|e| QoderAuthError::Wasm(format!("runtime auth fields 非 JSON: {e}")))?;
+        // 把生成的 encrypt_user_info / key 合进 userInfoForAuth,2nd refresh 让签名带上它们。
+        let mut merged = uifa.as_object().cloned().unwrap_or_default();
+        if let Some(e) = rt.get("encrypt_user_info") {
+            merged.insert("encrypt_user_info".to_string(), e.clone());
+        }
+        if let Some(k) = rt.get("key") {
+            merged.insert("key".to_string(), k.clone());
+        }
+        g.refresh_auth_fields(ctx, &serde_json::Value::Object(merged).to_string())?;
         let handle = g.prepare_infer_request(ctx, endpoint, body, model_key, model_source)?;
         let out = g.read_request_result(handle)?;
         g.free_context(ctx);
@@ -724,6 +748,38 @@ impl WasmInner {
             .to_vec();
         self.free_bytes(rptr, rlen)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `generate_runtime_auth_fields(json) -> json`(string→string)。输入
+    /// `{uid, organization_id, organization_tags, data_policy_agreed}`,输出
+    /// `{encrypt_user_info, key}`——签名依赖这俩(对齐官方 regenerateRuntimeFields)。
+    fn generate_runtime_auth_fields(&mut self, input: &str) -> Result<String> {
+        let f = self
+            .instance
+            .get_typed_func::<(i32, i32, i32), ()>(&mut self.store, "generate_runtime_auth_fields")
+            .map_err(|e| QoderAuthError::Wasm(e.to_string()))?;
+        let sp = self.add_sp.call(&mut self.store, -16).map_err(trap)?;
+        let (ptr, len) = self.pass_str(input)?;
+        if let Err(e) = f.call(&mut self.store, (sp, ptr, len)) {
+            self.add_sp.call(&mut self.store, 16).ok();
+            let msg = self.store.data_mut().last_err.take();
+            return Err(msg.map_or_else(|| trap(e), QoderAuthError::Trap));
+        }
+        let rptr = self.ret_i32(sp, 0);
+        let rlen = self.ret_i32(sp, 4);
+        self.add_sp.call(&mut self.store, 16).map_err(trap)?;
+        if rptr == 0 {
+            return Ok("{}".to_string());
+        }
+        let data = self.memory.data(&self.store);
+        let bytes = mem_slice(data, rptr as u32, rlen as u32)
+            .ok_or(QoderAuthError::Oob {
+                ptr: rptr as u32,
+                len: rlen as u32,
+            })?
+            .to_vec();
+        self.free_bytes(rptr, rlen)?;
+        Ok(std::str::from_utf8(&bytes)?.to_string())
     }
 
     /// UTF-8 编码 `s` 写进 WASM 线性内存(malloc),返回 `(ptr, len)`(len=字节长)。
