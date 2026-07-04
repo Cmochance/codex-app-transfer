@@ -712,7 +712,7 @@
     "authScheme": "qoder_oauth",
     "apiFormat": "openai_chat",
     "models": {
-      "default": "q36fmodel"
+      "default": "auto"
     },
     "notices": [
       {
