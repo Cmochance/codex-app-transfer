@@ -191,6 +191,20 @@ fn sanitize_id(id: &str) -> String {
     }
 }
 
+/// 某账号文件的绝对路径(供仍需 path 的 provider store wrapper 复用)。
+pub fn account_file_path(
+    ns: &str,
+    provider_id: &str,
+    uid: &str,
+) -> Result<PathBuf, PoolStorageError> {
+    Ok(account_path(&transfer_root()?, ns, provider_id, uid))
+}
+
+/// 旧「单文件单账号」的绝对路径(迁移读取用)。
+pub fn legacy_file_path(filename: &str) -> Result<PathBuf, PoolStorageError> {
+    Ok(transfer_root()?.join(filename))
+}
+
 fn account_path(root: &Path, ns: &str, provider_id: &str, uid: &str) -> PathBuf {
     // 账号文件放 `accounts/` 子目录,与同级 `_pool.json` 物理隔离(防某 uid 清洗后恰为
     // `_pool` 覆盖池态)。
@@ -207,7 +221,7 @@ fn pool_state_path(root: &Path, ns: &str, provider_id: &str) -> PathBuf {
 }
 
 /// atomic 写(唯一 temp + rename,unix 0600)。唯一 temp(pid + 进程内递增)防并发续期互撞。
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), PoolStorageError> {
+pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), PoolStorageError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -241,7 +255,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), PoolSto
     Ok(())
 }
 
-fn read_json_opt<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, PoolStorageError> {
+pub fn read_json_opt<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, PoolStorageError> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

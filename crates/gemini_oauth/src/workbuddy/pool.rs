@@ -1,363 +1,176 @@
-//! WorkBuddy **账号池**选择器 —— 单 provider 多账号 + 额度守护自动切换。
+//! WorkBuddy 多账号池 —— 复用通用 [`crate::account_pool`],只提供 WorkBuddy 特化 +
+//! 保留原对外 API(`ServingAccount{uid,token,device_id}` / `PoolAccount` / 各操作)。
 //!
-//! 一个 `workbuddy-login` provider 维护一个账号池([`token`] 的 `<provider_id>/<uid>.json`)。
-//! 代理转发时 [`select_serving_account`] 选一个「当前服务账号」并自动续期 token;某账号被
-//! 额度守护标记 `exhausted_until`(见 [`set_exhausted`])后,选择器自动跳到下一个可用账号
-//! (sticky:不切则一直用同一个,直到它被标记耗尽)。
-//!
-//! **切换由额度守护驱动**(quota 守护进程:某账号总剩余 < 阈值 → 标记耗尽),本模块只消费
-//! `exhausted_until`。`set_exhausted` 也预留给未来的反应式失败转移(撞耗尽错误即标记),当前
-//! 仅守护一条路调用。
-//! **每账号独立 device_id**(登录生成、存账号文件)由 [`add_account`] 分配,避免多账号同设备被风控关联。
+//! 选择/失败转移/存储全在 [`crate::account_pool`];本模块只实现 [`PoolBackend`]
+//! (WorkBuddy 凭证字段抽取 + 续期)+ 把泛型结果 map 回 WorkBuddy 既有形态。
 
-use super::token::{
-    self, unix_now_ms, PoolState, WorkbuddyCredential, WorkbuddyCredentialStore, WorkbuddyPoolStore,
-};
-use super::{ensure_valid_workbuddy_token, user_id_from_jwt, uuid_v4, WorkbuddyError};
+use crate::account_pool::{self, PoolBackend, PoolError, RefreshOutcome};
 
-/// 选中的服务账号 —— 代理转发用。
+use super::login::{ensure_valid_workbuddy_token, WorkbuddyError};
+use super::token::{WorkbuddyCredential, WorkbuddyCredentialStore, WorkbuddyTokenError};
+use super::{account_display_from_jwt, user_id_from_jwt, uuid_v4, workbuddy_device_id};
+
+/// WorkBuddy 的 [`PoolBackend`] 特化。
+pub struct WorkbuddyBackend;
+
+impl PoolBackend for WorkbuddyBackend {
+    type Cred = WorkbuddyCredential;
+
+    fn namespace() -> &'static str {
+        "workbuddy"
+    }
+
+    fn legacy_single_filename() -> &'static str {
+        "workbuddy-oauth.json"
+    }
+
+    fn cred_uid(cred: &Self::Cred) -> Option<String> {
+        cred.uid.clone()
+    }
+
+    fn uid_from_token(cred: &Self::Cred) -> Option<String> {
+        user_id_from_jwt(&cred.access_token)
+    }
+
+    fn set_uid(cred: &mut Self::Cred, uid: String) {
+        cred.uid = Some(uid);
+    }
+
+    /// WorkBuddy 的设备指纹 = `device_id`(`X-Device-Id` 用)。
+    fn cred_fingerprint(cred: &Self::Cred) -> Option<String> {
+        cred.device_id.clone()
+    }
+
+    fn set_fingerprint(cred: &mut Self::Cred, fp: String) {
+        cred.device_id = Some(fp);
+    }
+
+    fn new_fingerprint() -> String {
+        uuid_v4()
+    }
+
+    fn fingerprint_fallback() -> String {
+        workbuddy_device_id()
+    }
+
+    fn cred_nickname(cred: &Self::Cred) -> Option<String> {
+        cred.nickname.clone()
+    }
+
+    fn cred_display(cred: &Self::Cred) -> Option<String> {
+        account_display_from_jwt(&cred.access_token)
+    }
+
+    /// 续期该账号 access token。网关拒 refresh(Business)/ 凭证丢失(NotLoggedIn)= 账号级
+    /// → 失败转移;Http / 存储 = 基础设施级 → 直接返回。
+    async fn ensure_valid(
+        http: &reqwest::Client,
+        provider_id: &str,
+        uid: &str,
+    ) -> Result<String, RefreshOutcome> {
+        let store = WorkbuddyCredentialStore::for_account(provider_id, uid)
+            .map_err(|e| RefreshOutcome::Infra(e.to_string()))?;
+        match ensure_valid_workbuddy_token(http, &store).await {
+            Ok(token) => Ok(token),
+            Err(e @ (WorkbuddyError::Business { .. } | WorkbuddyError::NotLoggedIn)) => {
+                Err(RefreshOutcome::AccountLevel(e.to_string()))
+            }
+            Err(e) => Err(RefreshOutcome::Infra(e.to_string())),
+        }
+    }
+}
+
+// ── 保留 WorkBuddy 既有对外形态 ─────────────────────────────────────
+
+/// 选中的服务账号 —— 代理转发用(字段名保持 `token`/`device_id`,forward.rs 依赖)。
 #[derive(Debug, Clone)]
 pub struct ServingAccount {
     pub uid: String,
-    /// 已续期的有效 access token。
     pub token: String,
-    /// 本账号专属 `X-Device-Id`。
     pub device_id: String,
 }
 
-/// 池内账号摘要(UI / quota 守护用)。
+/// 池内账号摘要(UI / quota 守护)。
 #[derive(Debug, Clone)]
 pub struct PoolAccount {
     pub uid: String,
     pub nickname: Option<String>,
-    /// 账号人类可读标签(脱敏手机号),UI 显示用;取不到则 None(前端退回短 uid)。
     pub display: Option<String>,
     pub device_id: Option<String>,
-    /// 是否为当前 sticky 服务账号。
     pub is_active: bool,
-    /// 耗尽到期 UNIX ms(0 = 未标记);> now 即当前不可选。
     pub exhausted_until: i64,
 }
 
-/// **纯函数**选服务账号:sticky active(若可用)→ 否则可用集第一个(uid 排序稳定)→
-/// 全耗尽则最快解禁的那个(尽力,大概率仍失败但比不发好)。可单测,无 IO。
-///
-/// `now_ms` 当前时刻;`exhausted_until[uid] > now` 视为不可选。
-pub fn choose_serving_uid(uids: &[String], pool: &PoolState, now_ms: i64) -> Option<String> {
-    if uids.is_empty() {
-        return None;
-    }
-    let exhausted_at = |uid: &str| pool.exhausted_until.get(uid).copied().unwrap_or(0);
-    let mut available: Vec<&String> = uids.iter().filter(|u| exhausted_at(u) <= now_ms).collect();
-    available.sort(); // 稳定顺序(防每次选不同账号抖动)
-    if let Some(active) = pool.active_uid.as_deref() {
-        if available.iter().any(|u| u.as_str() == active) {
-            return Some(active.to_string());
+/// 泛型池错误 → WorkbuddyError(`classify_workbuddy_service_error` 只区分 needs_login:
+/// NotLoggedIn / Business / Token(Serde);其余为基础设施错误 needs_login=false)。
+fn map_pool_err(e: PoolError) -> WorkbuddyError {
+    match e {
+        PoolError::NotLoggedIn => WorkbuddyError::NotLoggedIn,
+        PoolError::Account(msg) => WorkbuddyError::Business { code: -1, msg },
+        PoolError::Infra(msg) => {
+            WorkbuddyError::Token(WorkbuddyTokenError::Io(std::io::Error::other(msg)))
         }
+        PoolError::Storage(s) => WorkbuddyError::Token(s.into()),
     }
-    if let Some(first) = available.first() {
-        return Some((*first).clone());
-    }
-    // 全耗尽 → 选最快解禁的(exhausted_until 最小)
-    uids.iter().min_by_key(|u| exhausted_at(u)).cloned()
 }
 
-/// 代理转发入口:迁移老凭证 → 选服务账号 → 续期 token → 返回 token + 该账号 device_id。
-/// 池空(无账号)→ `NotLoggedIn`(forward 据此提示登录)。
+/// 代理转发选服务账号(续期 + 失败转移)。
 pub async fn select_serving_account(
     http: &reqwest::Client,
     provider_id: &str,
 ) -> Result<ServingAccount, WorkbuddyError> {
-    migrate_legacy_if_needed(provider_id)?;
-    let accounts = token::list_accounts(provider_id)?;
-    let uids: Vec<String> = accounts.iter().filter_map(|c| c.uid.clone()).collect();
-    if uids.is_empty() {
-        return Err(WorkbuddyError::NotLoggedIn);
-    }
-    let pool_store = WorkbuddyPoolStore::for_provider(provider_id)?;
-    let mut pool = pool_store.load()?;
-    // 反应式失败转移:选中账号 refresh token 被网关拒(Business)或凭证丢失(NotLoggedIn)
-    // 时,标记该账号短退避耗尽(5 min)并重试池里下一个账号,避免单账号失效撞死整个池。
-    // Http / Token(Serde)类是基础设施错误(网络抖动 / 文件系统),不会因换账号自愈,直接返回。
-    // `tried` 记录本轮已试过的账号,防止 choose_serving_uid 全耗尽兜底又选回刚失败的账号死循环。
-    let mut last_err = WorkbuddyError::NotLoggedIn;
-    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-    loop {
-        // 从候选里排除本轮已试过的(choose_serving_uid 不感知 tried,这里过滤后传入)
-        let candidates: Vec<String> = uids
-            .iter()
-            .filter(|u| !tried.contains(*u))
-            .cloned()
-            .collect();
-        if candidates.is_empty() {
-            return Err(last_err); // 池里所有账号本轮都试过且失败
-        }
-        let chosen = choose_serving_uid(&candidates, &pool, unix_now_ms())
-            .ok_or(WorkbuddyError::NotLoggedIn)?;
-        tried.insert(chosen.clone());
-        // sticky 切换才落盘(避免每请求写 _pool.json)
-        if pool.active_uid.as_deref() != Some(chosen.as_str()) {
-            pool.active_uid = Some(chosen.clone());
-            pool_store.save(&pool)?;
-        }
-        let store = WorkbuddyCredentialStore::for_account(provider_id, &chosen)?;
-        let cred = store.load()?.ok_or(WorkbuddyError::NotLoggedIn)?;
-        match ensure_valid_workbuddy_token(http, &store).await {
-            Ok(token) => {
-                // device_id 正常恒 Some(add_account/迁移已补);老凭证兜底全局 device-id。
-                let device_id = cred
-                    .device_id
-                    .clone()
-                    .unwrap_or_else(super::workbuddy_device_id);
-                return Ok(ServingAccount {
-                    uid: chosen,
-                    token,
-                    device_id,
-                });
-            }
-            Err(e)
-                if matches!(
-                    e,
-                    WorkbuddyError::Business { .. } | WorkbuddyError::NotLoggedIn
-                ) =>
-            {
-                // 账号级失效:标记 5 min 退避(网关拒 refresh 短期不会自愈,但不永久 bench
-                // —— 用户可能重登修复),刷新 pool 后重试下一账号。
-                last_err = e;
-                let until = unix_now_ms() + 5 * 60 * 1000;
-                pool.exhausted_until.insert(chosen.clone(), until);
-                pool_store.save(&pool)?;
-                tracing::warn!(uid = %chosen, error = %last_err, "[Pool] 账号 refresh 失败 → 标记 5min 退避,重试下一账号");
-                continue;
-            }
-            Err(e) => return Err(e), // Http / Token 等基础设施错误,换账号无益
-        }
-    }
+    let a = account_pool::select_serving_account::<WorkbuddyBackend>(http, provider_id)
+        .await
+        .map_err(map_pool_err)?;
+    Ok(ServingAccount {
+        uid: a.uid,
+        token: a.serving_token,
+        device_id: a.fingerprint,
+    })
 }
 
-/// 登录成功后**加账号入池**:分配/复用本账号 device_id → 写 `<uid>.json` → 更新池
-/// (首账号设 active;清该账号 exhausted)。返回 uid。重登同 uid = 更新(保留 device_id 稳定)。
-pub fn add_account(
-    provider_id: &str,
-    mut cred: WorkbuddyCredential,
-) -> Result<String, WorkbuddyError> {
-    let uid = cred
-        .uid
-        .clone()
-        .or_else(|| user_id_from_jwt(&cred.access_token))
-        .ok_or(WorkbuddyError::Parse("uid"))?;
-    cred.uid = Some(uid.clone());
-    // device_id:重登复用该 uid 既有账号的(设备指纹保持稳定),首登新生成 v4 UUID。
-    // 容忍腐败文件:旧 JSON 解析失败时丢弃它(返回 None),让新登录覆盖。
-    // 否则 needs_login 后的正常恢复路径会因 load()? 传播 serde 错误而 500,
-    // 用户只能手动删文件。本读仅为保留旧 device_id,丢掉无伤大雅。
-    let existing_dev = WorkbuddyCredentialStore::for_account(provider_id, &uid)?
-        .load()
-        .ok()
-        .flatten()
-        .and_then(|c| c.device_id);
-    cred.device_id = cred.device_id.or(existing_dev).or_else(|| Some(uuid_v4()));
-    WorkbuddyCredentialStore::for_account(provider_id, &uid)?.save(&cred)?;
-
-    let pool_store = WorkbuddyPoolStore::for_provider(provider_id)?;
-    let mut pool = pool_store.load()?;
-    if pool.active_uid.is_none() {
-        pool.active_uid = Some(uid.clone());
-    }
-    pool.exhausted_until.remove(&uid); // 新登录的账号一定可用
-    pool_store.save(&pool)?;
-    Ok(uid)
+/// 登录成功后加账号入池。
+pub fn add_account(provider_id: &str, cred: WorkbuddyCredential) -> Result<String, WorkbuddyError> {
+    account_pool::add_account::<WorkbuddyBackend>(provider_id, cred).map_err(map_pool_err)
 }
 
-/// 标记账号耗尽到 `until_ms`(配额守护:剩余<阈值 → 该账号会刷新的包 CycleEndTime)。
-/// `until_ms <= now` 等价清除。(未来反应式失败转移可复用本函数,传 now + 短退避。)
-pub fn set_exhausted(provider_id: &str, uid: &str, until_ms: i64) -> Result<(), WorkbuddyError> {
-    let store = WorkbuddyPoolStore::for_provider(provider_id)?;
-    let mut pool = store.load()?;
-    if until_ms <= unix_now_ms() {
-        pool.exhausted_until.remove(uid);
-    } else {
-        pool.exhausted_until.insert(uid.to_string(), until_ms);
-    }
-    store.save(&pool)?;
-    Ok(())
-}
-
-/// 清除账号耗尽标记(配额守护:剩余恢复到阈值上)。
-pub fn clear_exhausted(provider_id: &str, uid: &str) -> Result<(), WorkbuddyError> {
-    set_exhausted(provider_id, uid, 0)
-}
-
-/// 手动指定当前服务账号(UI 切换)。不存在的 uid 也允许写(下次 select 校验回退)。
-pub fn set_active(provider_id: &str, uid: &str) -> Result<(), WorkbuddyError> {
-    let store = WorkbuddyPoolStore::for_provider(provider_id)?;
-    let mut pool = store.load()?;
-    pool.active_uid = Some(uid.to_string());
-    store.save(&pool)?;
-    Ok(())
-}
-
-/// 移除账号(UI):删账号文件 + 从池态摘除;若删的是 active 则清 active(下次 select 现选)。
-pub fn remove_account(provider_id: &str, uid: &str) -> Result<(), WorkbuddyError> {
-    WorkbuddyCredentialStore::for_account(provider_id, uid)?.delete()?;
-    let store = WorkbuddyPoolStore::for_provider(provider_id)?;
-    let mut pool = store.load()?;
-    pool.exhausted_until.remove(uid);
-    if pool.active_uid.as_deref() == Some(uid) {
-        pool.active_uid = None;
-    }
-    store.save(&pool)?;
-    Ok(())
-}
-
-/// 列池内账号摘要(UI / quota 守护)。
+/// 列池内账号摘要(UI)。
 pub fn list_pool(provider_id: &str) -> Result<Vec<PoolAccount>, WorkbuddyError> {
-    migrate_legacy_if_needed(provider_id)?;
-    let accounts = token::list_accounts(provider_id)?;
-    let pool = WorkbuddyPoolStore::for_provider(provider_id)?.load()?;
-    let active = pool.active_uid.as_deref();
-    Ok(accounts
+    let items = account_pool::list_pool::<WorkbuddyBackend>(provider_id)
+        .map_err(|e| map_pool_err(PoolError::Storage(e)))?;
+    Ok(items
         .into_iter()
-        .filter_map(|c| {
-            let uid = c.uid.clone()?;
-            Some(PoolAccount {
-                is_active: active == Some(uid.as_str()),
-                exhausted_until: pool.exhausted_until.get(&uid).copied().unwrap_or(0),
-                display: super::account_display_from_jwt(&c.access_token),
-                nickname: c.nickname,
-                device_id: c.device_id,
-                uid,
-            })
+        .map(|p| PoolAccount {
+            uid: p.uid,
+            nickname: p.nickname,
+            display: p.display,
+            device_id: p.fingerprint,
+            is_active: p.is_active,
+            exhausted_until: p.exhausted_until,
         })
         .collect())
 }
 
-/// 一次性迁移:老「单文件单账号」(`workbuddy-oauth.json` + 全局 `workbuddy-device-id`)
-/// → 池首账号 `<provider_id>/<uid>.json`。仅当**本 provider 池为空且老单文件存在**时执行,
-/// 把老全局 device-id 绑给该账号(保持其设备指纹不变),迁完删老单文件。失败不致命(吞掉,
-/// 用户重登即可),不阻塞正常流程。
-fn migrate_legacy_if_needed(provider_id: &str) -> Result<(), WorkbuddyError> {
-    if !token::list_accounts(provider_id)?.is_empty() {
-        return Ok(()); // 已有账号,不迁
-    }
-    let legacy = WorkbuddyCredentialStore::legacy_single()?;
-    let Some(mut cred) = legacy.load()? else {
-        return Ok(()); // 无老单文件
-    };
-    let uid = cred
-        .uid
-        .clone()
-        .or_else(|| user_id_from_jwt(&cred.access_token));
-    let Some(uid) = uid else {
-        return Ok(()); // 解不出 uid 不迁(让用户重登)
-    };
-    cred.uid = Some(uid.clone());
-    // 老账号沿用全局 device-id(它一直用这个设备指纹)。
-    cred.device_id = cred
-        .device_id
-        .clone()
-        .or_else(|| Some(super::workbuddy_device_id()));
-    WorkbuddyCredentialStore::for_account(provider_id, &uid)?.save(&cred)?;
-    let pool_store = WorkbuddyPoolStore::for_provider(provider_id)?;
-    let mut pool = pool_store.load()?;
-    pool.active_uid = Some(uid);
-    pool_store.save(&pool)?;
-    let _ = legacy.delete(); // 删老单文件(失败无妨)
-    Ok(())
+/// 标记账号耗尽(quota 守护)。
+pub fn set_exhausted(provider_id: &str, uid: &str, until_ms: i64) -> Result<(), WorkbuddyError> {
+    account_pool::set_exhausted("workbuddy", provider_id, uid, until_ms)
+        .map_err(|e| map_pool_err(PoolError::Storage(e)))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// 清除账号耗尽标记。
+pub fn clear_exhausted(provider_id: &str, uid: &str) -> Result<(), WorkbuddyError> {
+    account_pool::clear_exhausted("workbuddy", provider_id, uid)
+        .map_err(|e| map_pool_err(PoolError::Storage(e)))
+}
 
-    fn pool_with(active: Option<&str>, exhausted: &[(&str, i64)]) -> PoolState {
-        let mut p = PoolState {
-            active_uid: active.map(str::to_string),
-            ..Default::default()
-        };
-        for (u, t) in exhausted {
-            p.exhausted_until.insert(u.to_string(), *t);
-        }
-        p
-    }
+/// 手动切换当前服务账号(UI)。
+pub fn set_active(provider_id: &str, uid: &str) -> Result<(), WorkbuddyError> {
+    account_pool::set_active("workbuddy", provider_id, uid)
+        .map_err(|e| map_pool_err(PoolError::Storage(e)))
+}
 
-    #[test]
-    fn empty_pool_returns_none() {
-        assert_eq!(choose_serving_uid(&[], &PoolState::default(), 1000), None);
-    }
-
-    #[test]
-    fn sticky_keeps_active_when_available() {
-        let uids = vec!["a".to_string(), "b".to_string()];
-        let p = pool_with(Some("b"), &[]);
-        assert_eq!(choose_serving_uid(&uids, &p, 1000).as_deref(), Some("b"));
-    }
-
-    #[test]
-    fn switches_off_exhausted_active() {
-        let uids = vec!["a".to_string(), "b".to_string()];
-        // active=a 但 a 耗尽到 5000(> now 1000)→ 切到 b
-        let p = pool_with(Some("a"), &[("a", 5000)]);
-        assert_eq!(choose_serving_uid(&uids, &p, 1000).as_deref(), Some("b"));
-    }
-
-    #[test]
-    fn exhaustion_expires_after_until() {
-        let uids = vec!["a".to_string(), "b".to_string()];
-        let p = pool_with(Some("a"), &[("a", 5000)]);
-        // now=6000 > 5000 → a 解禁,sticky 回 a
-        assert_eq!(choose_serving_uid(&uids, &p, 6000).as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn no_active_picks_first_available_sorted() {
-        let uids = vec!["b".to_string(), "a".to_string()];
-        let p = pool_with(None, &[]);
-        assert_eq!(
-            choose_serving_uid(&uids, &p, 1000).as_deref(),
-            Some("a"),
-            "uid 排序后取首个,稳定"
-        );
-    }
-
-    #[test]
-    fn all_exhausted_picks_soonest_to_recover() {
-        let uids = vec!["a".to_string(), "b".to_string()];
-        // 全耗尽:a 到 9000,b 到 7000 → 选 b(最快解禁)
-        let p = pool_with(Some("a"), &[("a", 9000), ("b", 7000)]);
-        assert_eq!(choose_serving_uid(&uids, &p, 1000).as_deref(), Some("b"));
-    }
-
-    /// 验证 `select_serving_account` 反应式失败转移的防死循环核心:
-    /// 账号 A refresh 失败被标记 5min 退避后,全耗尽兜底本会选 A(最快解禁);
-    /// 但 `tried` 过滤掉 A 后,候选只剩 B,choose_serving_uid 必须选 B。
-    #[test]
-    fn tried_filter_prevents_deadloop_on_failover() {
-        let mut tried = std::collections::HashSet::new();
-        tried.insert("a".to_string());
-        // A 被标记耗尽到 now+5min(9000),B 耗尽到更晚(9500)—— 不过滤会选 A
-        let p = pool_with(Some("a"), &[("a", 9000), ("b", 9500)]);
-        let now = 1000_i64;
-
-        // 不过滤:全耗尽兜底选 A(min exhausted_until)—— 这正是死循环根源
-        let uids_all = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(
-            choose_serving_uid(&uids_all, &p, now).as_deref(),
-            Some("a"),
-            "不过滤时全耗尽兜底会选回刚失败的 A"
-        );
-
-        // 过滤掉 tried={a}:候选只剩 B,即使 B 也耗尽也必须选 B(避免死循环)
-        let candidates: Vec<String> = uids_all
-            .iter()
-            .filter(|u| !tried.contains(*u))
-            .cloned()
-            .collect();
-        assert!(!candidates.is_empty(), "候选非空(还有 B 没试)");
-        assert_eq!(
-            choose_serving_uid(&candidates, &p, now).as_deref(),
-            Some("b"),
-            "tried 过滤后必须选 B,不能死循环回 A"
-        );
-    }
+/// 移除账号(UI)。
+pub fn remove_account(provider_id: &str, uid: &str) -> Result<(), WorkbuddyError> {
+    account_pool::remove_account("workbuddy", provider_id, uid)
+        .map_err(|e| map_pool_err(PoolError::Storage(e)))
 }
