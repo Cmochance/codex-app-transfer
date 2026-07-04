@@ -1023,6 +1023,7 @@ dependencies = [
  "chrono",
  "codex-app-transfer-adapters",
  "codex-app-transfer-gemini-oauth",
+ "codex-app-transfer-qoder-auth",
  "codex-app-transfer-registry",
  "ctor 1.0.7",
  "futures-core",
