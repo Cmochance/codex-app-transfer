@@ -1,7 +1,7 @@
 [package]
 name = "codex-app-transfer-qoder-auth"
 version = "0.1.0"
-description = "QoderWork CN Cosy 签名协议 —— 内嵌 qoder_auth_wasm(wasm-bindgen)并用 wasmtime 驱动,产出模型请求的签名+加密头/体。逆向实证见 MOC-297。"
+description = "QoderWork CN Cosy 签名协议 —— 内嵌 qoder_auth_wasm(wasm-bindgen)并用 wasmi 驱动,产出模型请求的签名+加密头/体 + remoteChatAsk body 构造。逆向实证见 MOC-297。"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,3 +17,5 @@ wasmi = "0.40"
 # getRandomValues host import 的真随机源(RSA/nonce)。workspace 已 transitive 依赖。
 getrandom = "0.2"
 thiserror = "2"
+# remoteChatAsk body 构造(OpenAI 请求 → QoderWork 私有 envelope)。
+serde_json = "1"

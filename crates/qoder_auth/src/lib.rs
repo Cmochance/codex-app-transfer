@@ -28,6 +28,9 @@ use std::sync::Mutex;
 
 use wasmi::{Caller, Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
 
+pub mod body;
+pub use body::{build_remote_chat_ask, RemoteChatAskParams};
+
 /// 内嵌的官方 WASM。致谢:阿里 Qoder(`qoder_auth_wasm`,提取自 QoderWork CN app)。
 static WASM_BYTES: &[u8] = include_bytes!("../assets/qoder_auth_wasm_bg.wasm");
 
