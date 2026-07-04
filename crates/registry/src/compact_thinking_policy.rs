@@ -459,6 +459,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qoder_compact_disables_via_reasoning_effort_none() {
+        // [MOC-297] compact 与 reasoning wire 共用 reasoning_tiers 的 disable_wire(单一真相)。
+        // 故 qoder 模型 compact 关思考 = 写 reasoning_effort="none"(与 reasoning「none」档同一 wire),
+        // **无需 qoder compact 专门设置**。思考型 key 都命中;mmodel 非思考 → None(不注入)。
+        for m in [
+            "gm51model",
+            "dmodel",
+            "dfmodel",
+            "auto",
+            "qmodel",
+            "l",
+            "kmodel",
+        ] {
+            assert_eq!(
+                compact_disable_thinking_wire(m),
+                Some(DisableThinkingWire::ReasoningEffortNone),
+                "{m} compact 应写 reasoning_effort=none 关思考"
+            );
+        }
+        // 注入后 compact chat body 带 reasoning_effort="none"(build_parameters 透传给 QoderWork)。
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("gm51model".into()));
+        DisableThinkingWire::ReasoningEffortNone.apply_to_map(&mut body);
+        assert_eq!(body["reasoning_effort"], "none");
+        // **compact 胜出(覆盖语义)**:compact 注入在 apply_reasoning_effort 之后(compact.rs:443),
+        // 即便用户档位已写 reasoning_effort="max",compact disable 用 insert **覆盖**成 "none"
+        // → qoder compact 一定关思考(不被深度档翻案)。这是用 insert 而非 or_insert 的关键原因。
+        let mut with_max = Map::new();
+        with_max.insert("reasoning_effort".into(), Value::String("max".into()));
+        DisableThinkingWire::ReasoningEffortNone.apply_to_map(&mut with_max);
+        assert_eq!(
+            with_max["reasoning_effort"], "none",
+            "compact disable 必须覆盖深度档"
+        );
+        // 非思考模型不注入 disable(保持 current behavior)。
+        assert_eq!(compact_disable_thinking_wire("mmodel"), None);
+    }
+
     // ── 注入行为 ────────────────────────────────────────────────────
 
     #[test]
