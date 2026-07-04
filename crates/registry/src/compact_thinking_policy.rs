@@ -91,6 +91,14 @@ pub enum DisableThinkingWire {
     /// (自建 vLLM/SGLang,GLM 官方客户端智谱 ZCode `createGlm52ReasoningProviderOptions` 的
     /// openaiCompatible wire)。二者皆「关」、不矛盾,覆盖 hosted 与自建两种部署。
     GlmDual,
+
+    /// **[MOC-297] QoderWork** —— 写 `reasoning_effort: "none"` 关思考。QoderWork(阿里 Qoder)
+    /// 经 remoteChatAsk `parameters.reasoning_effort` 控思考(`qoder_auth::body::build_parameters`
+    /// 透传 chat body 的 `reasoning_effort`),**实测 `reasoning_effort="none"` → 不输出 reasoning、
+    /// `high`/`max` → 思考**(gateway.qoder.com.cn)。故它的 disable = 显式 `reasoning_effort:"none"`
+    /// (不是删、也不是 thinking 顶级字段——那些会被 build_remote_chat_ask 丢弃)。**与其它派相反:
+    /// 保留而非移除 reasoning_effort**。
+    ReasoningEffortNone,
 }
 
 impl DisableThinkingWire {
@@ -130,6 +138,15 @@ impl DisableThinkingWire {
                 let a = set_thinking_type_disabled(obj);
                 let b = set_chat_template_enable_thinking_false(obj);
                 a || b
+            }
+            // QoderWork:disable = 显式 `reasoning_effort:"none"`(**覆盖**已有值,它本身就是关思考
+            // 信号)。返回 false 跳过下面的 remove——绝不删,删了 QoderWork 就当默认思考开。
+            Self::ReasoningEffortNone => {
+                obj.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String("none".to_owned()),
+                );
+                false
             }
         };
         // 仅当 thinking 确实被关掉才删 reasoning_effort(见上方 P2 说明)。

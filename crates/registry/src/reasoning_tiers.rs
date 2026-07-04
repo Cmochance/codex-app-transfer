@@ -126,25 +126,26 @@ static SINGLE_MAX: ReasoningTierSpec = ReasoningTierSpec {
 // QoderWork 模型的思考不走各上游原生 wire,统一经 remoteChatAsk `parameters.reasoning_effort`
 // (`qoder_auth::body::build_parameters` 透传客户端 chat body 的 `reasoning_effort`)。故这里
 // **不用** GLM/DeepSeek 那套 provider 特化 disable_wire(build_remote_chat_ask 只透传
-// reasoning_effort,那些顶级 thinking 字段会被丢弃);on-tier 用 `HighMax` 写 reasoning_effort,
-// disable_wire=None(「none」档 = 不写 reasoning_effort → QoderWork 用模型默认;真·硬关思考需
-// remoteChatAsk 侧补 QoderWork disable 字段,留 followup)。档位取自 QoderWork server model-list
-// 的 `thinking_config`(main.log,MOC-297)。
+// reasoning_effort,那些顶级 thinking 字段会被丢弃)。QoderWork 经 remoteChatAsk **单个
+// `reasoning_effort` 字段**控思考(实测 gateway.qoder.com.cn:`none`→不输出 reasoning,`high`/`max`
+// →思考):on-tier 用 `HighMax` 写 high/max;「none」档用 `ReasoningEffortNone` 写
+// reasoning_effort="none"。档位取自 QoderWork server model-list 的 `thinking_config`(main.log,MOC-297)。
 
 /// QoderWork 二元思考模型(auto / Qwen3.7-Max·Plus / Qwen3.6-Flash / Kimi-K2.7):`none` + `max`。
+/// `max`=思考开(不写 effort = 模型默认思考,实测默认即开);`none`=写 reasoning_effort="none" 关。
 static QODER_BINARY: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[TIER_NONE, TIER_MAX],
     default_level: Some("max"),
-    disable_wire: None,
+    disable_wire: Some(DisableThinkingWire::ReasoningEffortNone),
     on_tier_wire: None,
 };
 
 /// QoderWork 三档 effort 模型(DeepSeek-V4-Pro/Flash / GLM-5.2,`thinking_config.efforts=[high,max]`):
-/// `none` + `high` + `max`,深度档经 reasoning_effort 透传(HighMax)。
+/// `none`(写 reasoning_effort="none")+ `high` + `max`(深度档经 reasoning_effort 透传 HighMax)。
 static QODER_EFFORT: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[TIER_NONE, TIER_HIGH, TIER_MAX],
     default_level: Some("max"),
-    disable_wire: None,
+    disable_wire: Some(DisableThinkingWire::ReasoningEffortNone),
     on_tier_wire: Some(ReasoningEffortWire::HighMax),
 };
 
@@ -381,10 +382,10 @@ mod tests {
         // 非思考(MiniMax-M2.7):隐藏 picker(空档位)
         let mm = reasoning_tiers_for_model("mmodel").unwrap();
         assert!(mm.levels.is_empty(), "mmodel 应隐藏 picker");
-        // qoder 不写直连 provider 的 disable_wire(build_remote_chat_ask 只透传 reasoning_effort)
+        // qoder 关思考 = 写 reasoning_effort="none"(实测 QoderWork 单字段控思考)
         assert_eq!(
             reasoning_tiers_for_model("gm51model").unwrap().disable_wire,
-            None
+            Some(DisableThinkingWire::ReasoningEffortNone)
         );
     }
 

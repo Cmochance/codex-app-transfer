@@ -487,6 +487,33 @@ mod tests {
     }
 
     #[test]
+    fn qoder_none_writes_reasoning_effort_none_depth_passes_through() {
+        // [MOC-297] QoderWork:单字段控思考(实测 gateway.qoder.com.cn)。关思考=写
+        // reasoning_effort="none"(**不是**删,也不是 thinking 顶级字段);深度档 high/max 透传。
+        // provider_id 随意——命中 reasoning_tiers 表即由 spec 完全决定 wire,不 fall-through。
+        assert_eq!(
+            apply_model("qoder", "gm51model", "none")["reasoning_effort"],
+            "none"
+        );
+        assert_eq!(
+            apply_model("qoder", "gm51model", "high")["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            apply_model("qoder", "dmodel", "max")["reasoning_effort"],
+            "max"
+        );
+        // 二元模型(kmodel/auto):none 关;max = 模型默认思考(on_tier=None,不写 effort)。
+        assert_eq!(
+            apply_model("qoder", "kmodel", "none")["reasoning_effort"],
+            "none"
+        );
+        assert!(apply_model("qoder", "kmodel", "max")
+            .get("reasoning_effort")
+            .is_none());
+    }
+
+    #[test]
     fn glm_other_efforts_noop() {
         // GLM picker 只暴露 none/max;其它档若出现 → 不写,留 GLM 默认(思考开)
         for e in ["low", "medium", "high", "minimal", "auto"] {
