@@ -1774,6 +1774,11 @@ async fn build_and_send_upstream(
     adapter_headers: &HeaderMap,
     upstream_url: &str,
 ) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    // QoderWork Cosy 通道:整份出站请求(url + Cosy 签名头 + AES-GCM 加密 body)由 WASM
+    // 产出,不走下面通用的 build_upstream_url / inject_auth / 指纹头注入路径。
+    if matches!(resolved.auth_scheme, crate::resolver::AuthScheme::QoderCosy) {
+        return send_qoder_cosy(state, plan_body, resolved).await;
+    }
     // GoogleOauthCloudCode / GoogleOauthAntigravity authScheme:provider.api_key
     // 是空,真实 token 在 ~/.codex-app-transfer/{gemini,antigravity}-oauth.json。
     // 这里 await load + auto refresh 拿当前可用 access_token,后面 inject_auth 用
@@ -2072,6 +2077,103 @@ async fn build_and_send_upstream(
         up = up.header("X-Device-Id", device_id);
     }
     let req = up.build()?;
+    let outbound_headers_snapshot = req.headers().clone();
+    let resp = state.http.execute(req).await?;
+    Ok((resp, outbound_headers_snapshot))
+}
+
+/// QoderWork Cosy 出站:选服务账号(池 + 续期)→ 拉 userinfo → 客户端 chat 请求转私有
+/// `remoteChatAsk` 明文 → WASM `qoder_auth` 签名+加密 → 用产出的 url/headers/body 发到
+/// `gateway.qoder.com.cn`。`plan_body` 是 chat completions(qoder provider 走
+/// openai_chat/responses adapter 已转成 chat)。响应(加密 SSE)由 caller 侧解密。
+async fn send_qoder_cosy(
+    state: &ProxyState,
+    plan_body: &Bytes,
+    resolved: &ResolvedProvider,
+) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    use codex_app_transfer_gemini_oauth::qoder;
+    use codex_app_transfer_qoder_auth::{build_remote_chat_ask, QoderAuth, RemoteChatAskParams};
+
+    // 1. 选当前服务账号(多账号池 sticky + 续期 + 失败转移);池空 → needs_login。
+    let acct = qoder::pool::select_serving_account(&state.http, &resolved.provider.id)
+        .await
+        .map_err(|e| ForwardError::OauthUnavailable {
+            needs_login: matches!(e, qoder::pool::PoolError::NotLoggedIn),
+            reason: e.to_string(),
+        })?;
+
+    // 2. 拉用户信息(uid / org)—— WASM 签名的 Cosy-User + userInfoForAuth 用。
+    let userinfo = qoder::fetch_user_info(&state.http, &acct.serving_token)
+        .await
+        .map_err(|e| ForwardError::OauthUnavailable {
+            reason: format!("qoder userinfo: {e}"),
+            needs_login: false,
+        })?;
+
+    // 3. 客户端 chat 请求 → 私有 remoteChatAsk 明文 body。
+    let chat: serde_json::Value = serde_json::from_slice(plan_body)
+        .map_err(|e| ForwardError::BadRequest(format!("qoder: 请求体非 JSON chat: {e}")))?;
+    let model_key = chat
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("q36fmodel")
+        .to_string();
+    let session_id = qoder::uuid_v4();
+    let request_id = qoder::uuid_v4();
+    let remote_body = build_remote_chat_ask(&RemoteChatAskParams {
+        openai_body: &chat,
+        model_key: &model_key,
+        model_source: "system",
+        session_id: &session_id,
+        request_id: &request_id,
+        request_set_id: &request_id,
+    });
+
+    // 4. WASM 签名 + 加密(machine_id=账号指纹;device token=serving_token)。
+    let user_info = serde_json::json!({
+        "uid": userinfo.uid,
+        "encrypt_user_info": "",
+        "key": "",
+        "organization_id": userinfo.organization_id,
+        "organization_tags": userinfo.organization_tags,
+        "data_policy_agreed": true,
+        "security_oauth_token": acct.serving_token,
+    })
+    .to_string();
+    let client_meta = serde_json::json!({
+        "client_type": "6",
+        "business_product": "qoder_work",
+        "business_type": "agent",
+        "scene": "assistant",
+    })
+    .to_string();
+    // WASM 签名是同步的,且 `QoderAuth` 内含 wasmi Store(非 Send)。放独立块内让它在
+    // 后面 `.await` 之前就 drop,只让 url/headers/body(都 Send)逃逸,保证 handler future Send。
+    let (url, headers, body) = {
+        let qa = QoderAuth::new()
+            .map_err(|e| ForwardError::Header(format!("qoder WASM 初始化: {e}")))?;
+        let prepared = qa
+            .prepare_signed_request(
+                &acct.fingerprint,
+                "1.0.34",
+                &user_info,
+                &client_meta,
+                &user_info,
+                "https://gateway.qoder.com.cn",
+                &remote_body.to_string(),
+                &model_key,
+                "system",
+            )
+            .map_err(|e| ForwardError::Header(format!("qoder 签名: {e}")))?;
+        (prepared.url, prepared.headers, prepared.body)
+    };
+
+    // 5. 用 WASM 产出的 url/headers/加密 body 发送。
+    let mut up = state.http.post(&url);
+    for (name, value) in &headers {
+        up = up.header(name, value);
+    }
+    let req = up.body(body).build()?;
     let outbound_headers_snapshot = req.headers().clone();
     let resp = state.http.execute(req).await?;
     Ok((resp, outbound_headers_snapshot))

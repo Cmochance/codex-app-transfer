@@ -12,6 +12,8 @@ repository.workspace = true
 codex-app-transfer-registry = { path = "../registry" }
 codex-app-transfer-adapters = { path = "../adapters" }
 codex-app-transfer-gemini-oauth = { path = "../gemini_oauth" }
+# QoderWork Cosy 签名(WASM 驱动)—— QoderCosy 出站分支产签名请求 + 解密响应。
+codex-app-transfer-qoder-auth = { path = "../qoder_auth" }
 axum = { version = "0.8", features = ["http1", "http2", "tokio", "ws"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
