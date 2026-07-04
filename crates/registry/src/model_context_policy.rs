@@ -164,6 +164,13 @@ mod tests {
         assert_eq!(documented_context_window("kimi-k2.7"), Some(262_144));
         assert_eq!(documented_context_window("glm-5.2"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
+        // QoderWork 原始 key → 各模型支持的最大 context(gm51model/dmodel/l=1M, kmodel=256k,
+        // auto=180k, mmodel=200k)。key 非人类可读,不撞上面显示名分支。
+        assert_eq!(documented_context_window("gm51model"), Some(1_000_000));
+        assert_eq!(documented_context_window("l"), Some(1_000_000));
+        assert_eq!(documented_context_window("kmodel"), Some(256_000));
+        assert_eq!(documented_context_window("auto"), Some(180_000));
+        assert_eq!(documented_context_window("mmodel"), Some(200_000));
     }
 
     #[test]

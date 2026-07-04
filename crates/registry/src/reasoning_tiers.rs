@@ -366,6 +366,29 @@ mod tests {
     }
 
     #[test]
+    fn qoder_keys_map_to_qoder_specs() {
+        // effort 模型(DeepSeek/GLM):none/high/max,reasoning_effort 透传(HighMax)
+        for m in ["gm51model", "dmodel", "dfmodel"] {
+            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中"));
+            assert_eq!(efforts(s), vec!["none", "high", "max"], "{m}");
+            assert_eq!(s.on_tier_wire, Some(ReasoningEffortWire::HighMax), "{m}");
+        }
+        // 二元思考(auto/Qwen/Kimi):none/max
+        for m in ["auto", "qmodel_latest", "qmodel", "l", "kmodel"] {
+            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中"));
+            assert_eq!(efforts(s), vec!["none", "max"], "{m}");
+        }
+        // 非思考(MiniMax-M2.7):隐藏 picker(空档位)
+        let mm = reasoning_tiers_for_model("mmodel").unwrap();
+        assert!(mm.levels.is_empty(), "mmodel 应隐藏 picker");
+        // qoder 不写直连 provider 的 disable_wire(build_remote_chat_ask 只透传 reasoning_effort)
+        assert_eq!(
+            reasoning_tiers_for_model("gm51model").unwrap().disable_wire,
+            None
+        );
+    }
+
+    #[test]
     fn unknown_and_deferred_models_have_no_spec() {
         // legacy GLM-4 / 非 thinking / 暂留默认的 provider → None(用 Codex 默认 4 档)
         for m in [
