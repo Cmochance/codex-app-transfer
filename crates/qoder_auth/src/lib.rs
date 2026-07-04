@@ -641,6 +641,14 @@ impl QoderAuth {
         g.free_context(ctx);
         Ok(out)
     }
+
+    /// 解密 gateway 的加密响应(`Encode=1`):整段响应文本 → 解密后 JSON/SSE 文本。
+    /// 对齐官方 `decryptServerResponse`(`RS().decrypt_server_response(await resp.text())`)。
+    /// 非法/未加密输入会 [`QoderAuthError::Trap`](对齐官方 glue 的 try/catch 语义)。
+    pub fn decrypt_server_response(&self, encrypted: &str) -> Result<String> {
+        let mut g = self.inner.lock().unwrap();
+        g.decrypt_server_response(encrypted)
+    }
 }
 
 /// [`QoderAuth::prepare_signed_request`] 的产物 —— 可直接 `POST` 的签名请求。
@@ -681,6 +689,38 @@ impl WasmInner {
         self.add_sp.call(&mut self.store, 16).map_err(trap)?;
         free.call(&mut self.store, (ptr, len, 1)).map_err(trap)?;
         Ok(s)
+    }
+
+    /// `decrypt_server_response(text) -> text`(string→string,retptr 模式)。
+    fn decrypt_server_response(&mut self, encrypted: &str) -> Result<String> {
+        let f = self
+            .instance
+            .get_typed_func::<(i32, i32, i32), ()>(&mut self.store, "decrypt_server_response")
+            .map_err(|e| QoderAuthError::Wasm(e.to_string()))?;
+        let sp = self.add_sp.call(&mut self.store, -16).map_err(trap)?;
+        let (ptr, len) = self.pass_str(encrypted)?;
+        // 解密对非法输入会 throw(官方 glue try/catch)→ __wbindgen_throw 记 last_err
+        // + 随后的 unreachable 让 wasmi trap;两种情况都归一成 Trap 错误。
+        if let Err(e) = f.call(&mut self.store, (sp, ptr, len)) {
+            self.add_sp.call(&mut self.store, 16).ok();
+            let msg = self.store.data_mut().last_err.take();
+            return Err(msg.map_or_else(|| trap(e), QoderAuthError::Trap));
+        }
+        let rptr = self.ret_i32(sp, 0);
+        let rlen = self.ret_i32(sp, 4);
+        self.add_sp.call(&mut self.store, 16).map_err(trap)?;
+        if rptr == 0 {
+            return Ok(String::new());
+        }
+        let data = self.memory.data(&self.store);
+        let bytes = mem_slice(data, rptr as u32, rlen as u32)
+            .ok_or(QoderAuthError::Oob {
+                ptr: rptr as u32,
+                len: rlen as u32,
+            })?
+            .to_vec();
+        self.free_bytes(rptr, rlen)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// UTF-8 编码 `s` 写进 WASM 线性内存(malloc),返回 `(ptr, len)`(len=字节长)。
@@ -943,5 +983,13 @@ mod tests {
         assert_eq!(h.get("Cosy-ClientType").copied(), Some("6"));
         assert!(h.contains_key("Cosy-Date"), "missing Cosy-Date");
         assert!(!req.body.is_empty(), "加密 body 不应为空");
+    }
+
+    /// 冒烟:decrypt 绑定可调、非法输入不 panic(返回 Ok 或 Err 均可)。
+    /// 真机加密响应的解密正确性需捕获样本,留 adapter 集成测。
+    #[test]
+    fn decrypt_server_response_does_not_panic() {
+        let qa = QoderAuth::new().unwrap();
+        let _ = qa.decrypt_server_response("not-a-valid-encrypted-payload");
     }
 }
