@@ -44,6 +44,13 @@ pub struct QoderCredential {
     pub nickname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+    /// 组织 id(个人账号为空串)。登录时经 `/userinfo` 取,签名 `Cosy-User`/`encrypt_user_info` 用。
+    /// 与 uid 一样是账号静态属性 → 落盘缓存,出站签名直接复用,免每请求打账号级 `/userinfo`
+    /// (对齐 QoderWork 原 app 的 user_info 缓存行为;`None` = 老凭证未存过 → 出站兜底拉一次回填)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_tags: Option<Vec<String>>,
 }
 
 impl QoderCredential {
@@ -137,6 +144,8 @@ mod tests {
             machine_id: Some("mid-1".into()),
             nickname: None,
             uid: Some("u-1".into()),
+            organization_id: None,
+            organization_tags: None,
         };
         store.save(&cred).unwrap();
         let got = store.load().unwrap().unwrap();
@@ -159,6 +168,8 @@ mod tests {
             machine_id: None,
             nickname: None,
             uid: None,
+            organization_id: None,
+            organization_tags: None,
         };
         assert!(cred.should_refresh());
     }

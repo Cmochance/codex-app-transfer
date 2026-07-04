@@ -112,6 +112,9 @@ fn payload_to_cred(t: TokenPayload, machine_id: String) -> QoderCredential {
         machine_id: Some(machine_id),
         nickname: t.nickname,
         uid,
+        // org 在 run_qoder_login 出站前经 /userinfo 补(refresh 保留旧值,见 pool.rs ensure_valid)。
+        organization_id: None,
+        organization_tags: None,
     }
 }
 
@@ -150,7 +153,11 @@ pub async fn run_qoder_login(
 ) -> Result<QoderCredential, QoderError> {
     let (verifier, challenge) = generate_pkce()?;
     let nonce = super::uuid_v4();
-    let machine_id = qoder_machine_id();
+    // per-account 设备隔离:每次登录**新生成** machine_id(而非全局共用),让池内各账号有独立
+    // `Cosy-MachineId` → 网关不把多账号看作同一设备(降低多号被风控关联/连坐 ban)。该 id 绑进
+    // authUrl(device token 由 PKCE 与之绑定)→ payload_to_cred 落盘 → 签名全程用同一个,三处一致。
+    // 全局 `qoder_machine_id()` 仅留作 refresh/migrate 兜底(见 pool.rs / :335)。
+    let machine_id = super::uuid_v4();
 
     // ① 拼 authUrl,交 call site 打开
     let auth_url = build_auth_url(&challenge, &nonce, &machine_id)?;
@@ -198,6 +205,10 @@ pub async fn run_qoder_login(
                         if cred.nickname.is_none() {
                             cred.nickname = info.nickname;
                         }
+                        // org 一并缓存(uid/org 都是账号静态属性)→ 出站签名复用,免每请求打
+                        // 账号级 /userinfo(见 forward.rs send_qoder_cosy)。个人号 org_id 为空串。
+                        cred.organization_id = Some(info.organization_id);
+                        cred.organization_tags = Some(info.organization_tags);
                     }
                     return Ok(cred);
                 }

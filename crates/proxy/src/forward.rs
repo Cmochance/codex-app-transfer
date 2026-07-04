@@ -2116,13 +2116,33 @@ async fn send_qoder_cosy(
             reason: e.to_string(),
         })?;
 
-    // 2. 拉用户信息(uid / org)—— WASM 签名的 Cosy-User + userInfoForAuth 用。
-    let userinfo = qoder::fetch_user_info(&state.http, &acct.serving_token)
-        .await
-        .map_err(|e| ForwardError::OauthUnavailable {
-            reason: format!("qoder userinfo: {e}"),
-            needs_login: false,
-        })?;
+    // 2. 用户信息(uid / org)—— 账号静态属性(uid 固定、org 静态),登录时已缓存进凭证,签名
+    //    直接复用,**免每请求打账号级 /userinfo**(对齐 QoderWork 原 app 的 user_info 缓存;否则
+    //    /userinfo 被推理热路径依赖,它限流则 token 有效也全崩)。老凭证未缓存 org → 兜底拉一次。
+    let (uid, organization_id, organization_tags) = {
+        let cached = qoder::pool::load_account(&resolved.provider.id, &acct.uid)
+            .map_err(|e| ForwardError::OauthUnavailable {
+                reason: format!("qoder 凭证加载: {e}"),
+                needs_login: false,
+            })?
+            .and_then(|c| match (c.uid, c.organization_id, c.organization_tags) {
+                (Some(u), Some(oid), Some(tags)) => Some((u, oid, tags)),
+                _ => None,
+            });
+        match cached {
+            Some(t) => t,
+            None => {
+                // 老凭证(登录时未缓存 org / 缺 uid)→ 兜底拉一次;下次登录/refresh 会补齐落盘。
+                let info = qoder::fetch_user_info(&state.http, &acct.serving_token)
+                    .await
+                    .map_err(|e| ForwardError::OauthUnavailable {
+                        reason: format!("qoder userinfo: {e}"),
+                        needs_login: false,
+                    })?;
+                (info.uid, info.organization_id, info.organization_tags)
+            }
+        }
+    };
 
     // 3. 客户端 chat 请求 → 私有 remoteChatAsk 明文 body。
     let chat: serde_json::Value = serde_json::from_slice(plan_body)
@@ -2130,7 +2150,7 @@ async fn send_qoder_cosy(
     let model_key = chat
         .get("model")
         .and_then(|m| m.as_str())
-        .unwrap_or("q36fmodel")
+        .unwrap_or("auto")
         .to_string();
     let session_id = qoder::uuid_v4();
     let request_id = qoder::uuid_v4();
@@ -2145,11 +2165,11 @@ async fn send_qoder_cosy(
 
     // 4. WASM 签名 + 加密(machine_id=账号指纹;device token=serving_token)。
     let user_info = serde_json::json!({
-        "uid": userinfo.uid,
+        "uid": uid,
         "encrypt_user_info": "",
         "key": "",
-        "organization_id": userinfo.organization_id,
-        "organization_tags": userinfo.organization_tags,
+        "organization_id": organization_id,
+        "organization_tags": organization_tags,
         "data_policy_agreed": true,
         "security_oauth_token": acct.serving_token,
     })
