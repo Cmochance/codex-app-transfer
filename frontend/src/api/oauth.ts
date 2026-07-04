@@ -8,7 +8,7 @@
 // login 为长阻塞:POST 后端开系统浏览器授权,直到回调完成/取消才返回。
 import { api } from './http'
 
-export type OAuthKind = 'zai' | 'bigmodel' | 'gemini' | 'antigravity' | 'trae' | 'workbuddy'
+export type OAuthKind = 'zai' | 'bigmodel' | 'gemini' | 'antigravity' | 'trae' | 'workbuddy' | 'qoder'
 
 export interface OAuthStatus {
   loggedIn: boolean
@@ -27,6 +27,11 @@ function endpoint(kind: OAuthKind, providerId?: string): { base: string; query: 
       return { base: '/api/gemini-oauth', query: '' }
     case 'antigravity':
       return { base: '/api/antigravity-oauth', query: '' }
+    case 'qoder':
+      return {
+        base: '/api/qoder-oauth',
+        query: `?providerId=${encodeURIComponent(providerId ?? '')}`,
+      }
     case 'trae':
       return {
         base: '/api/trae-oauth',
@@ -65,30 +70,42 @@ export function oauthClaimPending(kind: OAuthKind, providerId: string) {
   return api<{ claimed: boolean }>('POST', `${base}/claim${query}`)
 }
 
-// ── WorkBuddy 账号池(单 provider 多账号,额度守护自动切换)─────────────
-// 一个 workbuddy-login provider 维护账号池:status 列所有账号 + 当前服务账号;login 加账号;
-// account 移除单账号;switch 手动切当前服务账号。
-export interface WorkbuddyAccount {
+// ── 账号池(单 provider 多账号,额度守护自动切换)—— workbuddy / qoder 共用 ──────
+// 一个 provider 维护账号池:status 列所有账号 + 当前服务账号;login 加账号;
+// account 移除单账号;switch 手动切当前服务账号。各 provider 只是 endpoint base 不同。
+export interface PoolAccount {
   uid: string
-  display?: string // 账号人类可读标签(脱敏手机号),取不到时前端退回短 uid
+  display?: string // 账号人类可读标签,取不到时前端退回短 uid
   nickname?: string
   isActive: boolean // 当前服务账号(sticky)
   exhausted: boolean // 额度低于守护阈值、当前被跳过
   exhaustedUntil: number
 }
-export interface WorkbuddyPoolStatus {
+export interface PoolStatus {
   loggedIn: boolean
-  accounts: WorkbuddyAccount[]
+  accounts: PoolAccount[]
 }
-const wbQ = (providerId: string, uid?: string) =>
+const poolQ = (providerId: string, uid?: string) =>
   `?providerId=${encodeURIComponent(providerId)}` +
   (uid ? `&uid=${encodeURIComponent(uid)}` : '')
-export function workbuddyPoolStatus(providerId: string) {
-  return api<WorkbuddyPoolStatus>('GET', `/api/workbuddy-oauth/status${wbQ(providerId)}`)
+export function poolStatus(kind: OAuthKind, providerId: string) {
+  const { base } = endpoint(kind, providerId)
+  return api<PoolStatus>('GET', `${base}/status${poolQ(providerId)}`)
 }
-export function workbuddyRemoveAccount(providerId: string, uid: string) {
-  return api('DELETE', `/api/workbuddy-oauth/account${wbQ(providerId, uid)}`)
+export function poolRemoveAccount(kind: OAuthKind, providerId: string, uid: string) {
+  const { base } = endpoint(kind, providerId)
+  return api('DELETE', `${base}/account${poolQ(providerId, uid)}`)
 }
-export function workbuddySwitchAccount(providerId: string, uid: string) {
-  return api('POST', `/api/workbuddy-oauth/switch${wbQ(providerId, uid)}`)
+export function poolSwitchAccount(kind: OAuthKind, providerId: string, uid: string) {
+  const { base } = endpoint(kind, providerId)
+  return api('POST', `${base}/switch${poolQ(providerId, uid)}`)
 }
+
+// workbuddy 旧别名(保留既有调用点不变)。
+export type WorkbuddyAccount = PoolAccount
+export type WorkbuddyPoolStatus = PoolStatus
+export const workbuddyPoolStatus = (providerId: string) => poolStatus('workbuddy', providerId)
+export const workbuddyRemoveAccount = (providerId: string, uid: string) =>
+  poolRemoveAccount('workbuddy', providerId, uid)
+export const workbuddySwitchAccount = (providerId: string, uid: string) =>
+  poolSwitchAccount('workbuddy', providerId, uid)

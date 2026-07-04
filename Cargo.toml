@@ -11,6 +11,7 @@ members = [
     "crates/codex_integration",
     "crates/conversation_export",
     "crates/gemini_oauth",
+    "crates/qoder_auth",
     "crates/usage_tracker",
     "xtask",
     # 后续阶段陆续启用:

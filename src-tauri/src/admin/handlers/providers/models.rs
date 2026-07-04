@@ -474,6 +474,42 @@ async fn fetch_zai_glm_models_impl(zp: codex_app_transfer_gemini_oauth::ZaiProvi
     })
 }
 
+/// QoderWork CN 模型目录(静态种子)。
+///
+/// QoderWork 的模型列表走 Cosy 签名的 gRPC `get_models`(在 `@qoder-ai/qoder-agent-sdk`
+/// 内,scene=`qwork`),**没有干净的 HTTP `/models` 端点**可探测(候选 GET 全 404/503),
+/// 故与 `gemini_cli_oauth` / `antigravity` / 百炼 token-plan 同模式用静态种子。
+///
+/// 目录取自 QoderWork 客户端实测的 server model-list(其 `ModelService get_models` 缓存日志,
+/// scene=qwork,9 个;`id` = 网关 `model_config.key`,`display_name` = 客户端展示名,顺序对齐 UI)。
+/// **网关对未知 key 静默 fallback 到 `auto`**(不报错),故这些 key 必须精确才能路由到目标模型
+/// + 正确计费——不能靠猜。用户仍可在映射里手工填 QoderWork 后续新增的 model key。
+fn qoder_work_models() -> Value {
+    let models = json!([
+        {"id": "auto", "display_name": "Auto"},
+        {"id": "qmodel_latest", "display_name": "Qwen3.7-Max"},
+        {"id": "qmodel", "display_name": "Qwen3.7-Plus"},
+        {"id": "l", "display_name": "Qwen3.6-Flash"},
+        {"id": "dmodel", "display_name": "DeepSeek-V4-Pro"},
+        {"id": "dfmodel", "display_name": "DeepSeek-V4-Flash"},
+        {"id": "gm51model", "display_name": "GLM-5.2"},
+        {"id": "kmodel", "display_name": "Kimi-K2.7-Code"},
+        {"id": "mmodel", "display_name": "MiniMax-M2.7"},
+    ]);
+    // 默认建议 → auto(QoderWork 自身默认,智能路由 + 支持 reasoning/vision;
+    // 用户可再手工把具体槽位映射到指定模型)。
+    let mut suggested = empty_model_mappings_value();
+    if let Some(obj) = suggested.as_object_mut() {
+        obj.insert("default".to_owned(), json!("auto"));
+    }
+    json!({
+        "success": true,
+        "endpoint": "(static seed: QoderWork CN models, scene=qwork)",
+        "models": models,
+        "suggested": suggested,
+    })
+}
+
 async fn fetch_provider_models_impl(provider: &Value) -> Value {
     // Cloud Code Assist (gemini_cli_oauth) 上游没有 listModels endpoint —
     // gemini-cli upstream 自己用 hardcoded enum (`packages/core/src/config/models.ts`)。
@@ -535,6 +571,16 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         _ => None,
     } {
         return fetch_zai_glm_models_impl(zp).await;
+    }
+
+    // **QoderWork CN**(authScheme=qoder_oauth):模型列表走 Cosy 签名 gRPC(SDK 内),无干净
+    // HTTP /models 端点 → 用静态种子(见 `qoder_work_models`)。按 authScheme 判(apiFormat 是
+    // openai_chat、跟普通 OpenAI 共用,不能按它分流)。
+    if matches!(
+        provider.get("authScheme").and_then(|v| v.as_str()),
+        Some("qoder_oauth") | Some("qoder") | Some("qoder_cosy")
+    ) {
+        return qoder_work_models();
     }
 
     // **百炼 Token Plan 套餐** (`token-plan.cn-beijing.maas.aliyuncs.com`) 不暴露
@@ -715,6 +761,42 @@ pub async fn fetch_provider_models_payload(Json(payload): Json<Value>) -> impl I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qoder_dispatch_returns_static_catalog_by_authscheme_no_http() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // authScheme=qoder_oauth 命中静态种子(不打 HTTP,即便 baseUrl 是旧废弃通道)。
+        let result = runtime.block_on(fetch_provider_models_impl(&json!({
+            "baseUrl": "https://gateway.qoder.com.cn",
+            "apiFormat": "openai_chat",
+            "authScheme": "qoder_oauth",
+        })));
+        assert_eq!(result["success"], json!(true));
+        assert!(result["endpoint"].as_str().unwrap_or("").contains("static"));
+        let models = result["models"].as_array().unwrap();
+        assert_eq!(models.len(), 9, "QoderWork 目录应 9 个模型");
+        // id = 网关真实 model_config.key(实测自 QoderWork server model-list),display_name = 展示名
+        let by_id: std::collections::HashMap<&str, &str> = models
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_str().unwrap(),
+                    m["display_name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_id.get("auto"), Some(&"Auto"));
+        assert_eq!(by_id.get("l"), Some(&"Qwen3.6-Flash"));
+        assert_eq!(by_id.get("gm51model"), Some(&"GLM-5.2"));
+        assert_eq!(by_id.get("dmodel"), Some(&"DeepSeek-V4-Pro"));
+        assert_eq!(by_id.get("kmodel"), Some(&"Kimi-K2.7-Code"));
+        assert_eq!(by_id.get("mmodel"), Some(&"MiniMax-M2.7"));
+        // 默认建议 = auto(真 key;网关对未知 key 静默 fallback,故必须精确)
+        assert_eq!(result["suggested"]["default"], json!("auto"));
+    }
 
     #[test]
     fn provider_is_bailian_token_plan_matches_only_token_plan_host() {

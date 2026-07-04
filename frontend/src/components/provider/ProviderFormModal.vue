@@ -15,7 +15,7 @@ import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import IconEye from '~icons/lucide/eye'
 import IconEyeOff from '~icons/lucide/eye-off'
 import OAuthLoginSection from '@/components/provider/OAuthLoginSection.vue'
-import WorkbuddyPoolSection from '@/components/provider/WorkbuddyPoolSection.vue'
+import AccountPoolSection from '@/components/provider/AccountPoolSection.vue'
 import { oauthClaimPending, type OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
 
@@ -168,6 +168,7 @@ const OAUTH_KIND_BY_AUTH: Record<string, OAuthKind> = {
   antigravity_oauth: 'antigravity',
   trae_oauth: 'trae',
   workbuddy_oauth: 'workbuddy',
+  qoder_oauth: 'qoder',
 }
 const oauthKind = computed<OAuthKind | null>(() => OAUTH_KIND_BY_AUTH[form.authScheme] ?? null)
 // grok-web 不是 OAuth, 走粘贴 grok.com SSO cookie。
@@ -570,10 +571,11 @@ async function save() {
         <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
       <SettingsRow v-if="oauthKind" :title="t('providerForm.account')">
-        <!-- WorkBuddy:单 provider 账号池(多账号 + 额度守护自动切换),非单账号登录区 -->
-        <WorkbuddyPoolSection
-          v-if="oauthKind === 'workbuddy'"
-          key="wbpool"
+        <!-- WorkBuddy / QoderWork:单 provider 账号池(多账号 + 额度守护自动切换),非单账号登录区 -->
+        <AccountPoolSection
+          v-if="oauthKind === 'workbuddy' || oauthKind === 'qoder'"
+          :key="`pool-${oauthKind}`"
+          :kind="oauthKind"
           :provider-id="props.editId ?? undefined"
         />
         <OAuthLoginSection

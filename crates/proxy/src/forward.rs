@@ -807,6 +807,20 @@ pub async fn forward_handler(
         (st, hs, stream)
     };
 
+    // QoderCosy:上游 SSE 每帧是 `{headers, body, statusCodeValue, statusCode}` 信封,body 是
+    // stringified OpenAI chat.completion.chunk(实测,非加密)。先 unwrap 成标准 OpenAI SSE,
+    // 再交 openai_chat adapter 做 chat→responses 转换。
+    // **只在成功响应上套 unwrap**:HTTP 非 2xx(403/5xx)时 body 是普通 JSON 错误(无 `data:` SSE
+    // 前缀),已被上面错误分支 buffer 成单块 + `log_upstream_error_diag` 落日志;若也走 unwrap,
+    // 会因无 `data:` 行匹配而把整个错误 body 丢弃、替换成 [DONE](破坏性 fallback)。原样透传给既有错误链。
+    let upstream_stream = if matches!(resolved.auth_scheme, crate::resolver::AuthScheme::QoderCosy)
+        && status.is_success()
+    {
+        unwrap_qoder_cosy_stream(upstream_stream)
+    } else {
+        upstream_stream
+    };
+
     let response_plan = adapter.transform_response_stream(
         status,
         upstream_headers,
@@ -1774,6 +1788,11 @@ async fn build_and_send_upstream(
     adapter_headers: &HeaderMap,
     upstream_url: &str,
 ) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    // QoderWork Cosy 通道:整份出站请求(url + Cosy 签名头 + AES-GCM 加密 body)由 WASM
+    // 产出,不走下面通用的 build_upstream_url / inject_auth / 指纹头注入路径。
+    if matches!(resolved.auth_scheme, crate::resolver::AuthScheme::QoderCosy) {
+        return send_qoder_cosy(state, plan_body, resolved).await;
+    }
     // GoogleOauthCloudCode / GoogleOauthAntigravity authScheme:provider.api_key
     // 是空,真实 token 在 ~/.codex-app-transfer/{gemini,antigravity}-oauth.json。
     // 这里 await load + auto refresh 拿当前可用 access_token,后面 inject_auth 用
@@ -2077,6 +2096,209 @@ async fn build_and_send_upstream(
     Ok((resp, outbound_headers_snapshot))
 }
 
+/// QoderWork Cosy 出站:选服务账号(池 + 续期)→ 拉 userinfo → 客户端 chat 请求转私有
+/// `remoteChatAsk` 明文 → WASM `qoder_auth` 签名+加密 → 用产出的 url/headers/body 发到
+/// `gateway.qoder.com.cn`。`plan_body` 是 chat completions(qoder provider 走
+/// openai_chat/responses adapter 已转成 chat)。响应(加密 SSE)由 caller 侧解密。
+async fn send_qoder_cosy(
+    state: &ProxyState,
+    plan_body: &Bytes,
+    resolved: &ResolvedProvider,
+) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    use codex_app_transfer_gemini_oauth::qoder;
+    use codex_app_transfer_qoder_auth::{build_remote_chat_ask, QoderAuth, RemoteChatAskParams};
+
+    // 1. 选当前服务账号(多账号池 sticky + 续期 + 失败转移);池空 → needs_login。
+    let acct = qoder::pool::select_serving_account(&state.http, &resolved.provider.id)
+        .await
+        .map_err(|e| ForwardError::OauthUnavailable {
+            needs_login: matches!(e, qoder::pool::PoolError::NotLoggedIn),
+            reason: e.to_string(),
+        })?;
+
+    // 2. 拉用户信息(uid / org)—— WASM 签名的 Cosy-User + userInfoForAuth 用。
+    let userinfo = qoder::fetch_user_info(&state.http, &acct.serving_token)
+        .await
+        .map_err(|e| ForwardError::OauthUnavailable {
+            reason: format!("qoder userinfo: {e}"),
+            needs_login: false,
+        })?;
+
+    // 3. 客户端 chat 请求 → 私有 remoteChatAsk 明文 body。
+    let chat: serde_json::Value = serde_json::from_slice(plan_body)
+        .map_err(|e| ForwardError::BadRequest(format!("qoder: 请求体非 JSON chat: {e}")))?;
+    let model_key = chat
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("q36fmodel")
+        .to_string();
+    let session_id = qoder::uuid_v4();
+    let request_id = qoder::uuid_v4();
+    let remote_body = build_remote_chat_ask(&RemoteChatAskParams {
+        openai_body: &chat,
+        model_key: &model_key,
+        model_source: "system",
+        session_id: &session_id,
+        request_id: &request_id,
+        request_set_id: &request_id,
+    });
+
+    // 4. WASM 签名 + 加密(machine_id=账号指纹;device token=serving_token)。
+    let user_info = serde_json::json!({
+        "uid": userinfo.uid,
+        "encrypt_user_info": "",
+        "key": "",
+        "organization_id": userinfo.organization_id,
+        "organization_tags": userinfo.organization_tags,
+        "data_policy_agreed": true,
+        "security_oauth_token": acct.serving_token,
+    })
+    .to_string();
+    let client_meta = serde_json::json!({
+        "client_type": "6",
+        "business_product": "qoder_work",
+        "business_type": "agent",
+        "scene": "assistant",
+    })
+    .to_string();
+    // WASM 签名是同步的,且 `QoderAuth` 内含 wasmi Store(非 Send)。放独立块内让它在
+    // 后面 `.await` 之前就 drop,只让 url/headers/body(都 Send)逃逸,保证 handler future Send。
+    let (url, headers, body) = {
+        let qa = QoderAuth::new()
+            .map_err(|e| ForwardError::Header(format!("qoder WASM 初始化: {e}")))?;
+        let prepared = qa
+            .prepare_signed_request(
+                &acct.fingerprint,
+                "1.0.34",
+                &user_info,
+                &client_meta,
+                &user_info,
+                "https://gateway.qoder.com.cn",
+                &remote_body.to_string(),
+                &model_key,
+                "system",
+            )
+            .map_err(|e| ForwardError::Header(format!("qoder 签名: {e}")))?;
+        (prepared.url, prepared.headers, prepared.body)
+    };
+
+    // 5. 用 WASM 产出的 url/headers/加密 body 发送。
+    let mut up = state.http.post(&url);
+    for (name, value) in &headers {
+        up = up.header(name, value);
+    }
+    let req = up.body(body).build()?;
+    let outbound_headers_snapshot = req.headers().clone();
+    let resp = state.http.execute(req).await?;
+    Ok((resp, outbound_headers_snapshot))
+}
+
+/// QoderCosy 响应流 unwrap:上游每 SSE 帧是 `{headers, body, statusCodeValue, statusCode}`
+/// 信封(MOC-297 实测,**非加密**),`body` 是 stringified OpenAI `chat.completion.chunk`。
+/// 逐帧提 `body` 重发成标准 OpenAI SSE(`data: <body>`),流尾补 `data: [DONE]`,再交下游
+/// openai_chat adapter 做 chat→responses 转换。
+/// 日志用截断(按 char 边界,防多字节 panic);信封 body 是业务错误对象非凭证,截断只防日志膨胀。
+fn qoder_clip(s: &str) -> String {
+    let t = s.trim();
+    let mut out: String = t.chars().take(200).collect();
+    if t.chars().count() > 200 {
+        out.push('…');
+    }
+    out
+}
+
+fn unwrap_qoder_cosy_stream(
+    inner: codex_app_transfer_adapters::ByteStream,
+) -> codex_app_transfer_adapters::ByteStream {
+    use futures_util::StreamExt;
+    // state = (inner, buf, ended, saw_done);saw_done 收敛「上游 in-band [DONE] + 收尾补发」双 [DONE]。
+    let s = futures_util::stream::unfold(
+        (inner, Vec::<u8>::new(), false, false),
+        |(mut inner, mut buf, ended, mut saw_done)| async move {
+            loop {
+                // 提 buf 里所有完整行(\n 结尾),unwrap 后拼进 out。
+                let mut out: Vec<u8> = Vec::new();
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let s = String::from_utf8_lossy(&line);
+                    let Some(payload) = s.trim().strip_prefix("data:") else {
+                        continue;
+                    };
+                    let p = payload.trim();
+                    if p.is_empty() {
+                        continue;
+                    }
+                    if p == "[DONE]" {
+                        if !saw_done {
+                            out.extend_from_slice(b"data: [DONE]\n\n");
+                            saw_done = true;
+                        }
+                        continue;
+                    }
+                    let env = match serde_json::from_str::<serde_json::Value>(p) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // 协议漂移 / 截断帧:静默吞会让「上游改了信封结构」表现为无声空回答,
+                            // 留 warn 供排查(项目红线:禁静默失败)。
+                            tracing::warn!(error = %e, payload = %qoder_clip(p), "qoder 信封非法 JSON,跳过该帧");
+                            continue;
+                        }
+                    };
+                    // 错误信封(HTTP-200 外壳内 statusCodeValue != 200,如 Signature invalid 403):
+                    // 必须让错误可见,不能被下面无条件的收尾 [DONE] 伪装成「正常空回答」。以流错误收场,
+                    // 下游 adapter/客户端看到失败而非空的成功流;服务端 warn 留痕。
+                    if let Some(code) = env.get("statusCodeValue").and_then(|v| v.as_i64()) {
+                        if code != 200 {
+                            let detail = env.get("body").map(|b| b.to_string()).unwrap_or_default();
+                            tracing::warn!(status = code, body = %qoder_clip(&detail), "qoder 上游信封错误状态,以流错误收场");
+                            let msg = format!(
+                                "qoder upstream error (status {code}): {}",
+                                qoder_clip(&detail)
+                            );
+                            return Some((
+                                Err(std::io::Error::other(msg)),
+                                (inner, Vec::new(), true, true),
+                            ));
+                        }
+                    }
+                    match env.get("body").and_then(|b| b.as_str()) {
+                        Some(body) => {
+                            out.extend_from_slice(b"data: ");
+                            out.extend_from_slice(body.as_bytes());
+                            out.extend_from_slice(b"\n\n");
+                        }
+                        None => {
+                            tracing::warn!(payload = %qoder_clip(p), "qoder 信封缺 body 字段(或非字符串),跳过该帧");
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    return Some((Ok(Bytes::from(out)), (inner, buf, ended, saw_done)));
+                }
+                if ended {
+                    return None;
+                }
+                match inner.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => return Some((Err(e), (inner, buf, true, saw_done))),
+                    None => {
+                        if saw_done {
+                            // 上游已发过 in-band [DONE],不重复补发。
+                            return None;
+                        }
+                        // 上游结束:补 [DONE] 收尾(下游 openai adapter 需要)。
+                        return Some((
+                            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                            (inner, Vec::new(), true, true),
+                        ));
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(s)
+}
+
 /// [#304] 本地记录 `session_id → 真实上游模型` 到 `~/.codex-app-transfer/session-models.jsonl`。
 /// Codex 入站带 `x-session-id` / `session_id` 头(= rollout session uuid),配上 adapter
 /// 解析后的真实上游模型,Usage 页据此显示真实模型而非客户端占位名(gpt-5.x)。
@@ -2356,6 +2578,11 @@ fn inject_auth(
             // (走 `codex_app_transfer_adapters::grok_web::auth::apply_grok_headers`),
             // 这里**不写** Authorization Bearer(grok.com 没这 header)。
         }
+        AuthScheme::QoderCosy => {
+            // QoderWork Cosy 通道:鉴权是 WASM 生成的签名头(`Authorization: Bearer COSY.<sig>`
+            // + 一整套 `Cosy-*`),连同加密 body 在 build_and_send_upstream 的 QoderCosy 分支
+            // **整体覆盖**出站请求产出,这里不写普通 Bearer。
+        }
         AuthScheme::None => {}
     }
     req
@@ -2634,6 +2861,98 @@ mod tests {
         assert!(
             message.starts_with("Previous response with id"),
             "措辞对齐 OpenAI 服务端,实际 {message}"
+        );
+    }
+
+    // ── unwrap_qoder_cosy_stream:信封 SSE → 标准 OpenAI SSE ────────────────
+    // 把字节块 vec 包成 ByteStream 过 unwrap,收集全部输出(遇流错误返 Err)。
+    async fn drive_qoder_unwrap(
+        chunks: Vec<Result<Bytes, std::io::Error>>,
+    ) -> Result<String, std::io::Error> {
+        let inner: codex_app_transfer_adapters::ByteStream =
+            Box::pin(futures_util::stream::iter(chunks));
+        let mut s = unwrap_qoder_cosy_stream(inner);
+        let mut out = String::new();
+        while let Some(item) = s.next().await {
+            out.push_str(&String::from_utf8_lossy(&item?));
+        }
+        Ok(out)
+    }
+    // body_json = stringified OpenAI chunk(信封 body 字段),serde 负责转义。
+    fn qoder_env(body_json: &str, status: i64) -> Bytes {
+        let env = serde_json::json!({
+            "headers": {},
+            "body": body_json,
+            "statusCodeValue": status,
+            "statusCode": if status == 200 { "OK" } else { "ERROR" },
+        });
+        Bytes::from(format!("data: {env}\n"))
+    }
+
+    #[tokio::test]
+    async fn qoder_unwrap_extracts_body_and_appends_done() {
+        let chunk = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let out = drive_qoder_unwrap(vec![Ok(qoder_env(chunk, 200))])
+            .await
+            .expect("正常信封不应报错");
+        assert!(
+            out.contains(&format!("data: {chunk}")),
+            "应提出 body: {out}"
+        );
+        assert!(
+            out.trim_end().ends_with("data: [DONE]"),
+            "应补收尾 [DONE]: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qoder_unwrap_error_envelope_surfaces_error_not_silent_done() {
+        // statusCodeValue != 200(如 Signature invalid 403):必须以流错误收场,
+        // 不能被 [DONE] 伪装成正常空回答(项目红线:禁静默失败)。
+        let res = drive_qoder_unwrap(vec![Ok(qoder_env("Signature invalid", 403))]).await;
+        assert!(res.is_err(), "错误信封必须以 Err 收场,实际 Ok({res:?})");
+    }
+
+    #[tokio::test]
+    async fn qoder_unwrap_invalid_json_line_skipped_no_panic() {
+        // 非法 JSON 帧跳过(warn),不 panic,收尾 [DONE] 仍发,流不卡死。
+        let out = drive_qoder_unwrap(vec![Ok(Bytes::from_static(b"data: not-json\n"))])
+            .await
+            .expect("非法帧应跳过而非报错");
+        assert_eq!(out, "data: [DONE]\n\n", "只应剩收尾 [DONE]: {out}");
+    }
+
+    #[tokio::test]
+    async fn qoder_unwrap_empty_stream_yields_only_done() {
+        let out = drive_qoder_unwrap(vec![]).await.expect("空流不应报错");
+        assert_eq!(out, "data: [DONE]\n\n");
+    }
+
+    #[tokio::test]
+    async fn qoder_unwrap_inband_done_not_duplicated() {
+        // 上游自带 [DONE] + 收尾补发 → 收敛成一个,不双发。
+        let out = drive_qoder_unwrap(vec![Ok(Bytes::from_static(b"data: [DONE]\n"))])
+            .await
+            .expect("in-band [DONE] 不应报错");
+        assert_eq!(out.matches("[DONE]").count(), 1, "应恰好一个 [DONE]: {out}");
+    }
+
+    #[tokio::test]
+    async fn qoder_unwrap_reassembles_frame_split_across_chunks() {
+        // 一个信封被切成两个上游 chunk(JSON 中间断开)→ buf 累积后仍只产一帧 body。
+        let full = qoder_env(r#"{"choices":[{"delta":{"content":"ok"}}]}"#, 200);
+        let bytes = full.to_vec();
+        let mid = bytes.len() / 2;
+        let out = drive_qoder_unwrap(vec![
+            Ok(Bytes::copy_from_slice(&bytes[..mid])),
+            Ok(Bytes::copy_from_slice(&bytes[mid..])),
+        ])
+        .await
+        .expect("跨块分帧不应报错");
+        assert_eq!(
+            out.matches("\"content\":\"ok\"").count(),
+            1,
+            "跨块应重组成恰好一帧: {out}"
         );
     }
 

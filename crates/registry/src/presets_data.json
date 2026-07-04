@@ -702,5 +702,25 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "qoder-login",
+    "name": "QoderWork CN（Login）",
+    "gray": true,
+    "baseUrl": "https://gateway.qoder.com.cn",
+    "docsUrl": "https://qoder.com.cn",
+    "authScheme": "qoder_oauth",
+    "apiFormat": "openai_chat",
+    "models": {
+      "default": "auto"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "QoderWork CN（阿里 Qoder 系）账号登录 + 模型路由。点「登录」用 Qoder 账号在浏览器授权一次（纯客户端 PKCE device flow），凭证落盘并自动 refresh，支持多账号池。模型走 legacy Cosy 通道 gateway.qoder.com.cn，鉴权由内置 WASM 生成 Cosy 签名（device token 即用，无需额外交换），请求体/响应加密。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]

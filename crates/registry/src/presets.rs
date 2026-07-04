@@ -53,7 +53,10 @@ mod tests {
         //  minimax-m3/kimi-k2.x/hy3 等可用,详见逆向记录)
         // (2026-06-30 加 workbuddy-login:WorkBuddy 账号登录 OAuth 路,authScheme
         //  workbuddy_oauth;外链轮询登录 + 自动 refresh,与 API-key 路 workbuddy 并存)
-        assert_eq!(builtin_presets().len(), 20);
+        // (2026-07-03 加 qoder-login:QoderWork CN 账号登录 OAuth 路,authScheme
+        //  qoder_oauth;纯客户端 PKCE device flow 轮询登录 + 自动 refresh。阶段一仅
+        //  login+save,模型路由 jobToken 交换注入在阶段二实测后接入)
+        assert_eq!(builtin_presets().len(), 21);
     }
 
     #[test]
