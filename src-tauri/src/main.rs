@@ -23,6 +23,7 @@ mod opencode_go_quota;
 mod opencode_session;
 mod provider_quota;
 mod proxy_runner;
+mod qoder_quota;
 #[cfg(target_os = "macos")]
 mod single_instance;
 mod system_proxy;
