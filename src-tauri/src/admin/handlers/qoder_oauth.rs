@@ -20,12 +20,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{delete, get, post},
     Router,
 };
-use codex_app_transfer_gemini_oauth::qoder::{run_qoder_login, QoderCredentialStore, QoderError};
+use codex_app_transfer_gemini_oauth::qoder::{pool, run_qoder_login, QoderError};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -147,46 +149,74 @@ fn shared_qoder_http_client() -> Result<&'static reqwest::Client, &'static str> 
     }
 }
 
-fn store() -> Result<QoderCredentialStore, QoderError> {
-    Ok(QoderCredentialStore::with_default_path()?)
+/// 多账号:所有路由按 `providerId` 隔离账号池(一个 qoder provider = 一个池)。
+#[derive(Debug, Deserialize)]
+struct ProviderIdQuery {
+    #[serde(rename = "providerId", default)]
+    provider_id: String,
+}
+
+/// 账号级操作(移除 / 切换)额外带目标账号 `uid`。
+#[derive(Debug, Deserialize)]
+struct AccountQuery {
+    #[serde(rename = "providerId", default)]
+    provider_id: String,
+    #[serde(rename = "uid", default)]
+    uid: String,
+}
+
+/// trim 后非空才有效;空 = provider 未保存,账号池无处安放。
+fn nonempty(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 // ── routes ─────────────────────────────────────────────────────────
 
 pub fn routes() -> Router<AdminState> {
     Router::new()
+        // status?providerId → 列池内账号(多账号);login?providerId → 加账号入池
         .route("/api/qoder-oauth/status", get(status_handler))
         .route("/api/qoder-oauth/login", post(login_handler))
         .route(
             "/api/qoder-oauth/login/cancel",
             delete(cancel_login_handler),
         )
-        .route("/api/qoder-oauth/logout", delete(logout_handler))
+        // account?providerId&uid → 移除单账号;switch?providerId&uid → 手动切当前服务账号
+        .route("/api/qoder-oauth/account", delete(remove_account_handler))
+        .route("/api/qoder-oauth/switch", post(switch_handler))
 }
 
-async fn status_handler() -> impl IntoResponse {
-    let st = match store() {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("qoder store: {e}"),
-            )
-            .into_response()
-        }
+async fn status_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
+    // providerId 空(provider 未保存)→ 空池(前端显「先保存再添加账号」)。
+    let Some(provider_id) = nonempty(&q.provider_id) else {
+        return Json(json!({ "loggedIn": false, "accounts": [] })).into_response();
     };
-    match st.load() {
-        Ok(Some(cred)) => Json(json!({
-            "loggedIn": true,
-            "nickname": cred.nickname,
-            "userId": cred.uid,
-            "obtainedAt": cred.obtained_at_ms,
-        }))
-        .into_response(),
-        Ok(None) => Json(json!({ "loggedIn": false })).into_response(),
+    match pool::list_pool(provider_id) {
+        Ok(accounts) => {
+            let now = codex_app_transfer_gemini_oauth::qoder::token::unix_now_ms();
+            let list: Vec<_> = accounts
+                .iter()
+                .map(|a| {
+                    json!({
+                        "uid": a.uid,
+                        "display": a.display,
+                        "nickname": a.nickname,
+                        "isActive": a.is_active,
+                        "exhausted": a.exhausted_until > now,
+                        "exhaustedUntil": a.exhausted_until,
+                    })
+                })
+                .collect();
+            Json(json!({ "loggedIn": !list.is_empty(), "accounts": list })).into_response()
+        }
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("qoder status load: {e}"),
+            format!("qoder status: {e}"),
         )
         .into_response(),
     }
@@ -201,43 +231,48 @@ async fn cancel_login_handler() -> impl IntoResponse {
     Json(json!({ "cancelled": outcome.cancelled })).into_response()
 }
 
-async fn logout_handler() -> impl IntoResponse {
-    let st = match store() {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("qoder store: {e}"),
-            )
-            .into_response()
-        }
+async fn remove_account_handler(Query(q): Query<AccountQuery>) -> impl IntoResponse {
+    let (Some(provider_id), Some(uid)) = (nonempty(&q.provider_id), nonempty(&q.uid)) else {
+        return err(StatusCode::BAD_REQUEST, "providerId / uid 必填".to_string()).into_response();
     };
-    match st.delete() {
-        Ok(()) => Json(json!({ "loggedIn": false })).into_response(),
+    match pool::remove_account(provider_id, uid) {
+        Ok(()) => Json(json!({ "removed": true })).into_response(),
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("qoder logout failed: {e}"),
+            format!("qoder remove account failed: {e}"),
         )
         .into_response(),
     }
 }
 
-async fn login_handler() -> impl IntoResponse {
+async fn switch_handler(Query(q): Query<AccountQuery>) -> impl IntoResponse {
+    let (Some(provider_id), Some(uid)) = (nonempty(&q.provider_id), nonempty(&q.uid)) else {
+        return err(StatusCode::BAD_REQUEST, "providerId / uid 必填".to_string()).into_response();
+    };
+    match pool::set_active(provider_id, uid) {
+        Ok(()) => Json(json!({ "active": uid })).into_response(),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("qoder switch failed: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+async fn login_handler(Query(q): Query<ProviderIdQuery>) -> impl IntoResponse {
+    let Some(provider_id) = nonempty(&q.provider_id) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "providerId 必填(先保存 provider 再添加账号)".to_string(),
+        )
+        .into_response();
+    };
+    let provider_id = provider_id.to_string();
     let my_epoch = next_epoch();
     let _done_guard = LoginDoneGuard { epoch: my_epoch };
     let http = match shared_qoder_http_client() {
         Ok(c) => c,
         Err(msg) => return err(StatusCode::INTERNAL_SERVER_ERROR, msg.to_string()).into_response(),
-    };
-    let st = match store() {
-        Ok(s) => s,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("qoder store: {e}"),
-            )
-            .into_response()
-        }
     };
 
     // 注册 cancel sender + 抢占语义（新登录抢占任何 in-flight）。
@@ -301,10 +336,10 @@ async fn login_handler() -> impl IntoResponse {
     match result {
         Ok(cred) => {
             let nickname = cred.nickname.clone();
-            let uid = cred.uid.clone();
             let obtained_at = cred.obtained_at_ms;
-            match st.save(&cred) {
-                Ok(()) => Json(json!({
+            // 加账号入池:分配/复用本账号 machine_id + 写 <provider_id>/<uid>.json + 更新池。
+            match pool::add_account(&provider_id, cred) {
+                Ok(uid) => Json(json!({
                     "loggedIn": true,
                     "nickname": nickname,
                     "userId": uid,
@@ -313,7 +348,7 @@ async fn login_handler() -> impl IntoResponse {
                 .into_response(),
                 Err(e) => err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("qoder save credential failed: {e}"),
+                    format!("qoder add account failed: {e}"),
                 )
                 .into_response(),
             }
