@@ -26,7 +26,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use super::token::{unix_now_ms, QoderCredential, QoderCredentialStore, QoderTokenError};
+use super::token::{
+    merge_refreshed_cred, unix_now_ms, QoderCredential, QoderCredentialStore, QoderTokenError,
+};
 use super::{
     qoder_machine_id, user_id_from_jwt, QODER_CLIENT_ID, QODER_OPENAPI_HOST, QODER_REDIRECT_URI,
     QODER_WEBSITE_HOST,
@@ -112,6 +114,9 @@ fn payload_to_cred(t: TokenPayload, machine_id: String) -> QoderCredential {
         machine_id: Some(machine_id),
         nickname: t.nickname,
         uid,
+        // org 在 run_qoder_login 出站前经 /userinfo 补(refresh 保留旧值,见 pool.rs ensure_valid)。
+        organization_id: None,
+        organization_tags: None,
     }
 }
 
@@ -150,7 +155,11 @@ pub async fn run_qoder_login(
 ) -> Result<QoderCredential, QoderError> {
     let (verifier, challenge) = generate_pkce()?;
     let nonce = super::uuid_v4();
-    let machine_id = qoder_machine_id();
+    // per-account 设备隔离:每次登录**新生成** machine_id(而非全局共用),让池内各账号有独立
+    // `Cosy-MachineId` → 网关不把多账号看作同一设备(降低多号被风控关联/连坐 ban)。该 id 绑进
+    // authUrl(device token 由 PKCE 与之绑定)→ payload_to_cred 落盘 → 签名全程用同一个,三处一致。
+    // 全局 `qoder_machine_id()` 仅留作 refresh/migrate 兜底(见 pool.rs / :335)。
+    let machine_id = super::uuid_v4();
 
     // ① 拼 authUrl,交 call site 打开
     let auth_url = build_auth_url(&challenge, &nonce, &machine_id)?;
@@ -198,6 +207,10 @@ pub async fn run_qoder_login(
                         if cred.nickname.is_none() {
                             cred.nickname = info.nickname;
                         }
+                        // org 一并缓存(uid/org 都是账号静态属性)→ 出站签名复用,免每请求打
+                        // 账号级 /userinfo(见 forward.rs send_qoder_cosy)。个人号 org_id 为空串。
+                        cred.organization_id = Some(info.organization_id);
+                        cred.organization_tags = Some(info.organization_tags);
                     }
                     return Ok(cred);
                 }
@@ -281,10 +294,20 @@ pub async fn fetch_user_info(
     }
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|_| QoderError::Parse("userinfo payload"))?;
+    parse_user_info(&v)
+}
+
+/// 解析 `/userinfo` 响应 JSON → [`QoderUserInfo`](纯函数,不含网络,便于单测)。
+///
+/// - **uid**:按 `id`→`user_id`→`uid` 顺序取**首个非空**字符串(空值跳过继续找 —— filter 在
+///   find_map **内**,避免停在空的 `id` 上误判缺失);三键全缺/全空 → `Parse`;
+/// - **organization_id**:缺失 → 空串(个人号,签名侧接受);
+/// - **organization_tags**:非数组 → 空;数组内非字符串元素过滤掉;
+/// - **nickname**:取 `name`(可空)。
+fn parse_user_info(v: &serde_json::Value) -> Result<QoderUserInfo, QoderError> {
     let uid = ["id", "user_id", "uid"]
         .iter()
-        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
-        .filter(|s| !s.is_empty())
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))
         .ok_or(QoderError::Parse("userinfo: missing uid"))?
         .to_string();
     let organization_id = v
@@ -333,10 +356,10 @@ pub async fn ensure_valid_personal_token(
         return Ok(cred.personal_token);
     }
     let machine_id = cred.machine_id.clone().unwrap_or_else(qoder_machine_id);
-    let mut fresh = refresh_qoder_token(http, &cred.refresh_token, machine_id).await?;
-    if fresh.nickname.is_none() {
-        fresh.nickname = cred.nickname.clone();
-    }
+    let fresh = refresh_qoder_token(http, &cred.refresh_token, machine_id).await?;
+    // 与 pool 续期共用 merge:refresh 不回带则从旧凭证兜底 refresh_token(防 brick)/ machine_id
+    //(保隔离)/ uid / org / nickname —— 此前本路只回填 nickname,漏了前四个高危字段。
+    let fresh = merge_refreshed_cred(fresh, &cred);
     store.save(&fresh)?;
     Ok(fresh.personal_token)
 }
@@ -427,5 +450,57 @@ mod tests {
     fn resolve_expiry_ms_passthrough() {
         let e = resolve_expiry_ms(&Some(serde_json::json!(1_900_000_000_000i64)), None);
         assert_eq!(e, 1_900_000_000_000);
+    }
+
+    #[test]
+    fn parse_user_info_uid_falls_through_empty_keys() {
+        // `id` 空 → 跳到 `user_id`(filter 在 find_map 内,不停在空的 id 上)。
+        let info = parse_user_info(&serde_json::json!({
+            "id": "", "user_id": "u-123", "name": "Alice",
+        }))
+        .unwrap();
+        assert_eq!(info.uid, "u-123");
+        assert_eq!(info.nickname.as_deref(), Some("Alice"));
+        // `id` 有值 → 优先用 id。
+        let info2 = parse_user_info(&serde_json::json!({"id": "u-1", "user_id": "u-2"})).unwrap();
+        assert_eq!(info2.uid, "u-1");
+        // 第三键 `uid` 兜底。
+        let info3 = parse_user_info(&serde_json::json!({"uid": "u-9"})).unwrap();
+        assert_eq!(info3.uid, "u-9");
+    }
+
+    #[test]
+    fn parse_user_info_missing_uid_errors() {
+        // 三键全缺 / 全空 → Parse 错误(不静默用空 uid,否则签名会拿空 uid)。
+        assert!(matches!(
+            parse_user_info(&serde_json::json!({"name": "x"})),
+            Err(QoderError::Parse(_))
+        ));
+        assert!(matches!(
+            parse_user_info(&serde_json::json!({"id": "", "user_id": "", "uid": ""})),
+            Err(QoderError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn parse_user_info_org_tags_filter_and_personal_default() {
+        // organization_tags 数组内非字符串元素被过滤;organization_id 缺 → 空串(个人号)。
+        let info = parse_user_info(&serde_json::json!({
+            "id": "u-1",
+            "organization_tags": ["t1", 42, "t2", null],
+        }))
+        .unwrap();
+        assert_eq!(
+            info.organization_tags,
+            vec!["t1".to_string(), "t2".to_string()]
+        );
+        assert_eq!(info.organization_id, "", "缺 org → 空串(个人号)");
+        // 显式 org + 非数组 tags → 空。
+        let info2 = parse_user_info(&serde_json::json!({
+            "id": "u-1", "organization_id": "org-x", "organization_tags": "not-array",
+        }))
+        .unwrap();
+        assert_eq!(info2.organization_id, "org-x");
+        assert!(info2.organization_tags.is_empty());
     }
 }

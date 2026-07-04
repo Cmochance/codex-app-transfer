@@ -6,6 +6,12 @@ pub const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// 与 `presets_data.json` 中 builtin preset 的 `modelCapabilities.context_window`
 /// 对齐。用于在未显式配置 capability 时提供保守默认值。
+///
+/// **全局表(不含 QoderWork)**:key 假定跨 provider 全局唯一的真实模型名。QoderWork 的网关 key 含
+/// `auto` / `l` 这类通用别名(与 WorkBuddy 的 `auto` 撞名),不在此表 —— 见
+/// [`documented_context_window_scoped`],只在 qoder provider 上下文里补 [`crate::qoder_catalog`] 的
+/// 最大 context,避免把 qoder 的 `auto`=180k 误加到同名的其它 provider(那些 provider 有自己的
+/// `modelCapabilities`,以显式声明为准)。
 pub fn documented_context_window(model_id: &str) -> Option<u64> {
     match model_id.trim().to_ascii_lowercase().as_str() {
         // DeepSeek
@@ -50,6 +56,19 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
     }
 }
 
+/// 按 model id + **是否 qoder provider** 查文档化 context window。qoder provider 先查
+/// [`crate::qoder_catalog`] 的最大 context(网关 key `auto`/`gm51model` 等,QoderWork 无
+/// `modelCapabilities`、context 全靠本表),再兜底全局表;非 qoder 只查全局表(WorkBuddy 的
+/// `auto` → 全局无 → 以其自身 `modelCapabilities` 显式声明为准,不被 qoder 的 180k 污染)。
+pub fn documented_context_window_scoped(model_id: &str, is_qoder: bool) -> Option<u64> {
+    if is_qoder {
+        crate::qoder_catalog::qoder_max_context(model_id.trim())
+            .or_else(|| documented_context_window(model_id))
+    } else {
+        documented_context_window(model_id)
+    }
+}
+
 /// 统一的 1M 判定策略(优先级从高到低):
 /// 1. `[1m]` 内部后缀
 /// 2. 显式 `modelCapabilities[model].context_window` 数值(权威:>= 1M → true,< 1M → false;
@@ -57,6 +76,17 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
 /// 3. 文档化 context_window >= 1M
 /// 4. `modelCapabilities[model].supports1m = true/false`
 pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value>) -> bool {
+    model_supports_1m_scoped(original_model, model_capabilities, false)
+}
+
+/// 同 [`model_supports_1m`],但 `is_qoder=true` 时文档化 context 走
+/// [`documented_context_window_scoped`](qoder 网关 key 才解析)。qoder provider 的默认模型 1M 判定
+/// (`providers::provider_supports_1m`)用本入口,避免 qoder 的 `gm51model`(1M)因不在全局表被判非 1M。
+pub fn model_supports_1m_scoped(
+    original_model: &str,
+    model_capabilities: Option<&Value>,
+    is_qoder: bool,
+) -> bool {
     if has_internal_one_m_suffix(original_model) {
         return true;
     }
@@ -79,7 +109,9 @@ pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value
         return n >= ONE_M_CONTEXT_WINDOW;
     }
 
-    if documented_context_window(clean_model).is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW) {
+    if documented_context_window_scoped(clean_model, is_qoder)
+        .is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW)
+    {
         return true;
     }
 
@@ -159,6 +191,38 @@ mod tests {
         assert_eq!(documented_context_window("kimi-k2.7"), Some(262_144));
         assert_eq!(documented_context_window("glm-5.2"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
+    }
+
+    #[test]
+    fn qoder_context_only_resolves_scoped_not_global() {
+        // QoderWork 原始 key → 各模型最大 context,只在 qoder-scoped(is_qoder=true)里解析。
+        assert_eq!(
+            documented_context_window_scoped("gm51model", true),
+            Some(1_000_000)
+        );
+        assert_eq!(documented_context_window_scoped("l", true), Some(1_000_000));
+        assert_eq!(
+            documented_context_window_scoped("kmodel", true),
+            Some(256_000)
+        );
+        assert_eq!(
+            documented_context_window_scoped("auto", true),
+            Some(180_000)
+        );
+        assert_eq!(
+            documented_context_window_scoped("mmodel", true),
+            Some(200_000)
+        );
+        // [HIGH 回归防护] 通用别名 `auto`/`l` 不得进全局表(会撞 WorkBuddy 等同名 provider);
+        // 非 qoder provider(is_qoder=false)也不得解析成 qoder context。
+        for m in ["auto", "l", "gm51model", "mmodel"] {
+            assert_eq!(documented_context_window(m), None, "{m} 全局表应为空");
+            assert_eq!(
+                documented_context_window_scoped(m, false),
+                None,
+                "{m} 非 qoder 不应解析"
+            );
+        }
     }
 
     #[test]

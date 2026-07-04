@@ -1510,6 +1510,83 @@ fn workbuddy_guard_threshold() -> f64 {
         .unwrap_or(20.0)
 }
 
+/// 活动 provider 若是 QoderWork(authScheme `qoder_oauth`)→ 其 id;否则 `None`。
+fn active_qoder_provider() -> Option<String> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let auth = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(auth, "qoder_oauth" | "qoder" | "qoder_cosy") {
+        p.get("id").and_then(|v| v.as_str()).map(String::from)
+    } else {
+        None
+    }
+}
+
+/// QoderWork 额度(池型):取当前服务账号 device token → `GET /api/v2/quota/usage` → 解析成
+/// [`ProviderQuota`](基础套餐 + 加油包两条 credit bar)。45s 缓存;鉴权失败清缓存,瞬时失败留旧
+/// 缓存;非活动 qoder → `None`(自清缓存,防上个 provider 额度滞留)。
+async fn fetch_qoder_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use codex_app_transfer_gemini_oauth::qoder;
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some(provider_id) = active_qoder_provider() else {
+        *cache = None;
+        return None;
+    };
+    let http = http.as_ref()?;
+    // 当前服务账号(sticky + 续期);池空 → NotLoggedIn(正常「未登录」态,不留痕)。
+    // 其它错误(续期失败 / 存储 IO / 全账号退避)是真失败:留 debug 痕再返 None ——
+    // 否则登录用户额度一直不显示时无从诊断(与下方 QuotaError 分支的留痕一致)。
+    let acct = match qoder::pool::select_serving_account(http, &provider_id).await {
+        Ok(a) => a,
+        Err(qoder::pool::PoolError::NotLoggedIn) => return None,
+        Err(e) => {
+            tracing::debug!(error = %e, "[Quota] qoder 选服务账号失败 → 本 tick 无额度");
+            return None;
+        }
+    };
+    let fp = quota_fingerprint(&[provider_id.as_str(), acct.uid.as_str()]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    match crate::qoder_quota::fetch_qoder_quota_usage(http, &acct.serving_token).await {
+        Ok(json) => {
+            let q = crate::qoder_quota::parse_qoder_quota(&json);
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(crate::workbuddy_quota::QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] qoder quota 鉴权失败 → 清缓存");
+            *cache = None;
+            None
+        }
+        Err(crate::workbuddy_quota::QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] qoder quota 瞬时失败,留旧缓存");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
 async fn fetch_workbuddy_quota(
     http: &Option<reqwest::Client>,
     cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
@@ -2031,6 +2108,7 @@ pub async fn run_quota_daemon() {
     let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut trae_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut workbuddy_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut qoder_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -2070,6 +2148,7 @@ pub async fn run_quota_daemon() {
         let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
         let trae = fetch_trae_quota(&quota_http, &mut trae_cache).await;
         let workbuddy = fetch_workbuddy_quota(&quota_http, &mut workbuddy_cache).await;
+        let qoder = fetch_qoder_quota(&quota_http, &mut qoder_cache).await;
         // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
         let quota = antigravity
             .or(glm)
@@ -2081,6 +2160,7 @@ pub async fn run_quota_daemon() {
             .or(moonshot)
             .or(trae)
             .or(workbuddy)
+            .or(qoder)
             .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));

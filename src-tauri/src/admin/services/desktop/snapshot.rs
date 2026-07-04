@@ -43,6 +43,10 @@ pub struct DesktopConfigTarget {
     /// 从 provider `reviewModelSlot` 读;透传给 catalog 生成写每个 entry 的
     /// `auto_review_model_override`,让审查脱钩主模型走该槽位的现有映射。
     pub review_model_slot: Option<String>,
+    /// [correctness review HIGH] 是否 QoderWork provider(authScheme qoder_oauth)。透传给
+    /// `ApplyConfig.is_qoder`,让 catalog 只在 qoder 上下文解析 qoder 网关 key 的 reasoning/context,
+    /// 避免 `auto` 等通用别名撞 WorkBuddy 等同名 model。见 [`provider_is_qoder`]。
+    pub is_qoder: bool,
 }
 
 /// [MOC-69] 给 antigravity provider 构建 model id → displayName 反查表(JSON object),
@@ -63,6 +67,40 @@ fn antigravity_display_names(api_format_lower: &str) -> Value {
         }
     }
     Value::Object(map)
+}
+
+/// provider 是否为 QoderWork(authScheme `qoder_oauth` 及别名)。qoder 网关 key 含通用别名
+/// (`auto`/`l`,与 WorkBuddy 撞名),catalog 的 reasoning 档 + context 只在 qoder provider 上下文里
+/// 解析(透传 `ApplyConfig.is_qoder`),见 registry::qoder_catalog::is_qoder_auth_scheme。
+fn provider_is_qoder(provider: &Value) -> bool {
+    let auth = provider
+        .get("authScheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    codex_app_transfer_registry::qoder_catalog::is_qoder_auth_scheme(auth)
+}
+
+/// QoderWork(authScheme `qoder_oauth`):Codex catalog id = 网关原始 key(gm51model 等),picker
+/// 直接显示会露机器名 → 从 [`qoder_catalog`] 建 `{key: 显示名}` 覆盖(GLM-5.2 / DeepSeek-V4-Pro …)。
+fn qoder_display_names(provider: &Value) -> Value {
+    if !provider_is_qoder(provider) {
+        return Value::Null;
+    }
+    let mut map = serde_json::Map::new();
+    for m in codex_app_transfer_registry::qoder_catalog::QODER_MODELS {
+        map.insert(m.key.to_string(), Value::String(m.display_name.to_string()));
+    }
+    Value::Object(map)
+}
+
+/// 按 provider 选 Codex catalog 的 `display_name` 覆盖表:qoder(按 authScheme)优先,否则
+/// antigravity(按 apiFormat);都不命中返 `Null`(catalog 用模型 id 本身)。
+fn model_display_names_for_provider(provider: &Value, api_format_lower: &str) -> Value {
+    let qoder = qoder_display_names(provider);
+    if !qoder.is_null() {
+        return qoder;
+    }
+    antigravity_display_names(api_format_lower)
 }
 
 pub fn desktop_config_target_for_provider(
@@ -111,8 +149,9 @@ pub fn desktop_config_target_for_provider(
         mode: "local_proxy",
         proxy_port,
         codex_network_access,
-        model_display_names: antigravity_display_names(&api_format_lower),
+        model_display_names: model_display_names_for_provider(provider, &api_format_lower),
         review_model_slot: provider_review_model_slot(provider),
+        is_qoder: provider_is_qoder(provider),
     }
 }
 
@@ -197,6 +236,7 @@ fn apply_desktop_target_impl(
             default_model: &target.default_model,
             model_mappings: Some(&target.model_mappings),
             model_capabilities: Some(&target.model_capabilities),
+            is_qoder: target.is_qoder,
             model_display_names: Some(&target.model_display_names),
             review_model_slot: target.review_model_slot.as_deref(),
             app_version: APP_VERSION,

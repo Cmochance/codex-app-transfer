@@ -20,13 +20,16 @@ pub mod model_alias;
 pub mod model_context_policy;
 pub mod paths;
 pub mod presets;
+pub mod qoder_catalog;
 pub mod raw_io;
 pub mod reasoning_effort_policy;
 pub mod reasoning_tiers;
 pub mod schema;
 
 pub use base_instructions::CAS_BASE_INSTRUCTIONS;
-pub use compact_thinking_policy::{compact_disable_thinking_wire, DisableThinkingWire};
+pub use compact_thinking_policy::{
+    compact_disable_thinking_wire, compact_disable_thinking_wire_scoped, DisableThinkingWire,
+};
 #[allow(deprecated)]
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
@@ -37,7 +40,8 @@ pub use model_alias::{
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
 };
 pub use model_context_policy::{
-    documented_context_window, model_supports_1m, ONE_M_CONTEXT_WINDOW,
+    documented_context_window, documented_context_window_scoped, model_supports_1m,
+    model_supports_1m_scoped, ONE_M_CONTEXT_WINDOW,
 };
 pub use paths::{
     config_dir, config_file, library_dir, resolve_home, sessions_db_file, tool_artifacts_db_file,
@@ -49,6 +53,7 @@ pub use reasoning_effort_policy::{
     apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
 };
 pub use reasoning_tiers::{
-    all_reasoning_tier_efforts, reasoning_tiers_for_model, ReasoningTier, ReasoningTierSpec,
+    all_reasoning_tier_efforts, reasoning_tiers_for_model, reasoning_tiers_for_model_scoped,
+    reasoning_tiers_for_qoder_model, ReasoningTier, ReasoningTierSpec,
 };
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};

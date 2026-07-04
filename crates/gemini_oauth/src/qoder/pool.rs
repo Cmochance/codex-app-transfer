@@ -9,7 +9,7 @@ use crate::account_pool::{self, PoolBackend, RefreshOutcome};
 pub use crate::account_pool::{PoolAccount, PoolError, PoolStorageError, ServingAccount};
 
 use super::login::{refresh_qoder_token, QoderError};
-use super::token::QoderCredential;
+use super::token::{merge_refreshed_cred, QoderCredential};
 use super::{qoder_machine_id, user_id_from_jwt, uuid_v4};
 
 /// QoderWork 的 [`PoolBackend`] 特化。
@@ -41,13 +41,13 @@ impl PoolBackend for QoderBackend {
 
     /// QoderWork 的设备指纹 = `machine_id`(签名 `Cosy-MachineId` 用)。
     ///
-    /// **注意(已知局限,per-account 设备隔离未达成)**:qoder 的 machine_id 在登录 PKCE authUrl
-    /// 阶段就绑定进 device token,`run_qoder_login` 用全局 `qoder_machine_id()` 且 `payload_to_cred`
-    /// 预填,故 `add_account` 的 `cred_fingerprint` 恒 `Some(全局值)`、`new_fingerprint` 对 qoder 不触发
-    /// —— 池内多账号共用同一 `Cosy-MachineId`。多账号仍能跑(网关按 token/`Cosy-User` uid 区分、配额倍增
-    /// 有效),但通用池文档所述「每账号独立设备指纹」对 qoder 未实现。真正 per-account 隔离需每次登录前
-    /// 生成新 machine_id 并贯穿 authUrl+落盘+签名,且需真机新登录验证 token 绑定 —— 留作 followup,
-    /// 不在本 PR 内改(避免 ship 未验证的鉴权流改动)。
+    /// **per-account 设备隔离已达成**(`login.rs::run_qoder_login`):qoder 的 machine_id 必须在登录
+    /// PKCE authUrl 阶段就绑进 device token,故只能登录时定;run_qoder_login 每次登录**新生成**一枚
+    /// `uuid_v4` machine_id 并贯穿 authUrl+落盘+签名 → 池内各账号 `Cosy-MachineId` 互不相同,网关不把
+    /// 多号看作同一设备。因此 machine_id 恒由 login 预填(`cred_fingerprint` 恒 `Some`),`add_account`
+    /// 的 `new_fingerprint` 对 qoder 走不到——这是「指纹须在 authUrl 阶段就定、不能等 add_account 才生成」
+    /// 所致(与 workbuddy 登录后才分配 device_id 不同),非缺陷。全局 `qoder_machine_id()` 仅留作
+    /// refresh/migrate 兜底(老账号)。
     fn cred_fingerprint(cred: &Self::Cred) -> Option<String> {
         cred.machine_id.clone()
     }
@@ -85,15 +85,10 @@ impl PoolBackend for QoderBackend {
         }
         let machine_id = cred.machine_id.clone().unwrap_or_else(qoder_machine_id);
         match refresh_qoder_token(http, &cred.refresh_token, machine_id).await {
-            Ok(mut fresh) => {
-                // refresh 响应通常不回昵称/uid/machine_id,回填保持稳定。
-                fresh.nickname = fresh.nickname.or(cred.nickname.clone());
-                fresh.uid = fresh.uid.or(cred.uid.clone());
-                fresh.machine_id = fresh.machine_id.or(cred.machine_id.clone());
-                // refresh_token 若上游不回带(不轮换),保留旧值——否则续期一次即清空、账号被 brick 需重登。
-                if fresh.refresh_token.is_empty() {
-                    fresh.refresh_token = cred.refresh_token.clone();
-                }
+            Ok(fresh) => {
+                // refresh 响应通常不回带 昵称/uid/machine_id/org/refresh_token → 逐字段用旧值兜底
+                //(refresh_token 空保留旧值防 brick、machine_id 保 per-account 隔离、org 保签名缓存)。
+                let fresh = merge_refreshed_cred(fresh, &cred);
                 let token = fresh.personal_token.clone();
                 account_pool::save_account(ns, provider_id, uid, &fresh)
                     .map_err(|e| RefreshOutcome::Infra(e.to_string()))?;
@@ -130,6 +125,14 @@ pub async fn select_serving_account(
 /// 登录成功后加账号入池。
 pub fn add_account(provider_id: &str, cred: QoderCredential) -> Result<String, PoolError> {
     account_pool::add_account::<QoderBackend>(provider_id, cred)
+}
+
+/// 取指定账号完整凭证(签名复用登录时缓存的 uid/org,免每请求打账号级 `/userinfo`)。
+pub fn load_account(
+    provider_id: &str,
+    uid: &str,
+) -> Result<Option<QoderCredential>, PoolStorageError> {
+    account_pool::load_account::<QoderCredential>(QoderBackend::namespace(), provider_id, uid)
 }
 
 /// 列池内账号摘要(UI)。

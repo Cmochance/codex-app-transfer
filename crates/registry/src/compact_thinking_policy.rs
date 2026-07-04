@@ -55,7 +55,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::reasoning_tiers::reasoning_tiers_for_model;
+use crate::reasoning_tiers::{reasoning_tiers_for_model, reasoning_tiers_for_model_scoped};
 
 /// compact 路径 disable-thinking 的 wire 形态。
 ///
@@ -91,6 +91,14 @@ pub enum DisableThinkingWire {
     /// (自建 vLLM/SGLang,GLM 官方客户端智谱 ZCode `createGlm52ReasoningProviderOptions` 的
     /// openaiCompatible wire)。二者皆「关」、不矛盾,覆盖 hosted 与自建两种部署。
     GlmDual,
+
+    /// **[MOC-297] QoderWork** —— 写 `reasoning_effort: "none"` 关思考。QoderWork(阿里 Qoder)
+    /// 经 remoteChatAsk `parameters.reasoning_effort` 控思考(`qoder_auth::body::build_parameters`
+    /// 透传 chat body 的 `reasoning_effort`),**实测 `reasoning_effort="none"` → 不输出 reasoning、
+    /// `high`/`max` → 思考**(gateway.qoder.com.cn)。故它的 disable = 显式 `reasoning_effort:"none"`
+    /// (不是删、也不是 thinking 顶级字段——那些会被 build_remote_chat_ask 丢弃)。**与其它派相反:
+    /// 保留而非移除 reasoning_effort**。
+    ReasoningEffortNone,
 }
 
 impl DisableThinkingWire {
@@ -130,6 +138,15 @@ impl DisableThinkingWire {
                 let a = set_thinking_type_disabled(obj);
                 let b = set_chat_template_enable_thinking_false(obj);
                 a || b
+            }
+            // QoderWork:disable = 显式 `reasoning_effort:"none"`(**覆盖**已有值,它本身就是关思考
+            // 信号)。返回 false 跳过下面的 remove——绝不删,删了 QoderWork 就当默认思考开。
+            Self::ReasoningEffortNone => {
+                obj.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String("none".to_owned()),
+                );
+                false
             }
         };
         // 仅当 thinking 确实被关掉才删 reasoning_effort(见上方 P2 说明)。
@@ -189,6 +206,17 @@ pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire>
     // 各模型的官方文档出处见 reasoning_tiers 表注释;下方 `__unsupported_model_anchors` 段保留
     // 「无解类 / 无 thinking 类」完整决策图。新增模型只改表一处。
     reasoning_tiers_for_model(model).and_then(|spec| spec.disable_wire)
+}
+
+/// 同 [`compact_disable_thinking_wire`],但 `is_qoder=true` 时也查 QoderWork scoped 档位表
+/// (网关 key `auto`/`gm51model` 等的 disable_wire = `ReasoningEffortNone`)。compact 侧由
+/// [`crate::reasoning_tiers`] 单一来源决定关思考 wire —— 非 qoder provider(is_qoder=false)对
+/// `auto` 返 `None`,不注入 disable(还原 WorkBuddy 等同名 provider 的原 compact 行为)。
+pub fn compact_disable_thinking_wire_scoped(
+    model: &str,
+    is_qoder: bool,
+) -> Option<DisableThinkingWire> {
+    reasoning_tiers_for_model_scoped(model, is_qoder).and_then(|spec| spec.disable_wire)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -440,6 +468,59 @@ mod tests {
             compact_disable_thinking_wire("MIMO-V2.5-PRO"),
             Some(DisableThinkingWire::EnableThinkingFalse)
         );
+    }
+
+    #[test]
+    fn qoder_compact_disables_via_reasoning_effort_none() {
+        // [MOC-297] compact 与 reasoning wire 共用 reasoning_tiers 的 disable_wire(单一真相)。
+        // 故 qoder 模型 compact 关思考 = 写 reasoning_effort="none"(与 reasoning「none」档同一 wire),
+        // **无需 qoder compact 专门设置**。qoder key 走 scoped(is_qoder=true);思考型 key 都命中;
+        // mmodel 非思考 → None(不注入)。
+        for m in [
+            "gm51model",
+            "dmodel",
+            "dfmodel",
+            "auto",
+            "qmodel",
+            "l",
+            "kmodel",
+        ] {
+            assert_eq!(
+                compact_disable_thinking_wire_scoped(m, true),
+                Some(DisableThinkingWire::ReasoningEffortNone),
+                "{m} compact 应写 reasoning_effort=none 关思考"
+            );
+            // [HIGH 回归防护] 非 qoder provider(is_qoder=false)对同名 key 不注入 disable ——
+            // 尤其 `auto` 撞 WorkBuddy,全局无 → None,还原其原 compact 行为。qoder key 已统一
+            // scoped,旧全局入口(compact_disable_thinking_wire)对它们一律 None。
+            assert_eq!(
+                compact_disable_thinking_wire_scoped(m, false),
+                None,
+                "{m} 非 qoder 不应注入 qoder disable"
+            );
+            assert_eq!(
+                compact_disable_thinking_wire(m),
+                None,
+                "{m} 旧全局入口对 qoder key 一律 None(qoder key 已 scoped)"
+            );
+        }
+        // 注入后 compact chat body 带 reasoning_effort="none"(build_parameters 透传给 QoderWork)。
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("gm51model".into()));
+        DisableThinkingWire::ReasoningEffortNone.apply_to_map(&mut body);
+        assert_eq!(body["reasoning_effort"], "none");
+        // **compact 胜出(覆盖语义)**:compact 注入在 apply_reasoning_effort 之后(compact.rs:443),
+        // 即便用户档位已写 reasoning_effort="max",compact disable 用 insert **覆盖**成 "none"
+        // → qoder compact 一定关思考(不被深度档翻案)。这是用 insert 而非 or_insert 的关键原因。
+        let mut with_max = Map::new();
+        with_max.insert("reasoning_effort".into(), Value::String("max".into()));
+        DisableThinkingWire::ReasoningEffortNone.apply_to_map(&mut with_max);
+        assert_eq!(
+            with_max["reasoning_effort"], "none",
+            "compact disable 必须覆盖深度档"
+        );
+        // 非思考模型不注入 disable(保持 current behavior)。
+        assert_eq!(compact_disable_thinking_wire("mmodel"), None);
     }
 
     // ── 注入行为 ────────────────────────────────────────────────────

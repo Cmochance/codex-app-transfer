@@ -23,6 +23,7 @@ mod opencode_go_quota;
 mod opencode_session;
 mod provider_quota;
 mod proxy_runner;
+mod qoder_quota;
 #[cfg(target_os = "macos")]
 mod single_instance;
 mod system_proxy;
@@ -732,6 +733,23 @@ fn main() {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         handlers::workbuddy_oauth::wait_for_login_epoch_complete(target_epoch),
+                    )
+                    .await
+                });
+            }
+            // 同理取消 in-flight QoderWork(阿里 Qoder)账号登录:此前 qoder 漏接这套 app-exit 取消
+            // (gemini/zai/trae/antigravity/workbuddy 都有),用户登 qoder 期间退出 app 时后台轮询残留 +
+            // auth 在退出过程完成致 ghost 凭证落盘。机器(cancel_in_flight_login + wait_for_login_epoch_complete)
+            // 已在 qoder_oauth handler,补接线(与 antigravity/workbuddy 对齐)。
+            let qoder_outcome = handlers::qoder_oauth::cancel_in_flight_login();
+            if let (true, Some(target_epoch)) =
+                (qoder_outcome.cancelled, qoder_outcome.cancelled_epoch)
+            {
+                tracing::info!(target_epoch, "app exit: cancelled in-flight qoder OAuth login");
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::qoder_oauth::wait_for_login_epoch_complete(target_epoch),
                     )
                     .await
                 });

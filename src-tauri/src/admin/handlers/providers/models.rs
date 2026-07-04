@@ -485,17 +485,11 @@ async fn fetch_zai_glm_models_impl(zp: codex_app_transfer_gemini_oauth::ZaiProvi
 /// **网关对未知 key 静默 fallback 到 `auto`**(不报错),故这些 key 必须精确才能路由到目标模型
 /// + 正确计费——不能靠猜。用户仍可在映射里手工填 QoderWork 后续新增的 model key。
 fn qoder_work_models() -> Value {
-    let models = json!([
-        {"id": "auto", "display_name": "Auto"},
-        {"id": "qmodel_latest", "display_name": "Qwen3.7-Max"},
-        {"id": "qmodel", "display_name": "Qwen3.7-Plus"},
-        {"id": "l", "display_name": "Qwen3.6-Flash"},
-        {"id": "dmodel", "display_name": "DeepSeek-V4-Pro"},
-        {"id": "dfmodel", "display_name": "DeepSeek-V4-Flash"},
-        {"id": "gm51model", "display_name": "GLM-5.2"},
-        {"id": "kmodel", "display_name": "Kimi-K2.7-Code"},
-        {"id": "mmodel", "display_name": "MiniMax-M2.7"},
-    ]);
+    // 单一来源:registry `qoder_catalog`(display_name / context / reasoning 同一张表)。
+    let models: Vec<Value> = codex_app_transfer_registry::qoder_catalog::QODER_MODELS
+        .iter()
+        .map(|m| json!({"id": m.key, "display_name": m.display_name}))
+        .collect();
     // 默认建议 → auto(QoderWork 自身默认,智能路由 + 支持 reasoning/vision;
     // 用户可再手工把具体槽位映射到指定模型)。
     let mut suggested = empty_model_mappings_value();
