@@ -2356,6 +2356,11 @@ fn inject_auth(
             // (走 `codex_app_transfer_adapters::grok_web::auth::apply_grok_headers`),
             // 这里**不写** Authorization Bearer(grok.com 没这 header)。
         }
+        AuthScheme::QoderCosy => {
+            // QoderWork Cosy 通道:鉴权是 WASM 生成的签名头(`Authorization: Bearer COSY.<sig>`
+            // + 一整套 `Cosy-*`),连同加密 body 在 build_and_send_upstream 的 QoderCosy 分支
+            // **整体覆盖**出站请求产出,这里不写普通 Bearer。
+        }
         AuthScheme::None => {}
     }
     req

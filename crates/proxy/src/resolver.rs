@@ -71,6 +71,12 @@ pub enum AuthScheme {
     /// 的 OpenAI Chat 兼容 wire,forward.rs 注 `Authorization: Bearer <access_token>` +
     /// 完整 coding 模式指纹头(与 API-key 路 `workbuddy` preset 对齐)。
     WorkbuddyOauth,
+    /// QoderWork CN(阿里 Qoder)legacy 模型通道:鉴权由 WASM(`qoder_auth`)生成的
+    /// **Cosy 签名**(`Authorization: Bearer COSY.<sig>` + 一整套 `Cosy-*` 头 + AES-GCM
+    /// 加密 body),host 钉死 `gateway.qoder.com.cn`。device token 由
+    /// `gemini_oauth::qoder` 多账号池持久化 + 请求时 refresh。签名/加密/整份出站
+    /// url+header+body 在 `forward.rs` 的 build_and_send_upstream QoderCosy 分支产出。
+    QoderCosy,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -93,6 +99,7 @@ impl AuthScheme {
             "zai_oauth" | "zai" => AuthScheme::ZaiOauth(ZaiProvider::Zai),
             "bigmodel_oauth" | "bigmodel" => AuthScheme::ZaiOauth(ZaiProvider::BigModel),
             "workbuddy_oauth" | "workbuddy_login" => AuthScheme::WorkbuddyOauth,
+            "qoder_oauth" | "qoder" | "qoder_cosy" => AuthScheme::QoderCosy,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -323,6 +330,7 @@ impl ProviderResolver for StaticResolver {
             // 网关 base,防 user 把 authScheme=workbuddy_oauth 配到任意 baseUrl 致账号 token
             // 外泄到非官方 host(codex review P2)。
             AuthScheme::WorkbuddyOauth => "https://copilot.tencent.com/v2".to_string(),
+            AuthScheme::QoderCosy => "https://gateway.qoder.com.cn".to_string(),
             _ => provider.base_url.clone(),
         };
 
