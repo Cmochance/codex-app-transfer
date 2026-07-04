@@ -7,6 +7,11 @@ pub const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 /// 与 `presets_data.json` 中 builtin preset 的 `modelCapabilities.context_window`
 /// 对齐。用于在未显式配置 capability 时提供保守默认值。
 pub fn documented_context_window(model_id: &str) -> Option<u64> {
+    // QoderWork 模型(原始 key gm51model/dmodel/l/kmodel/mmodel 等):用其支持的**最大** context
+    // (多数 1M,kmodel 256k,auto 180k,mmodel 200k)。key 非人类可读、不会命中下面的显示名 match。
+    if let Some(cw) = crate::qoder_catalog::qoder_max_context(model_id) {
+        return Some(cw);
+    }
     match model_id.trim().to_ascii_lowercase().as_str() {
         // DeepSeek
         "deepseek-v4-pro" | "deepseek-v4-flash" => Some(ONE_M_CONTEXT_WINDOW),

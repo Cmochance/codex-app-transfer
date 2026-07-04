@@ -65,6 +65,33 @@ fn antigravity_display_names(api_format_lower: &str) -> Value {
     Value::Object(map)
 }
 
+/// QoderWork(authScheme `qoder_oauth`):Codex catalog id = 网关原始 key(gm51model 等),picker
+/// 直接显示会露机器名 → 从 [`qoder_catalog`] 建 `{key: 显示名}` 覆盖(GLM-5.2 / DeepSeek-V4-Pro …)。
+fn qoder_display_names(provider: &Value) -> Value {
+    let auth = provider
+        .get("authScheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !matches!(auth, "qoder_oauth" | "qoder" | "qoder_cosy") {
+        return Value::Null;
+    }
+    let mut map = serde_json::Map::new();
+    for m in codex_app_transfer_registry::qoder_catalog::QODER_MODELS {
+        map.insert(m.key.to_string(), Value::String(m.display_name.to_string()));
+    }
+    Value::Object(map)
+}
+
+/// 按 provider 选 Codex catalog 的 `display_name` 覆盖表:qoder(按 authScheme)优先,否则
+/// antigravity(按 apiFormat);都不命中返 `Null`(catalog 用模型 id 本身)。
+fn model_display_names_for_provider(provider: &Value, api_format_lower: &str) -> Value {
+    let qoder = qoder_display_names(provider);
+    if !qoder.is_null() {
+        return qoder;
+    }
+    antigravity_display_names(api_format_lower)
+}
+
 pub fn desktop_config_target_for_provider(
     cfg: &mut RawConfig,
     provider: &Value,
@@ -111,7 +138,7 @@ pub fn desktop_config_target_for_provider(
         mode: "local_proxy",
         proxy_port,
         codex_network_access,
-        model_display_names: antigravity_display_names(&api_format_lower),
+        model_display_names: model_display_names_for_provider(provider, &api_format_lower),
         review_model_slot: provider_review_model_slot(provider),
     }
 }

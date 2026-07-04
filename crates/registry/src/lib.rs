@@ -20,6 +20,7 @@ pub mod model_alias;
 pub mod model_context_policy;
 pub mod paths;
 pub mod presets;
+pub mod qoder_catalog;
 pub mod raw_io;
 pub mod reasoning_effort_policy;
 pub mod reasoning_tiers;

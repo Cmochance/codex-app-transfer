@@ -122,6 +122,40 @@ static SINGLE_MAX: ReasoningTierSpec = ReasoningTierSpec {
     on_tier_wire: None,
 };
 
+// ── QoderWork(阿里 Qoder,Cosy 签名 / remoteChatAsk 通道)专用档位 ──────────────────
+// QoderWork 模型的思考不走各上游原生 wire,统一经 remoteChatAsk `parameters.reasoning_effort`
+// (`qoder_auth::body::build_parameters` 透传客户端 chat body 的 `reasoning_effort`)。故这里
+// **不用** GLM/DeepSeek 那套 provider 特化 disable_wire(build_remote_chat_ask 只透传
+// reasoning_effort,那些顶级 thinking 字段会被丢弃);on-tier 用 `HighMax` 写 reasoning_effort,
+// disable_wire=None(「none」档 = 不写 reasoning_effort → QoderWork 用模型默认;真·硬关思考需
+// remoteChatAsk 侧补 QoderWork disable 字段,留 followup)。档位取自 QoderWork server model-list
+// 的 `thinking_config`(main.log,MOC-297)。
+
+/// QoderWork 二元思考模型(auto / Qwen3.7-Max·Plus / Qwen3.6-Flash / Kimi-K2.7):`none` + `max`。
+static QODER_BINARY: ReasoningTierSpec = ReasoningTierSpec {
+    levels: &[TIER_NONE, TIER_MAX],
+    default_level: Some("max"),
+    disable_wire: None,
+    on_tier_wire: None,
+};
+
+/// QoderWork 三档 effort 模型(DeepSeek-V4-Pro/Flash / GLM-5.2,`thinking_config.efforts=[high,max]`):
+/// `none` + `high` + `max`,深度档经 reasoning_effort 透传(HighMax)。
+static QODER_EFFORT: ReasoningTierSpec = ReasoningTierSpec {
+    levels: &[TIER_NONE, TIER_HIGH, TIER_MAX],
+    default_level: Some("max"),
+    disable_wire: None,
+    on_tier_wire: Some(ReasoningEffortWire::HighMax),
+};
+
+/// QoderWork 非思考模型(MiniMax-M2.7,`is_reasoning=false`):隐藏 picker(空档位)。
+static QODER_NO_THINKING: ReasoningTierSpec = ReasoningTierSpec {
+    levels: &[],
+    default_level: None,
+    disable_wire: None,
+    on_tier_wire: None,
+};
+
 /// model id(自动 trim + lowercase)→ 可选思考档位规格;`None` = 无特殊档位(用 Codex 默认 4 档)。
 pub fn reasoning_tiers_for_model(model: &str) -> Option<&'static ReasoningTierSpec> {
     let m = model.trim().to_ascii_lowercase();
@@ -154,6 +188,12 @@ pub fn reasoning_tiers_for_model(model: &str) -> Option<&'static ReasoningTierSp
         | "mimo-v2.5" | "mimo-v2-pro" | "mimo-v2-flash" | "mimo-v2-omni" => {
             Some(&BINARY_ENABLE_THINKING)
         }
+
+        // QoderWork(阿里 Qoder)原始 model key(gm51model/dmodel/l 等,非人类可读,不撞上面
+        // 显示名分支):思考经 remoteChatAsk reasoning_effort 透传,档位取自 server model-list。
+        "gm51model" | "dmodel" | "dfmodel" => Some(&QODER_EFFORT),
+        "auto" | "qmodel_latest" | "qmodel" | "l" | "kmodel" => Some(&QODER_BINARY),
+        "mmodel" => Some(&QODER_NO_THINKING),
 
         _ => None,
     }
@@ -218,6 +258,9 @@ pub fn all_reasoning_tier_efforts() -> Vec<&'static str> {
         &BINARY_THINKING_TYPE,
         &BINARY_ENABLE_THINKING,
         &SINGLE_MAX,
+        &QODER_BINARY,
+        &QODER_EFFORT,
+        &QODER_NO_THINKING,
     ];
     let mut efforts: Vec<&'static str> = Vec::new();
     for spec in ALL_TIER_SPECS {
