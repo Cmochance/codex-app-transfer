@@ -30,6 +30,7 @@
 //! Wire-level 实现参考 [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI)
 //! (Go, MIT) 的 `internal/auth/gemini/` 与 `internal/runtime/executor/gemini_cli_executor.go`。
 
+pub mod account_pool;
 pub mod antigravity;
 pub mod cloud_code;
 pub mod constants;

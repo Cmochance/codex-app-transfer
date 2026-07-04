@@ -25,6 +25,7 @@
 use std::sync::OnceLock;
 
 pub mod login;
+pub mod pool;
 pub mod token;
 
 pub use login::{
