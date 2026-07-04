@@ -187,7 +187,19 @@ pub async fn run_qoder_login(
         if status.is_success() {
             if let Ok(payload) = serde_json::from_str::<TokenPayload>(&body) {
                 if !payload.token.is_empty() {
-                    return Ok(payload_to_cred(payload, machine_id));
+                    let mut cred = payload_to_cred(payload, machine_id);
+                    // device token 不透明(`dt-` 前缀,非 JWT),`user_id_from_jwt` 恒 None →
+                    // uid 解不出。而账号池按 uid keying,缺 uid 则 `add_account` 直接
+                    // `PoolError::Account("uid")` 失败(多账号池对所有账号不可用)。故出站前
+                    // 走 `GET /userinfo` 补齐 uid(顺带回填 nickname);userinfo 拿不到则登录失败。
+                    if cred.uid.is_none() {
+                        let info = fetch_user_info(http, &cred.personal_token).await?;
+                        cred.uid = Some(info.uid);
+                        if cred.nickname.is_none() {
+                            cred.nickname = info.nickname;
+                        }
+                    }
+                    return Ok(cred);
                 }
             }
             // 2xx 但无 token = 尚未登录完成,继续轮询。

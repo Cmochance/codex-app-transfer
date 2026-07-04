@@ -143,4 +143,12 @@ mod tests {
         assert_eq!(user_id_from_jwt(&token), Some("u-42".to_string()));
         assert_eq!(user_id_from_jwt("nope"), None);
     }
+
+    #[test]
+    fn opaque_device_token_yields_no_jwt_uid() {
+        // QoderWork 的 device token 是不透明串(`dt-` 前缀,单段,非 JWT),`user_id_from_jwt`
+        // 恒 None。这正是 `run_qoder_login` 必须走 `GET /userinfo` 补 uid 的原因:池按 uid
+        // keying,若靠 token 解 uid 会永远失败 → `add_account` 报 `uid` → 多账号池不可用。
+        assert_eq!(user_id_from_jwt("dt-6oAexampleopaquetokenQTwS"), None);
+    }
 }
