@@ -5,7 +5,7 @@
 >
 > 本项目当前**仅对 Kimi For Coding、Xiaomi MiMo(Token Plan)两家供应商完成了端到端真机实际测试**。
 >
-> 其他已内置的 chat-completions 兼容供应商(包括 **DeepSeek、Kimi(月之暗面)、Xiaomi MiMo(Pay for Token)、智谱 GLM、智谱 GLM Coding、GLM（Z.ai）(zai-login)、GLM（BigModel）(bigmodel-login)、阿里云百炼(API Key / Token Plan)、MiniMax、OpenCode Go、WorkBuddy(腾讯 CodeBuddy)**)**未做长期真机回归**,仅停留在单元测试 + 偶发用户反馈层面。
+> 其他已内置的 chat-completions 兼容供应商(包括 **DeepSeek、Kimi(月之暗面)、Xiaomi MiMo(Pay for Token)、智谱 GLM、智谱 GLM Coding、GLM（Z.ai）(zai-login)、GLM（BigModel）(bigmodel-login)、阿里云百炼(API Key / Token Plan)、MiniMax、OpenCode Go、WorkBuddy(腾讯 CodeBuddy)、QoderWork CN(阿里 Qoder;模型选择器显示 Credit 折扣倍率)**)**未做长期真机回归**,仅停留在单元测试 + 偶发用户反馈层面。
 >
 > 如果你愿意**提供其他供应商的 API key 用于测试**,将万分感激!可通过 **QQ:`3216202644`** 或邮箱联系作者,作者保证 **API key 仅用于本项目实际测试**。
 

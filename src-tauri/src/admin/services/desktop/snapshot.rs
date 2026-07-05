@@ -82,13 +82,15 @@ fn provider_is_qoder(provider: &Value) -> bool {
 
 /// QoderWork(authScheme `qoder_oauth`):Codex catalog id = 网关原始 key(gm51model 等),picker
 /// 直接显示会露机器名 → 从 [`qoder_catalog`] 建 `{key: 显示名}` 覆盖(GLM-5.2 / DeepSeek-V4-Pro …)。
+/// [MOC-297] 显示名带 Credit 折扣倍率后缀(`GLM-5.2 · 0.6×`),让 Codex picker 像 QoderWork
+/// 客户端一样展示折扣;`Auto` 等无固定倍率的模型只显示名字(见 `QoderModel::display_name_with_rate`)。
 fn qoder_display_names(provider: &Value) -> Value {
     if !provider_is_qoder(provider) {
         return Value::Null;
     }
     let mut map = serde_json::Map::new();
     for m in codex_app_transfer_registry::qoder_catalog::QODER_MODELS {
-        map.insert(m.key.to_string(), Value::String(m.display_name.to_string()));
+        map.insert(m.key.to_string(), Value::String(m.display_name_with_rate()));
     }
     Value::Object(map)
 }
@@ -914,6 +916,30 @@ mod tests {
         {
             let _ = writeln!(f, "{}", payload);
         }
+    }
+
+    #[test]
+    fn qoder_provider_target_display_names_carry_credit_rate() {
+        // [MOC-297] 真实 QoderWork provider(authScheme=qoder_oauth,apiFormat=openai_chat)经
+        // desktop_config_target_for_provider 后,model_display_names 带 Credit 倍率后缀,供 Codex
+        // picker 显折扣(GLM-5.2 · 0.6×);Auto 无固定倍率只显示名字;非 qoder 走 antigravity/Null。
+        let mut cfg = config_with_secret();
+        let provider = json!({
+            "id": "qoder-cn",
+            "name": "QoderWork CN",
+            "baseUrl": "https://gateway.qoder.com.cn",
+            "authScheme": "qoder_oauth",
+            "apiFormat": "openai_chat",
+            "models": {"default": "auto", "gpt_5_5": "gm51model"},
+        });
+        let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+        let names = &target.model_display_names;
+        assert_eq!(names["gm51model"], "GLM-5.2 · 0.6×");
+        assert_eq!(names["qmodel"], "Qwen3.7-Plus · 0.1×");
+        assert_eq!(names["mmodel"], "MiniMax-M2.7 · 0.2×");
+        assert_eq!(names["auto"], "Auto"); // 无倍率 → 只名字
+        assert_eq!(names.as_object().unwrap().len(), 9);
+        assert!(target.is_qoder, "qoder provider 应置 is_qoder");
     }
 
     #[test]
