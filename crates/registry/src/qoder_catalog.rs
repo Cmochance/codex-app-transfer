@@ -33,12 +33,9 @@ pub struct QoderModel {
 
 impl QoderModel {
     /// Codex picker 的显示名:有倍率 → `"GLM-5.2 · 0.6×"`,无 → `"Auto"`。
-    /// 中点 ` · ` 分隔,倍率后缀全角乘号 `×`。
+    /// 渲染走通用 [`crate::provider_credit_rate::display_name_with_rate`](与 WorkBuddy 同口径)。
     pub fn display_name_with_rate(&self) -> String {
-        match self.credit_rate {
-            Some(rate) => format!("{} · {rate}×", self.display_name),
-            None => self.display_name.to_owned(),
-        }
+        crate::provider_credit_rate::display_name_with_rate(self.display_name, self.credit_rate)
     }
 }
 

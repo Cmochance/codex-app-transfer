@@ -95,12 +95,47 @@ fn qoder_display_names(provider: &Value) -> Value {
     Value::Object(map)
 }
 
-/// 按 provider 选 Codex catalog 的 `display_name` 覆盖表:qoder(按 authScheme)优先,否则
-/// antigravity(按 apiFormat);都不命中返 `Null`(catalog 用模型 id 本身)。
+/// provider 是否为 WorkBuddy(腾讯 CodeBuddy)。两条 preset 识别方式不同:
+/// - `workbuddy-login`:authScheme=`workbuddy_oauth` → 按 authScheme 认;
+/// - `workbuddy`(API key):authScheme=`bearer`(与普通 OpenAI 共用,authScheme 认不出)→ 按
+///   baseUrl host `copilot.tencent.com` 认(WorkBuddy 网关 host 唯一)。
+fn provider_is_workbuddy(provider: &Value) -> bool {
+    let auth = provider
+        .get("authScheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if codex_app_transfer_registry::is_workbuddy_auth_scheme(auth) {
+        return true;
+    }
+    provider
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .and_then(|u| reqwest::Url::parse(u.trim()).ok())
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .is_some_and(|h| h == "copilot.tencent.com")
+}
+
+/// WorkBuddy:Codex catalog id = 网关 model id(`glm-5.2` 等),picker 直接显示露原始 id 且无
+/// 倍率 → 从 [`workbuddy_catalog`] 建 `{key: "显示名 · 倍率×"}` 覆盖(`GLM-5.2 · 0.79×` …)。
+/// [MOC-289] 纯展示:只改 picker 显示名,不动路由 / reasoning / context。
+fn workbuddy_display_names(provider: &Value) -> Value {
+    if !provider_is_workbuddy(provider) {
+        return Value::Null;
+    }
+    codex_app_transfer_registry::workbuddy_catalog_display_names()
+}
+
+/// 按 provider 选 Codex catalog 的 `display_name` 覆盖表:qoder(authScheme)→ WorkBuddy
+/// (authScheme / host)→ antigravity(apiFormat);三者互斥,都不命中返 `Null`(catalog 用
+/// 模型 id 本身)。
 fn model_display_names_for_provider(provider: &Value, api_format_lower: &str) -> Value {
     let qoder = qoder_display_names(provider);
     if !qoder.is_null() {
         return qoder;
+    }
+    let workbuddy = workbuddy_display_names(provider);
+    if !workbuddy.is_null() {
+        return workbuddy;
     }
     antigravity_display_names(api_format_lower)
 }
@@ -940,6 +975,57 @@ mod tests {
         assert_eq!(names["auto"], "Auto"); // 无倍率 → 只名字
         assert_eq!(names.as_object().unwrap().len(), 9);
         assert!(target.is_qoder, "qoder provider 应置 is_qoder");
+    }
+
+    #[test]
+    fn workbuddy_provider_target_display_names_carry_credit_rate() {
+        // [MOC-289] WorkBuddy 两条 preset 都要认出:
+        // ① account-login(authScheme=workbuddy_oauth);② API-key(authScheme=bearer,靠 host
+        // copilot.tencent.com)。model_display_names 带 Credit 倍率(GLM-5.2 · 0.79×);Auto 无倍率。
+        let check = |provider: Value, label: &str| {
+            let mut cfg = config_with_secret();
+            let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+            let names = &target.model_display_names;
+            assert_eq!(names["glm-5.2"], "GLM-5.2 · 0.79×", "{label}");
+            assert_eq!(
+                names["deepseek-v4-pro"], "Deepseek-V4-Pro · 0.16×",
+                "{label}"
+            );
+            assert_eq!(names["hy3-preview"], "Hy3 preview · 0.04×", "{label}");
+            assert_eq!(names["auto"], "Auto", "{label}"); // 无倍率 → 只名字
+            assert_eq!(names.as_object().unwrap().len(), 10, "{label}");
+        };
+        // ① 账号登录路(authScheme)
+        check(
+            json!({
+                "id": "wb-login", "name": "WorkBuddy（Login）",
+                "baseUrl": "https://copilot.tencent.com/v2",
+                "authScheme": "workbuddy_oauth", "apiFormat": "openai_chat",
+                "models": {"default": "deepseek-v4-pro"},
+            }),
+            "workbuddy-login",
+        );
+        // ② API-key 路(authScheme=bearer → 靠 host copilot.tencent.com 认)
+        check(
+            json!({
+                "id": "wb-apikey", "name": "WorkBuddy（APIKEY）",
+                "baseUrl": "https://copilot.tencent.com/v2",
+                "authScheme": "bearer", "apiFormat": "openai_chat",
+                "models": {"default": "deepseek-v4-pro"},
+            }),
+            "workbuddy-apikey",
+        );
+
+        // 普通 bearer OpenAI(非 copilot host)→ 不认 WorkBuddy(Null,零回归)
+        let mut cfg = config_with_secret();
+        let plain = json!({
+            "id": "plain", "name": "Plain OpenAI",
+            "baseUrl": "https://api.example.com/v1",
+            "authScheme": "bearer", "apiFormat": "openai_chat",
+            "models": {"default": "gpt-4o"},
+        });
+        let t = desktop_config_target_for_provider(&mut cfg, &plain, Some(19090));
+        assert!(t.model_display_names.get("glm-5.2").is_none());
     }
 
     #[test]

@@ -20,11 +20,13 @@ pub mod model_alias;
 pub mod model_context_policy;
 pub mod paths;
 pub mod presets;
+pub mod provider_credit_rate;
 pub mod qoder_catalog;
 pub mod raw_io;
 pub mod reasoning_effort_policy;
 pub mod reasoning_tiers;
 pub mod schema;
+pub mod workbuddy_catalog;
 
 pub use base_instructions::CAS_BASE_INSTRUCTIONS;
 pub use compact_thinking_policy::{
@@ -48,6 +50,7 @@ pub use paths::{
     HOME_OVERRIDE_ENV,
 };
 pub use presets::builtin_presets;
+pub use provider_credit_rate::display_name_with_rate;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
 pub use reasoning_effort_policy::{
     apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
@@ -57,3 +60,6 @@ pub use reasoning_tiers::{
     reasoning_tiers_for_qoder_model, ReasoningTier, ReasoningTierSpec,
 };
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};
+pub use workbuddy_catalog::{
+    is_workbuddy_auth_scheme, workbuddy_catalog_display_names, WorkbuddyModel, WORKBUDDY_MODELS,
+};
