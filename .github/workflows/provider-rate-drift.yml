@@ -1,0 +1,76 @@
+name: provider-rate-drift
+
+# 检测各 provider 客户端的 Credit 折扣倍率 / 模型列表是否与 registry 目录漂移。
+# - QoderWork:拉官方 docs.qoder.com/zh/cli/model.md「前沿模型 Credit 消耗倍率」表,与
+#   `qoder_catalog` 的 credit_rate 对比;有真实漂移(倍率变化/上游新增/我们多余)→ 开 issue。
+# - WorkBuddy:倍率在客户端下发 product 配置(需 auth,无公开源),仅在报告里列当前值供手动核对。
+# 非阻塞设计:只定时 + 手动跑,不挂 PR;有漂移开/更新一条 tracking issue,不 fail 无关流程。
+# 数据源/机制详见 .github/scripts/check_provider_rate_drift.py。
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # 每周一 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: provider-rate-drift
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dump registry rate catalogs → JSON
+        run: cargo run -q -p codex-app-transfer-registry --example dump_provider_rates > rates.json
+
+      - name: Check rate drift vs upstream
+        id: check
+        continue-on-error: true # 脚本 drift→exit 1;continue 让 summary/issue 步骤照跑
+        run: python3 .github/scripts/check_provider_rate_drift.py rates.json
+
+      - name: Job summary
+        if: always()
+        run: cat rate_drift_report.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open / update drift tracking issue
+        # **只要 check 步非零退出都开 issue**:脚本 exit 1 覆盖「倍率漂移 / 检测器失效」,而
+        # `outcome == 'failure'` 还额外覆盖脚本在写 outputs 前**崩溃**(bad rates.json / catalog
+        # 结构异常 / Python 运行时错误)的情况 —— continue-on-error 让 job 保持绿但 outcome 暴露真实
+        # 结果,不能让崩溃在 outputs 为空时被静默跳过、检测器无声死掉(P2 review)。
+        if: steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create provider-rate-drift --color FBCA04 \
+            --description "Provider Credit 倍率 / 模型列表漂移" 2>/dev/null || true
+          if [ "${{ steps.check.outputs.check_error }}" = "true" ]; then
+            title="Provider 倍率检测器失效(docs 拉取/解析失败)($(date -u +%Y-%m-%d))"
+          elif [ "${{ steps.check.outputs.drift }}" = "true" ]; then
+            title="Provider Credit 倍率漂移检测($(date -u +%Y-%m-%d))"
+          else
+            title="Provider 倍率检测脚本崩溃(需排查)($(date -u +%Y-%m-%d))"
+          fi
+          # 崩溃时 outputs 空、报告文件可能没写出 → 兜底 body 指向 run 日志。
+          if [ ! -s rate_drift_report.md ]; then
+            printf '检测脚本在写出报告前异常退出(rates.json 损坏 / catalog 结构异常 / Python 运行时错误)。\n\n见 workflow run 日志:%s/%s/actions/runs/%s\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" > rate_drift_report.md
+          fi
+          existing="$(gh issue list --label provider-rate-drift --state open \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "更新已有 issue #$existing"
+            gh issue comment "$existing" --body-file rate_drift_report.md
+          else
+            echo "新建 issue"
+            gh issue create --title "$title" --label provider-rate-drift \
+              --body-file rate_drift_report.md
+          fi
