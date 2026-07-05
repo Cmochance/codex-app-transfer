@@ -107,3 +107,4 @@ img/codex-theme/
 # Code graph: generated site output + local preview/test artifacts
 _site/
 .playwright-mcp/
+rate_drift_report.md
