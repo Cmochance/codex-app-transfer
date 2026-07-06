@@ -438,10 +438,35 @@ pub async fn forward_handler(
     State(state): State<ProxyState>,
     req: Request,
 ) -> Result<Response, ForwardError> {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
 
     // 1. 收齐入站 body
     let mut body_bytes: Bytes = axum::body::to_bytes(body, usize::MAX).await?;
+
+    // 1b. [入站解压] Codex 对大请求体用 `content-encoding: zstd`(偶尔 gzip)压缩。body 已完整
+    // buffer,后续 resolver 要 parse model 做映射、adapter 要读 body、透传要发上游 —— 压缩字节
+    // 会让 ① resolver 解析不出 model(模型映射静默失效)② 不支持该 encoding 的上游(grok
+    // cli-chat-proxy 只认不压缩)把压缩字节当非 JSON 拒(400)。故这里按 content-encoding 解压
+    // 成明文 JSON,并从 `parts.headers` 剥掉 content-encoding(body 已 buffer,reqwest 出站
+    // 重算 content-length;剥了头上游才不会再对明文 body 尝试解压)。解压失败 / 未知编码
+    // (identity/br 等)→ 保留原 body + 原头,退化为原透传行为(零回归)。
+    if let Some(encoding) = parts
+        .headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        if let Some(decoded) = decode_request_body(&encoding, &body_bytes) {
+            tracing::debug!(
+                encoding = %encoding,
+                from = body_bytes.len(),
+                to = decoded.len(),
+                "入站请求体已解压(明文转发,剥 content-encoding)"
+            );
+            body_bytes = decoded;
+            parts.headers.remove(http::header::CONTENT_ENCODING);
+        }
+    }
     // [MOC-89 forward-trace] 默认关:仅 CAS_DIAG_TRACE=1 时才克隆一份 Codex 原始请求体
     // (rewrite/strip 前),供全过程 trace。关时不 clone、零额外开销。
     let trace_inbound_raw: Option<Bytes> = forward_trace_enabled().then(|| body_bytes.clone());
@@ -2535,6 +2560,34 @@ fn body_model(body: &[u8]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// 按 HTTP `content-encoding` 把入站请求体解压成明文。支持 `zstd`(Codex 大请求默认)+
+/// `gzip` + `deflate`(zlib)。未知编码(`identity` / `br` 等)或解压失败 → 返 `None`,
+/// caller 保留原 body + 原 content-encoding 头透传(零回归)。仅解压、不重压;body 已完整
+/// buffer,故用同步 decode(非流式)。
+fn decode_request_body(encoding: &str, body: &Bytes) -> Option<Bytes> {
+    use std::io::Read;
+    match encoding {
+        "zstd" => zstd::stream::decode_all(std::io::Cursor::new(body.as_ref()))
+            .ok()
+            .map(Bytes::from),
+        "gzip" | "x-gzip" => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(std::io::Cursor::new(body.as_ref()))
+                .read_to_end(&mut out)
+                .ok()?;
+            Some(Bytes::from(out))
+        }
+        "deflate" => {
+            let mut out = Vec::new();
+            flate2::read::ZlibDecoder::new(std::io::Cursor::new(body.as_ref()))
+                .read_to_end(&mut out)
+                .ok()?;
+            Some(Bytes::from(out))
+        }
+        _ => None,
+    }
+}
+
 /// 把 [`codex_app_transfer_gemini_oauth::ServiceError`] 分类成 [`ForwardError::
 /// OauthUnavailable`] 的 `needs_login` flag。逻辑提出独立 fn 方便单测覆盖每条
 /// case 的 routing(2026-05-11 review 反馈)。
@@ -3423,6 +3476,42 @@ mod tests {
     fn rewrite_returns_none_for_non_json() {
         let body = Bytes::from_static(b"not json");
         assert!(rewrite_model_field(&body, "x").is_none());
+    }
+
+    #[test]
+    fn decode_request_body_zstd_gzip_roundtrip_and_passthrough() {
+        // Codex 大请求体用 zstd 压缩;解压后必须还原明文 JSON,否则 resolver 解析不出 model
+        // (映射失效)+ 不支持 zstd 的上游(grok cli-chat-proxy)把压缩字节当非 JSON 拒(MOC-299)。
+        use std::io::Write;
+        let json: &[u8] = br#"{"model":"gpt-5.5","input":[],"stream":true}"#;
+
+        // zstd 往返
+        let z = zstd::stream::encode_all(std::io::Cursor::new(json), 3).unwrap();
+        assert_ne!(z.as_slice(), json, "确是压缩过的");
+        assert_eq!(
+            decode_request_body("zstd", &Bytes::from(z)).as_deref(),
+            Some(json),
+            "zstd 解压必须还原明文"
+        );
+
+        // gzip 往返
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(json).unwrap();
+        let g = enc.finish().unwrap();
+        assert_eq!(
+            decode_request_body("gzip", &Bytes::from(g)).as_deref(),
+            Some(json),
+            "gzip 解压必须还原明文"
+        );
+
+        // 未知编码 / 损坏字节 → None(caller 保留原 body 透传,零回归)
+        assert!(decode_request_body("br", &Bytes::from_static(json)).is_none());
+        assert!(decode_request_body("identity", &Bytes::from_static(json)).is_none());
+        assert!(decode_request_body("", &Bytes::from_static(json)).is_none());
+        assert!(
+            decode_request_body("zstd", &Bytes::from_static(b"not-actually-zstd")).is_none(),
+            "损坏 zstd 字节解压失败应返 None、不 panic"
+        );
     }
 
     #[test]
