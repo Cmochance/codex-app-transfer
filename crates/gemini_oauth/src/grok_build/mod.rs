@@ -529,6 +529,42 @@ mod tests {
     }
 
     #[test]
+    fn client_headers_include_identity_and_model_override() {
+        let hs = client_headers("grok-build");
+        let map: std::collections::HashMap<&str, String> =
+            hs.iter().map(|(k, v)| (*k, v.clone())).collect();
+        // x-grok-model-override = 传入的上游模型(MOC-299:防上游选错模型)。
+        assert_eq!(
+            map.get("x-grok-model-override").map(String::as_str),
+            Some("grok-build")
+        );
+        // 固定身份指纹(避免服务端风控判定为非官方客户端)。
+        assert_eq!(
+            map.get("user-agent").map(String::as_str),
+            Some("grok-shell/0.2.87 (macos; aarch64)")
+        );
+        assert_eq!(
+            map.get("x-xai-token-auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            map.get("x-grok-client-identifier").map(String::as_str),
+            Some("grok-shell")
+        );
+        // 会话/请求标识存在。
+        assert!(map.contains_key("x-grok-req-id"));
+        assert!(map.contains_key("x-grok-session-id"));
+        assert!(map.contains_key("x-grok-agent-id"));
+        // strip 名集必须覆盖所有注入头(否则入站同名会 append 成双值)。
+        for (name, _) in &hs {
+            assert!(
+                is_grok_build_owned_header(name),
+                "{name} 被 client_headers 注入但未被 is_grok_build_owned_header 认为 owned"
+            );
+        }
+    }
+
+    #[test]
     fn device_auth_response_parses_minimal() {
         let json = r#"{"device_code":"dc","user_code":"ABCD-1234","verification_uri":"https://x.ai/device","expires_in":600}"#;
         let d: DeviceAuthResponse = serde_json::from_str(json).unwrap();
