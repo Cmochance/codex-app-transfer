@@ -747,6 +747,43 @@ mod tests {
     }
 
     #[test]
+    fn grok_build_scheme_parses_and_maps_codex_models_and_pins_upstream() {
+        // MOC-299 核心回归:grok-build preset(models.default=grok-build)必须把 Codex 发的
+        // gpt-5.x 模型名映射成 grok-build,**不透传 gpt 名到上游**(否则 cli-chat-proxy 400);
+        // 且 authScheme=grok_build_oauth 解析正确、upstream_base 钉死官方 host。
+        assert_eq!(
+            AuthScheme::parse("grok_build_oauth"),
+            AuthScheme::GrokBuildOauth
+        );
+        assert_eq!(AuthScheme::parse("grok-build"), AuthScheme::GrokBuildOauth);
+
+        let mut gb = provider("grok-build", "https://cli-chat-proxy.grok.com/v1", "");
+        gb.auth_scheme = "grok_build_oauth".into();
+        gb.api_format = "responses".into();
+        gb.models.clear();
+        gb.models.insert("default".into(), "grok-build".into());
+
+        let r = StaticResolver::new(None, vec![gb], Some("grok-build".into()));
+        let p = parts_with(&[]);
+        // Codex 实际会发的 slot 模型名(见 model_alias::MODEL_SLOTS),均未在 grok models 里
+        // 显式映射 → fallback default = grok-build。
+        for codex_model in ["gpt-5.3-codex", "gpt-5.5", "gpt-5.2", "gpt-5.4-mini"] {
+            let body = format!(r#"{{"model":"{codex_model}"}}"#);
+            let res = r.resolve(&p, body.as_bytes()).unwrap();
+            assert_eq!(
+                res.rewritten_model.as_deref(),
+                Some("grok-build"),
+                "{codex_model} 必须映射为 grok-build,不透传 gpt 名到上游"
+            );
+            assert_eq!(res.auth_scheme, AuthScheme::GrokBuildOauth);
+            assert_eq!(
+                res.upstream_base, "https://cli-chat-proxy.grok.com/v1",
+                "upstream_base 必须钉死官方 host,不随 user baseUrl 漂移"
+            );
+        }
+    }
+
+    #[test]
     fn slash_route_strips_internal_suffix() {
         let r = StaticResolver::new(
             None,
