@@ -35,6 +35,7 @@ pub mod antigravity;
 pub mod cloud_code;
 pub mod constants;
 pub mod flow;
+pub mod grok_build;
 pub mod qoder;
 pub mod service;
 pub mod token;
@@ -78,4 +79,11 @@ pub use trae::{
     claim_pending_for_provider, ensure_valid_trae_token, run_trae_login, DeviceFingerprint,
     DeviceKeyPair, TraeCredential, TraeCredentialStore, TraeEdition, TraeError, TraePendingStore,
     TraeProviderConfig,
+};
+
+// grok build(xAI grok CLI 编码后端账号登录)provider re-exports(parallel module,
+// 标准 OAuth2 device flow(RFC 8628)+ bearer token 单账号 store + 自动 refresh)
+pub use grok_build::{
+    ensure_valid_grok_build_token, poll_for_token, resolve_client_id, start_device_authorization,
+    DeviceAuthResponse, GrokBuildCredential, GrokBuildCredentialStore, GrokBuildError,
 };

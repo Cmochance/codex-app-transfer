@@ -77,6 +77,13 @@ pub enum AuthScheme {
     /// `gemini_oauth::qoder` 多账号池持久化 + 请求时 refresh。签名/加密/整份出站
     /// url+header+body 在 `forward.rs` 的 build_and_send_upstream QoderCosy 分支产出。
     QoderCosy,
+    /// grok build(xAI grok CLI 编码后端)账号登录。access token 不在 `provider.api_key`,
+    /// 由 `gemini_oauth::grok_build::GrokBuildCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/grok-build-oauth.json`)+ 请求时 `ensure_valid_grok_build_token`
+    /// load + **自动 refresh**(`accounts.x.ai/oauth2/token`,grant_type=refresh_token)。打
+    /// `cli-chat-proxy.grok.com/v1/responses` 的 OpenAI Responses wire(passthrough),
+    /// forward.rs 注 `Authorization: Bearer <access_token>` + 完整 grok-shell 客户端指纹头。
+    GrokBuildOauth,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -100,6 +107,7 @@ impl AuthScheme {
             "bigmodel_oauth" | "bigmodel" => AuthScheme::ZaiOauth(ZaiProvider::BigModel),
             "workbuddy_oauth" | "workbuddy_login" => AuthScheme::WorkbuddyOauth,
             "qoder_oauth" | "qoder" | "qoder_cosy" => AuthScheme::QoderCosy,
+            "grok_build_oauth" | "grok_build" | "grokbuild" => AuthScheme::GrokBuildOauth,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -331,6 +339,10 @@ impl ProviderResolver for StaticResolver {
             // 外泄到非官方 host(codex review P2)。
             AuthScheme::WorkbuddyOauth => "https://copilot.tencent.com/v2".to_string(),
             AuthScheme::QoderCosy => "https://gateway.qoder.com.cn".to_string(),
+            // grok build:access token scoped 给 cli-chat-proxy.grok.com,pin 官方端点防
+            // user 把 authScheme=grok_build_oauth 配到任意 baseUrl 致账号 token 外泄到非官方
+            // host(同 WorkBuddy/Qoder 先例)。preset baseUrl 已带 /v1,pin 与之一致。
+            AuthScheme::GrokBuildOauth => "https://cli-chat-proxy.grok.com/v1".to_string(),
             _ => provider.base_url.clone(),
         };
 

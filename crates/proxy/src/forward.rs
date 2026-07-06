@@ -1881,6 +1881,15 @@ async fn build_and_send_upstream(
             workbuddy_account = Some((acct.uid, acct.device_id));
             Some(acct.token)
         }
+        crate::resolver::AuthScheme::GrokBuildOauth => {
+            // grok build:access token 在 ~/.codex-app-transfer/grok-build-oauth.json,
+            // 单账号 load + 临期自动 refresh(accounts.x.ai/oauth2/token);文件不存在 = 未登录
+            // → needs_login。返回的 token 由下方 inject_auth 注 `Authorization: Bearer`。
+            let token = codex_app_transfer_gemini_oauth::ensure_valid_grok_build_token(&state.http)
+                .await
+                .map_err(classify_grok_build_service_error)?;
+            Some(token.access_token)
+        }
         _ => None,
     };
 
@@ -1901,6 +1910,10 @@ async fn build_and_send_upstream(
     // + 每请求 X-Conversation-*),并 strip 入站 Codex 同名头防 append 双值。
     let injects_workbuddy_headers =
         injects_workbuddy_source_headers(&resolved.auth_scheme, &resolved.provider.base_url);
+    // grok build(cli-chat-proxy.grok.com/v1/responses):注入 grok-shell 客户端指纹头
+    // (UA / x-xai-token-auth / x-grok-client-* / x-grok-model-override / 会话·请求标识)。
+    // base 由 resolver 钉死官方 host,判定只看 auth_scheme。
+    let injects_grok_build_headers = matches!(resolved.auth_scheme, AuthScheme::GrokBuildOauth);
     for (name, value) in inbound_headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
             continue;
@@ -1924,6 +1937,15 @@ async fn build_and_send_upstream(
         // strip 入站同名防 reqwest header() append 双值(User-Agent 已全局 strip)。
         if injects_workbuddy_headers
             && codex_app_transfer_gemini_oauth::workbuddy::is_workbuddy_owned_header(name.as_str())
+        {
+            continue;
+        }
+        // grok build 指纹头(user-agent / x-xai-* / x-grok-*)由下方独占注入;strip 入站
+        // 同名防 reqwest header() append 双值(Codex 一般不发这些头,防御性,含 UA 一致处理)。
+        if injects_grok_build_headers
+            && codex_app_transfer_gemini_oauth::grok_build::is_grok_build_owned_header(
+                name.as_str(),
+            )
         {
             continue;
         }
@@ -2089,6 +2111,23 @@ async fn build_and_send_upstream(
             .map(|(_, dev)| dev.clone())
             .unwrap_or_else(codex_app_transfer_gemini_oauth::workbuddy::workbuddy_device_id);
         up = up.header("X-Device-Id", device_id);
+    }
+    // grok build 客户端指纹注入 —— cli-chat-proxy.grok.com/v1/responses 的 grok-shell 身份头。
+    // x-grok-model-override 用 rewrite 后的真实上游模型;user 直接 -m 真实 grok 模型名
+    // (rewritten_model=None)时从请求体 model 取,避免发空 override(与 workbuddy X-Model-ID
+    // 同处置)。Authorization: Bearer 已由 inject_auth 注,入站同名头已在上方 strip。
+    if injects_grok_build_headers {
+        let body_model = serde_json::from_slice::<serde_json::Value>(&plan_body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
+        let model_id = resolved
+            .rewritten_model
+            .as_deref()
+            .or(body_model.as_deref())
+            .unwrap_or_default();
+        for (name, value) in codex_app_transfer_gemini_oauth::grok_build::client_headers(model_id) {
+            up = up.header(name, value);
+        }
     }
     let req = up.build()?;
     let outbound_headers_snapshot = req.headers().clone();
@@ -2548,6 +2587,25 @@ fn classify_workbuddy_service_error(
     }
 }
 
+/// grok build 账号登录 service 错 → ForwardError。needs_login:未登录 / OAuth 业务拒
+/// (invalid_grant 等 refresh_token 失效)/ 凭证文件损坏 → 需重登;HTTP / 5xx / 超时 /
+/// 解析 = 瞬时(ensure_valid 内部已把瞬时刷新错吞掉沿用旧凭证,故到此的多是终态)。
+fn classify_grok_build_service_error(
+    e: codex_app_transfer_gemini_oauth::grok_build::GrokBuildError,
+) -> ForwardError {
+    use codex_app_transfer_gemini_oauth::grok_build::{
+        GrokBuildError as GErr, GrokBuildTokenError,
+    };
+    let needs_login = matches!(
+        &e,
+        GErr::NotLoggedIn | GErr::OAuth { .. } | GErr::Token(GrokBuildTokenError::Serde(_))
+    );
+    ForwardError::OauthUnavailable {
+        reason: e.to_string(),
+        needs_login,
+    }
+}
+
 fn inject_auth(
     mut req: reqwest::RequestBuilder,
     resolved: &ResolvedProvider,
@@ -2566,7 +2624,8 @@ fn inject_auth(
         AuthScheme::GoogleOauthCloudCode
         | AuthScheme::GoogleOauthAntigravity
         | AuthScheme::ZaiOauth(_)
-        | AuthScheme::WorkbuddyOauth => {
+        | AuthScheme::WorkbuddyOauth
+        | AuthScheme::GrokBuildOauth => {
             // 调用方在 build_and_send_upstream 入口处已 await 过 OAuth token,
             // 这里单纯 Bearer 注入。Google 两个 scheme 共用 cloudcode-pa,zai 用换出的
             // 组织 key(ZCode model 调用对 plan provider 也是 `Authorization: Bearer`)→
