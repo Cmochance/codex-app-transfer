@@ -8,7 +8,15 @@
 // login 为长阻塞:POST 后端开系统浏览器授权,直到回调完成/取消才返回。
 import { api } from './http'
 
-export type OAuthKind = 'zai' | 'bigmodel' | 'gemini' | 'antigravity' | 'trae' | 'workbuddy' | 'qoder'
+export type OAuthKind =
+  | 'zai'
+  | 'bigmodel'
+  | 'gemini'
+  | 'antigravity'
+  | 'trae'
+  | 'workbuddy'
+  | 'qoder'
+  | 'grokBuild'
 
 export interface OAuthStatus {
   loggedIn: boolean
@@ -27,6 +35,9 @@ function endpoint(kind: OAuthKind, providerId?: string): { base: string; query: 
       return { base: '/api/gemini-oauth', query: '' }
     case 'antigravity':
       return { base: '/api/antigravity-oauth', query: '' }
+    case 'grokBuild':
+      // grok build 单账号(非池,不分 providerId),同 gemini/antigravity。
+      return { base: '/api/grok-build-oauth', query: '' }
     case 'qoder':
       return {
         base: '/api/qoder-oauth',
