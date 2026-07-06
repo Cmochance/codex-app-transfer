@@ -20,6 +20,7 @@ pub mod desktop;
 pub mod diagnostic;
 pub mod feedback;
 pub mod gemini_oauth;
+pub mod grok_build_oauth;
 pub mod marketplace_connectors;
 pub mod mcp;
 pub mod memories_md;

@@ -84,6 +84,7 @@ pub use trae::{
 // grok build(xAI grok CLI 编码后端账号登录)provider re-exports(parallel module,
 // 标准 OAuth2 device flow(RFC 8628)+ bearer token 单账号 store + 自动 refresh)
 pub use grok_build::{
-    ensure_valid_grok_build_token, poll_for_token, resolve_client_id, start_device_authorization,
-    DeviceAuthResponse, GrokBuildCredential, GrokBuildCredentialStore, GrokBuildError,
+    ensure_valid_grok_build_token, logout as grok_build_logout, poll_for_token, resolve_client_id,
+    run_grok_build_login, start_device_authorization, DeviceAuthResponse, GrokBuildCredential,
+    GrokBuildCredentialStore, GrokBuildError,
 };

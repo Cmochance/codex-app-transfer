@@ -322,6 +322,21 @@ pub async fn poll_for_token(
     }
 }
 
+/// 跑完整 device 登录:resolve client_id → `device/code` → 回调交出 `DeviceAuthResponse`
+/// (UI 据 `user_code` + `verification_uri_complete` 引导用户浏览器授权)→ 轮询 token →
+/// 成功**已落盘** [`GrokBuildCredential`] 并返回。与 [`super::qoder::run_qoder_login`] 同形
+/// (callback 交出授权入口,cancel 贯穿全程,返回凭证)。
+pub async fn run_grok_build_login(
+    http: &reqwest::Client,
+    on_device_auth: impl FnOnce(&DeviceAuthResponse),
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<GrokBuildCredential, GrokBuildError> {
+    let client_id = resolve_client_id(http).await;
+    let device = start_device_authorization(http, &client_id).await?;
+    on_device_auth(&device);
+    poll_for_token(http, &client_id, &device, cancel).await
+}
+
 /// 取一个**有效**的 access token:加载凭证,临期 / 已过期则用 refresh_token 续期并落盘,
 /// 返回最新凭证。proxy forward 每请求前调它拿当前 token。
 ///
