@@ -79,6 +79,32 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
         }
     }
 
+    // 3. 剥 grok 的加密 reasoning 缓存(grok 管它叫 "compaction blob")。grok 把上一轮
+    // reasoning 加密成 `encrypted_content` 返回,要求下一轮**原样回灌 + 请求上下文一致**才能
+    // 解密续推。但 transfer 对 grok 请求做了**必需的工具适配**(改了 tools / reasoning),破坏了
+    // 加密绑定 → grok 400 "Could not decode the compaction blob"。故:① 从 `include` 去掉
+    // `reasoning.encrypted_content`(grok 不再生成加密缓存)② 剥掉 input 里 reasoning item 已有的
+    // `encrypted_content`(过渡期回灌的旧 blob)。grok 改从可见 reasoning 文本(summary/content)
+    // 续推 —— 功能等价,仅丢「加密 reasoning 缓存」这一优化(实证 2026-07-07)。
+    if let Some(Value::Array(inc)) = obj.get_mut("include") {
+        let before = inc.len();
+        inc.retain(|x| x.as_str() != Some("reasoning.encrypted_content"));
+        if inc.len() != before {
+            changed = true;
+        }
+    }
+    if let Some(Value::Array(input)) = obj.get_mut("input") {
+        for it in input.iter_mut() {
+            if it.get("type").and_then(Value::as_str) == Some("reasoning") {
+                if let Some(o) = it.as_object_mut() {
+                    if o.remove("encrypted_content").is_some() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     changed
         .then(|| serde_json::to_vec(&v).ok().map(Bytes::from))
         .flatten()
@@ -198,6 +224,55 @@ mod tests {
         // reasoning.effort 剥掉,summary 保留。
         assert!(v["reasoning"].get("effort").is_none(), "effort 应剥");
         assert_eq!(v["reasoning"]["summary"], "auto", "reasoning 其它字段保留");
+    }
+
+    #[test]
+    fn strips_encrypted_reasoning_cache() {
+        // grok 的 encrypted_content(它管叫 compaction blob)与 transfer 改请求不兼容,
+        // 必须从 include 去掉 + 从 input reasoning item 剥掉,否则 grok 400。
+        let body = serde_json::to_vec(&json!({
+            "model": "grok-build",
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": { "summary": "auto" },
+            "input": [
+                { "type": "message", "role": "user", "content": "hi" },
+                { "type": "reasoning", "summary": [], "content": [],
+                  "encrypted_content": "AAAA-opaque-grok-blob-BBBB" },
+                { "type": "function_call", "name": "exec_command", "arguments": "{}", "call_id": "c1" }
+            ]
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        // include 不再含 reasoning.encrypted_content。
+        let inc: Vec<&str> = v["include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert!(
+            !inc.contains(&"reasoning.encrypted_content"),
+            "include 应剥 reasoning.encrypted_content"
+        );
+        // input reasoning item 不再含 encrypted_content,但保留 summary/content(可见 reasoning)。
+        let ritem = v["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["type"] == "reasoning")
+            .unwrap();
+        assert!(
+            ritem.get("encrypted_content").is_none(),
+            "reasoning item 应剥 encrypted_content"
+        );
+        assert!(
+            ritem.get("summary").is_some(),
+            "summary 保留(grok 从可见文本续推)"
+        );
+        // 其它 input item 不动。
+        assert_eq!(v["input"].as_array().unwrap().len(), 3);
     }
 
     #[test]
