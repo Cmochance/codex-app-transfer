@@ -13,7 +13,11 @@
 //!   → 单字符串 function、namespace 摊平、tool_search/image_gen drop),再把它输出的 chat 形
 //!   `{type:function, function:{…}}` **unwrap 回 responses-flat** `{type:function, …}`(grok
 //!   的 function 工具就是 responses-flat);`web_search` 剥成 bare `{type:web_search}`。
-//! - 剥 `reasoning.effort`。
+//! - `reasoning` 归一为 `{"summary": "concise"}`(对齐真实 grok CLI 抓包)。grok 不支持
+//!   `effort`,且靠 `summary` 指令生成 + 跨轮解密**加密 reasoning**(`encrypted_content`);
+//!   Codex 发 `{"effort":...}` 无 summary,若只剥成 `{}`,grok 下一轮回灌 encrypted_content 时
+//!   **解不开**(400 "Could not decode the compaction blob")。encrypted_content **保留原样透传**
+//!   —— grok 原生支持加密 reasoning,是它的能力,不能像 chat 路径那样丢(chat 丢是因上游不支持)。
 //!
 //! 真机实证(2026-07-07):适配后 grok `/responses` 返 200 并正常推理 + 调 function 工具。
 //! model 映射(gpt-5.x → grok-build)由 resolver 负责,不在此。
@@ -72,32 +76,37 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
         }
     }
 
-    // 2. 剥 reasoning.effort(grok-build 不支持;它自己会 reasoning)。
-    if let Some(Value::Object(r)) = obj.get_mut("reasoning") {
-        if r.remove("effort").is_some() {
-            changed = true;
-        }
+    // 2. reasoning 归一成 grok 认的形态。抓包实证(2026-07-07):真实 grok CLI 全程发
+    // `reasoning: {"summary": "concise"}`(**不发 effort**,grok-build supports_reasoning_effort=false)。
+    // grok 靠 `reasoning.summary` 指令生成 + **加密 reasoning(encrypted_content)** 并跨轮解密;
+    // Codex 发的是 `{"effort": "medium"}`(无 summary),若只剥 effort 留 `{}`,grok 缺 summary 指令
+    // → 生成的 encrypted_content 在下一轮回灌时**解不开**(400 "Could not decode the compaction
+    // blob")。故直接对齐真实 CLI:reasoning = {"summary": "concise"}。**保留** input 里的
+    // encrypted_content(grok 原生支持加密 reasoning,是它的能力,不能丢 —— 与 chat 路径「上游
+    // 不支持才丢」不同)。
+    if obj.contains_key("reasoning") {
+        obj.insert("reasoning".into(), json!({ "summary": "concise" }));
+        changed = true;
     }
 
-    // 3. 剥 grok 的加密 reasoning 缓存(grok 管它叫 "compaction blob")。grok 把上一轮
-    // reasoning 加密成 `encrypted_content` 返回,要求下一轮**原样回灌 + 请求上下文一致**才能
-    // 解密续推。但 transfer 对 grok 请求做了**必需的工具适配**(改了 tools / reasoning),破坏了
-    // 加密绑定 → grok 400 "Could not decode the compaction blob"。故:① 从 `include` 去掉
-    // `reasoning.encrypted_content`(grok 不再生成加密缓存)② 剥掉 input 里 reasoning item 已有的
-    // `encrypted_content`(过渡期回灌的旧 blob)。grok 改从可见 reasoning 文本(summary/content)
-    // 续推 —— 功能等价,仅丢「加密 reasoning 缓存」这一优化(实证 2026-07-07)。
-    if let Some(Value::Array(inc)) = obj.get_mut("include") {
-        let before = inc.len();
-        inc.retain(|x| x.as_str() != Some("reasoning.encrypted_content"));
-        if inc.len() != before {
-            changed = true;
-        }
-    }
+    // 3. input 里回灌的 reasoning item:对齐真实 grok CLI 的干净结构。抓包实证 grok 自己回灌的
+    // reasoning item 是 `{type, id, summary, encrypted_content}`;而 Codex 的是 `{type, summary,
+    // content, encrypted_content, internal_chat_message_metadata_passthrough}` —— 多了 `content`
+    // 与 Codex 私有的 `internal_chat_message_metadata_passthrough`。这些额外字段会干扰 grok 对
+    // encrypted_content 的解密(400 "Could not decode the compaction blob")。剥掉它们,**保留
+    // encrypted_content / summary**(grok 需要)。`internal_chat_message_metadata_passthrough` 只从
+    // reasoning item 剥(message item 上 grok 已容忍,不动以免影响别的路径)。
     if let Some(Value::Array(input)) = obj.get_mut("input") {
         for it in input.iter_mut() {
             if it.get("type").and_then(Value::as_str) == Some("reasoning") {
                 if let Some(o) = it.as_object_mut() {
-                    if o.remove("encrypted_content").is_some() {
+                    // content 恒为 null/空(reasoning 文本在 summary 里),grok 结构无此字段。
+                    if o.remove("content").is_some() {
+                        changed = true;
+                    }
+                    if o.remove("internal_chat_message_metadata_passthrough")
+                        .is_some()
+                    {
                         changed = true;
                     }
                 }
@@ -161,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn adapts_tools_and_strips_reasoning_effort() {
+    fn adapts_tools_and_normalizes_reasoning() {
         // Codex 请求:function(保留)+ custom apply_patch(→function)+ namespace(摊平)+
         // web_search(→bare)+ tool_search / image_generation(drop);reasoning.effort(剥)。
         let body = serde_json::to_vec(&json!({
@@ -221,23 +230,28 @@ mod tests {
             ws.get("external_web_access").is_none(),
             "web_search 应剥成 bare"
         );
-        // reasoning.effort 剥掉,summary 保留。
-        assert!(v["reasoning"].get("effort").is_none(), "effort 应剥");
-        assert_eq!(v["reasoning"]["summary"], "auto", "reasoning 其它字段保留");
+        // reasoning 归一为 {summary:concise}(对齐真实 grok CLI,去 effort、去 Codex 的 summary 值)。
+        assert_eq!(
+            v["reasoning"],
+            json!({ "summary": "concise" }),
+            "reasoning 应归一为 {{summary:concise}}"
+        );
     }
 
     #[test]
-    fn strips_encrypted_reasoning_cache() {
-        // grok 的 encrypted_content(它管叫 compaction blob)与 transfer 改请求不兼容,
-        // 必须从 include 去掉 + 从 input reasoning item 剥掉,否则 grok 400。
+    fn keeps_encrypted_reasoning_and_normalizes() {
+        // grok 原生支持加密 reasoning(encrypted_content),**不能丢**(与 chat 路径「上游不支持才丢」
+        // 不同)。适配只归一 reasoning + include 保留;input 里的 encrypted_content 原样透传。
         let body = serde_json::to_vec(&json!({
             "model": "grok-build",
             "include": ["reasoning.encrypted_content"],
-            "reasoning": { "summary": "auto" },
+            "reasoning": { "effort": "medium" },
             "input": [
-                { "type": "message", "role": "user", "content": "hi" },
-                { "type": "reasoning", "summary": [], "content": [],
-                  "encrypted_content": "AAAA-opaque-grok-blob-BBBB" },
+                { "type": "message", "role": "user", "content": "hi",
+                  "internal_chat_message_metadata_passthrough": {"x": 1} },
+                { "type": "reasoning", "summary": [{"type":"summary_text","text":"thinking"}],
+                  "content": [], "encrypted_content": "AAAA-opaque-grok-blob-BBBB",
+                  "internal_chat_message_metadata_passthrough": {"turn": 1} },
                 { "type": "function_call", "name": "exec_command", "arguments": "{}", "call_id": "c1" }
             ]
         }))
@@ -245,39 +259,48 @@ mod tests {
         let out =
             adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
         let v: Value = serde_json::from_slice(&out).unwrap();
-        // include 不再含 reasoning.encrypted_content。
-        let inc: Vec<&str> = v["include"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|x| x.as_str())
-            .collect();
-        assert!(
-            !inc.contains(&"reasoning.encrypted_content"),
-            "include 应剥 reasoning.encrypted_content"
+        // reasoning 归一。
+        assert_eq!(v["reasoning"], json!({ "summary": "concise" }));
+        // include 保留(grok 支持加密 reasoning)。
+        assert_eq!(
+            v["include"],
+            json!(["reasoning.encrypted_content"]),
+            "include 应保留"
         );
-        // input reasoning item 不再含 encrypted_content,但保留 summary/content(可见 reasoning)。
         let ritem = v["input"]
             .as_array()
             .unwrap()
             .iter()
             .find(|it| it["type"] == "reasoning")
             .unwrap();
+        // encrypted_content + summary **保留**(grok 需要它跨轮解密 + 结构)。
+        assert_eq!(
+            ritem["encrypted_content"], "AAAA-opaque-grok-blob-BBBB",
+            "encrypted_content 必须原样保留,不能丢"
+        );
+        assert!(ritem.get("summary").is_some(), "summary 保留");
+        // Codex 私有字段剥掉(对齐 grok 干净结构)。
         assert!(
-            ritem.get("encrypted_content").is_none(),
-            "reasoning item 应剥 encrypted_content"
+            ritem.get("content").is_none(),
+            "reasoning item 的 content 应剥"
         );
         assert!(
-            ritem.get("summary").is_some(),
-            "summary 保留(grok 从可见文本续推)"
+            ritem
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none(),
+            "reasoning item 的 internal_chat_message_metadata_passthrough 应剥"
         );
-        // 其它 input item 不动。
-        assert_eq!(v["input"].as_array().unwrap().len(), 3);
+        // message item 的 internal_metadata 不动(grok 已容忍)。
+        let msg = v["input"].as_array().unwrap()[0].as_object().unwrap();
+        assert!(
+            msg.contains_key("internal_chat_message_metadata_passthrough"),
+            "message item 的 internal_metadata 不动"
+        );
     }
 
     #[test]
     fn returns_none_when_nothing_to_change() {
-        // 无 tools、无 reasoning.effort → 不改(caller 走原 body)。
+        // 无 tools、无 reasoning → 不改(caller 走原 body)。
         let body = serde_json::to_vec(&json!({ "model": "grok-build", "input": [] })).unwrap();
         assert!(adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).is_none());
     }
