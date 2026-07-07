@@ -64,11 +64,22 @@ impl RequestMapper for ResponsesPassthroughMapper {
         &self,
         client_path: &str,
         body: Bytes,
-        _provider: &Provider,
+        provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        // [MOC-299] grok-build:/responses 是真 Responses API 但工具集受限(不认 Codex 的
+        // custom/namespace/tool_search/image_generation)且不支持 reasoning.effort。进 1:1 透传
+        // 前把请求体适配成 grok 接受的形态(工具转换复用 chat 路径决策,见 mapper::grok_build)。
+        // 非 grok-build provider 恒不改,透传语义与 MOC-234 完全一致。其余 provider 仍严格 1:1。
+        let body = if crate::mapper::grok_build::is_grok_build_provider(provider) {
+            crate::mapper::grok_build::adapt_grok_build_request_body(&body, provider)
+                .unwrap_or(body)
+        } else {
+            body
+        };
+
         // [MOC-234] 只读观测整合(gate=breakdown_enabled,默认关零开销):旁路 parse 一份
-        // 副本算 responses 原生 context_breakdown + 喂会话观测镜像,**绝不改 body**。返回的
-        // adapter_metadata 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
+        // 副本算 responses 原生 context_breakdown + 喂会话观测镜像。返回的 adapter_metadata
+        // 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
         let adapter_metadata = build_observe_metadata(client_path, &body);
 
         // 路径 normalize:剥 `/openai` legacy prefix + `/claude/v1/messages` alias +
