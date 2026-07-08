@@ -143,7 +143,7 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         upstream_status: StatusCode,
         upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
-        _provider: &Provider,
+        provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
         // [MOC-299] 本地 compaction:上游是我们发的 stream:false 摘要请求,回来的完整 JSON 在此包成
@@ -203,6 +203,21 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         // 非阻塞入队后原样立即返回,**不改字节、不 await、不解析**;SSE 抽行找 `response.completed`、
         // 把本轮(input+output)记进 always-on 会话观测镜像(供 breakdown 拼全历史 + orphan-400 降级
         // 重建上下文),全在独立 spawned task 异步完成(见 `ObserveTeeStream` doc)。
+        // [MOC-301/304] grok:响应侧 tool-call shim —— 把 grok 回的 `function_call`(name=apply_patch /
+        // tool_search,因请求侧转了 function)重打包回 Codex 认的 `custom_tool_call` / `tool_search_call`。
+        // **仅 grok**;其余 responses passthrough 仍严格 1:1(shim 在 ObserveTee 之前套,让观测镜像看到
+        // Codex 实际收到的转换后流)。cwd 供 apply_patch preflight 路径修复(缺则跳过 cwd-dependent 修复)。
+        let upstream_stream = if crate::mapper::grok_build::is_grok_build_provider(provider) {
+            let cwd = serde_json::from_slice::<Value>(&request_plan.body)
+                .ok()
+                .and_then(|v| crate::responses::apply_patch_preflight::extract_cwd(Some(&v)));
+            Box::pin(crate::responses::grok_tool_shim::GrokShimStream::new(
+                upstream_stream,
+                cwd,
+            )) as ByteStream
+        } else {
+            upstream_stream
+        };
         let stream = Box::pin(ObserveTeeStream::new(
             upstream_stream,
             observe_ctx_from_plan(request_plan),

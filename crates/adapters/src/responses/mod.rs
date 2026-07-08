@@ -16,6 +16,8 @@ pub mod compact;
 // [MOC-231] 上下文 by-source 明细(供 Codex Desktop context 下拉面板)。
 pub mod context_breakdown;
 pub mod converter;
+/// [MOC-301/304] grok passthrough 响应侧 tool-call shim(function_call → custom_tool_call/tool_search_call)。
+pub(crate) mod grok_tool_shim;
 // MOC-168: sessions.db 每条消息内容寻址外置(收文字/tool 侧逐轮快照重复)。
 mod message_store;
 // [MOC-234] responses 1:1 passthrough 的只读会话观测镜像(供 responses 原生 breakdown 拼全历史)。
