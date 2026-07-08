@@ -13,7 +13,7 @@ repository.workspace = true
 # 复刻其 31 个 host import + 内存 marshaling 来驱动。
 # 选 wasmi(纯 Rust 解释器):比 wasmtime(cranelift JIT)轻得多,无系统依赖,对
 # 桌面 app 体积友好;本模块每请求只调数次,解释器性能完全够。
-wasmi = "0.40"
+wasmi = "1.1"
 # getRandomValues host import 的真随机源(RSA/nonce)。workspace 已 transitive 依赖。
 getrandom = "0.2"
 thiserror = "2"
