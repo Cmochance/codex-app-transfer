@@ -70,41 +70,26 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
             return None;
         }
     };
+    // [MOC-304 leg3] tool_search 发现的工具在 input 的 `tool_search_output.tools` 里(**不在**
+    // body.tools[]),注入 tools[] 后 grok 才能真正调用它们(否则模型发现了工具却调不了 → 死循环调
+    // tool_search)。在 mutable borrow 前收集(Responses 形态,下方与原 tools 同款转换 + 去重)。
+    let discovered = crate::responses::request::discovered_tools_from_tool_search_output(&v);
+
     let obj = v.as_object_mut()?;
     let mut changed = false;
 
     // 1. 工具适配。
     if let Some(Value::Array(tools)) = obj.get("tools") {
         let tools = tools.clone();
-        let mut out: Vec<Value> = Vec::with_capacity(tools.len());
+        let mut out: Vec<Value> = Vec::with_capacity(tools.len() + discovered.len());
         for t in &tools {
-            match t.get("type").and_then(Value::as_str).unwrap_or("") {
-                // 已是 grok 兼容的 responses-flat function,原样保留。
-                "function" => out.push(t.clone()),
-                // web_search:grok 认 bare `{type:web_search}`,剥 Codex 的
-                // external_web_access / search_content_types 等子字段。
-                "web_search" | "web_search_preview" => out.push(json!({ "type": "web_search" })),
-                // namespace(MCP 包):复用 chat 路径转换决策(摊平成 function),再 unwrap 回 flat。
-                "namespace" => {
-                    for ct in convert_responses_tool_to_chat_tool(t, Some(provider)) {
-                        out.push(unwrap_chat_tool_to_responses_flat(ct));
-                    }
-                }
-                // custom(apply_patch freeform)/ tool_search:[MOC-301 / MOC-304] 请求侧转 function
-                // (与 namespace 同款 convert + reshape),响应侧由 grok passthrough 的 tool-call shim
-                // 把 grok 回的 `function_call` 重打包回 Codex 的 `custom_tool_call` / `tool_search_call`
-                // (见 `responses.rs::map_response` + `responses::grok_tool_shim`)。
-                // - apply_patch:`{input:string}` schema + chat 友好 V4A 指引(convert 内特判)。
-                // - tool_search:透传 name/desc/params,让 grok 看到 deferred MCP/连接器 server 列表。
-                "custom" | "tool_search" => {
-                    for ct in convert_responses_tool_to_chat_tool(t, Some(provider)) {
-                        out.push(unwrap_chat_tool_to_responses_flat(ct));
-                    }
-                }
-                // image_generation / 未知:grok 无等价 → drop(支持度探索见 MOC-305)。
-                _ => {}
-            }
+            push_grok_adapted_tool(t, provider, &mut out);
         }
+        // [MOC-304 leg3] 把 tool_search 发现的工具同款转换后注入,去重(可能与 namespace 展平重叠)。
+        for t in &discovered {
+            push_grok_adapted_tool(t, provider, &mut out);
+        }
+        dedup_grok_tools_by_name(&mut out);
         let out_empty = out.is_empty();
         if out != tools {
             obj.insert("tools".into(), Value::Array(out));
@@ -154,6 +139,14 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
                     }
                 }
             }
+            // [MOC-301/304 leg3] grok 的 InputItem enum 严格(untagged,未知 variant 直接 422)。
+            // 请求侧把 custom(apply_patch)/ tool_search 转了 function、响应侧 shim 把 grok 的
+            // function_call 重打包回 custom_tool_call / tool_search_call 给 Codex;下一轮 Codex 把这些
+            // Codex 类型的 item 回放进 input,grok 不认 → 必须反向改写回 function_call / function_call_output
+            // (与请求侧 function 化对齐,模型不失忆)。见 rewrite_tool_call_history_item。
+            if rewrite_tool_call_history_item(it) {
+                changed = true;
+            }
         }
     }
 
@@ -175,6 +168,180 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
     changed
         .then(|| serde_json::to_vec(&v).ok().map(Bytes::from))
         .flatten()
+}
+
+/// 把一个 Responses 工具 `t` 适配成 grok 认的形态 push 进 `out`(原 body.tools[] 与 tool_search
+/// 发现的工具共用)。`function` 原样;`web_search` 剥 bare;`namespace` 摊平→function→flat;
+/// `custom`(apply_patch)/ `tool_search` 转 function(convert + reshape);`image_generation`/未知 drop。
+fn push_grok_adapted_tool(t: &Value, provider: &Provider, out: &mut Vec<Value>) {
+    match t.get("type").and_then(Value::as_str).unwrap_or("") {
+        // 已是 grok 兼容的 responses-flat function,原样保留。
+        "function" => out.push(t.clone()),
+        // web_search:grok 认 bare `{type:web_search}`,剥 Codex 的 external_web_access 等子字段。
+        "web_search" | "web_search_preview" => out.push(json!({ "type": "web_search" })),
+        // namespace(MCP 包):复用 chat 路径转换决策(摊平成 function),再 unwrap 回 flat。
+        // custom(apply_patch freeform)/ tool_search:[MOC-301 / MOC-304] 同款请求侧转 function,
+        // 响应侧由 grok passthrough 的 tool-call shim 把 grok 回的 `function_call` 重打包回 Codex 的
+        // `custom_tool_call` / `tool_search_call`(见 `responses.rs::map_response` + `grok_tool_shim`)。
+        // - apply_patch:`{input:string}` schema + chat 友好 V4A 指引(convert 内特判)。
+        // - tool_search:透传 name/desc/params,让 grok 看到 deferred MCP/连接器 server 列表。
+        "namespace" | "custom" | "tool_search" => {
+            for ct in convert_responses_tool_to_chat_tool(t, Some(provider)) {
+                out.push(unwrap_chat_tool_to_responses_flat(ct));
+            }
+        }
+        // image_generation / 未知:grok 无等价 → drop(支持度探索见 MOC-305)。
+        _ => {}
+    }
+}
+
+/// 按 responses-flat function `name` 去重(保留首次出现 —— body.tools[] 在发现工具之前 push,故
+/// builtin/namespace 优先)。空 name / 非 function(web_search)不参与去重,全保留。
+fn dedup_grok_tools_by_name(out: &mut Vec<Value>) {
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|t| {
+        if t.get("type").and_then(Value::as_str) != Some("function") {
+            return true;
+        }
+        let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            return true;
+        }
+        seen.insert(name.to_owned())
+    });
+}
+
+/// [MOC-301/304 leg3] 把 Codex 回放进 input 的、grok 不认的 tool-call item **反向改写**成 grok 认的
+/// `function_call` / `function_call_output`。返回是否改过(非目标 item 原样,返回 false)。
+///
+/// - `custom_tool_call`(apply_patch,`{name, input:"<V4A>", call_id}`)→ `function_call`
+///   (`arguments = "{\"input\":\"<V4A>\"}"`,与请求侧 `convert_responses_tool_to_chat_tool` 的
+///   custom→function lowering 形态一致,模型不因 wire 变化失忆)。
+/// - `custom_tool_call_output` → `function_call_output`(只换 type;`output` payload 同编码)。
+/// - `tool_search_call`(`{arguments:<obj>, call_id}`)→ `function_call`(name=`tool_search`,
+///   arguments 序列化成 JSON 字符串)。
+/// - `tool_search_output`(`{tools:[...], call_id}`)→ `function_call_output`(output 描述发现的
+///   工具名;发现的工具本体另注入 tools[],见 `adapt_grok_build_request_body` 工具段)。
+fn rewrite_tool_call_history_item(it: &mut Value) -> bool {
+    let Some(ty) = it.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    match ty {
+        "custom_tool_call" => {
+            let name = it
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let input_text = it
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let call_id = it
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| it.get("id").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned();
+            // serde_json::to_string 自动转义换行 / 引号 / 反斜杠;valid UTF-8 string 不会失败。
+            let arguments = serde_json::to_string(&json!({ "input": input_text }))
+                .unwrap_or_else(|_| "{}".to_owned());
+            let mut new = json!({
+                "type": "function_call",
+                "name": name,
+                "arguments": arguments,
+                "call_id": call_id,
+            });
+            if let Some(id) = it.get("id").cloned() {
+                new["id"] = id;
+            }
+            *it = new;
+            true
+        }
+        "custom_tool_call_output" => {
+            if let Some(o) = it.as_object_mut() {
+                o.insert("type".into(), Value::String("function_call_output".into()));
+                return true;
+            }
+            false
+        }
+        "tool_search_call" => {
+            let call_id = it
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| it.get("id").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned();
+            // arguments 在 Responses 是 JSON Value(object);function.arguments 要 JSON 字符串。
+            let arguments = match it.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
+                None => "{}".to_owned(),
+            };
+            *it = json!({
+                "type": "function_call",
+                "name": "tool_search",
+                "arguments": arguments,
+                "call_id": call_id,
+            });
+            true
+        }
+        "tool_search_output" => {
+            let call_id = it
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| it.get("tool_call_id").and_then(Value::as_str))
+                .or_else(|| it.get("id").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned();
+            let names = grok_tool_search_output_names(it);
+            let output = if names.is_empty() {
+                "tool_search returned no matching tools.".to_owned()
+            } else {
+                format!(
+                    "tool_search discovered {} tool(s), now available to call directly: {}",
+                    names.len(),
+                    names.join(", ")
+                )
+            };
+            *it = json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// 提取 `tool_search_output.tools` 里所有具体工具名(namespace 包展开内层 function.name;顶级
+/// function 直接取 name)—— 供 leg3 的 `function_call_output` 描述文本用。
+fn grok_tool_search_output_names(item: &Value) -> Vec<String> {
+    let Some(tools) = item.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for t in tools {
+        match t.get("type").and_then(Value::as_str) {
+            Some("namespace") => {
+                if let Some(inner) = t.get("tools").and_then(Value::as_array) {
+                    for f in inner {
+                        if let Some(n) = f.get("name").and_then(Value::as_str) {
+                            names.push(n.to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(n) = t.get("name").and_then(Value::as_str) {
+                    names.push(n.to_owned());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// [MOC-299] 折叠 input 里重复的指令块(developer sandbox 块 + AGENTS 块),**keep-latest-at-front**:
@@ -436,6 +603,76 @@ mod tests {
     }
 
     #[test]
+    fn leg3_rewrites_tool_call_history_and_injects_discovered() {
+        // [MOC-301/304 leg3] grok 不认 custom_tool_call/output、tool_search_call/output(严格 untagged
+        // InputItem enum,未知 variant 422)→ 反向改写成 function_call/output;tool_search_output.tools
+        // 里的发现工具注入 tools[](grok 才能真调)。
+        let body = serde_json::to_vec(&json!({
+            "model": "grok-build",
+            "tools": [
+                { "type": "custom", "name": "apply_patch", "description": "x",
+                  "format": {"type":"grammar","syntax":"lark","definition":"start: x"} },
+                { "type": "tool_search", "execution": {} }
+            ],
+            "input": [
+                { "type": "custom_tool_call", "name": "apply_patch",
+                  "input": "*** Begin Patch\n*** End Patch", "call_id": "c1" },
+                { "type": "custom_tool_call_output", "call_id": "c1", "output": "done" },
+                { "type": "tool_search_call", "call_id": "c2", "execution": "client",
+                  "arguments": {"query": "notion"} },
+                { "type": "tool_search_output", "call_id": "c2", "status": "completed",
+                  "tools": [ { "type": "function", "name": "notion_create_pages",
+                              "parameters": {"type":"object"} } ] }
+            ]
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let input = v["input"].as_array().unwrap();
+        // 4 个 tool-call history item 全改写成 grok 认的 function_call/output。
+        let types: Vec<&str> = input.iter().filter_map(|i| i["type"].as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "function_call",
+                "function_call_output",
+                "function_call",
+                "function_call_output"
+            ],
+            "tool-call history 应全改写为 function_call/output,实得 {types:?}"
+        );
+        // custom_tool_call → function_call,arguments = {"input":"<V4A>"}(JSON 字符串)。
+        assert_eq!(input[0]["name"], "apply_patch");
+        let args: Value = serde_json::from_str(input[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["input"], "*** Begin Patch\n*** End Patch");
+        // custom_tool_call_output → function_call_output,output/call_id 保留。
+        assert_eq!(input[1]["output"], "done");
+        assert_eq!(input[1]["call_id"], "c1");
+        // tool_search_call → function_call(name=tool_search,arguments 字符串化)。
+        assert_eq!(input[2]["name"], "tool_search");
+        let ts_args: Value = serde_json::from_str(input[2]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(ts_args["query"], "notion");
+        // tool_search_output → function_call_output,output 描述发现的工具。
+        assert!(
+            input[3]["output"]
+                .as_str()
+                .unwrap()
+                .contains("notion_create_pages"),
+            "output 应描述发现的工具: {}",
+            input[3]["output"]
+        );
+        // 发现的工具注入 tools[](grok 可直接调)。
+        let tools = v["tools"].as_array().unwrap();
+        assert!(
+            tools
+                .iter()
+                .any(|t| t["name"] == "notion_create_pages" && t["type"] == "function"),
+            "发现的 notion_create_pages 应注入 tools[]"
+        );
+    }
+
+    #[test]
     fn keeps_encrypted_reasoning_and_normalizes() {
         // grok 原生支持加密 reasoning(encrypted_content),**不能丢**(与 chat 路径「上游不支持才丢」
         // 不同)。适配只归一 reasoning + include 保留;input 里的 encrypted_content 原样透传。
@@ -669,13 +906,14 @@ mod tests {
 
     #[test]
     fn adapt_removes_tool_choice_when_tools_all_dropped() {
-        // [silent-failure M2] 原 tools 全是可 drop 类型(tool_search)+ 已设 tool_choice → 适配后
-        // tools 空,必须移除 tool_choice,否则 grok 400 "tool_choice set but no tools"。
+        // [silent-failure M2] 原 tools 全是可 drop 类型 + 已设 tool_choice → 适配后 tools 空,必须移除
+        // tool_choice,否则 grok 400 "tool_choice set but no tools"。[MOC-304] tool_search 现在转
+        // function(不再 drop),故用仍会 drop 的 image_generation 覆盖此不变量。
         let body = serde_json::to_vec(&json!({
             "model":"grok-build",
             "input":[],
             "tool_choice":"none",
-            "tools":[{"type":"tool_search","execution":{}}],
+            "tools":[{"type":"image_generation","output_format":"png"}],
         }))
         .unwrap();
         let out =
@@ -684,7 +922,7 @@ mod tests {
         assert_eq!(
             v["tools"].as_array().unwrap().len(),
             0,
-            "tool_search 被 drop,tools 空"
+            "image_generation 被 drop,tools 空"
         );
         assert!(
             v.get("tool_choice").is_none(),
