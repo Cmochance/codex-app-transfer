@@ -754,6 +754,22 @@ fn main() {
                     .await
                 });
             }
+            // [AI review P2] 同理取消 in-flight grok-build device flow 登录:此前 grok 漏接这套
+            // app-exit 取消(gemini/zai/trae/antigravity/workbuddy/qoder 都有),用户登 grok 期间退出
+            // app 时后台轮询残留 + auth 在退出过程完成致 grok-build-oauth.json ghost 凭证落盘。
+            let grok_outcome = handlers::grok_build_oauth::cancel_in_flight_login();
+            if let (true, Some(target_epoch)) =
+                (grok_outcome.cancelled, grok_outcome.cancelled_epoch)
+            {
+                tracing::info!(target_epoch, "app exit: cancelled in-flight grok-build OAuth login");
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::grok_build_oauth::wait_for_login_epoch_complete(target_epoch),
+                    )
+                    .await
+                });
+            }
             // [devin review] 同理取消 in-flight `codex login`(真实账号登录):否则 user 在
             // OAuth 等待期间退出 app,孤儿 codex login 进程可能在下面 restore_codex_if_enabled
             // 恢复原配置**之后**才写 ~/.codex/auth.json,把刚恢复的状态又改脏(数据完整性)。

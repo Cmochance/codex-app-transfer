@@ -32,6 +32,7 @@ const ICON_MAP: Record<string, IconSpec> = {
   aistudio: { logo: 'assets/providers/google-ai-studio.png' },
   generativelanguage: { logo: 'assets/providers/google-ai-studio.png' },
   'grok-web': { logo: 'assets/providers/grok.svg' },
+  'grok-build': { logo: 'assets/providers/grok.svg' },
   anyrouter: { logo: 'assets/providers/anyrouter.png' },
   // OpenCode Go(opencode.ai)官方 favicon(深底白 O logo);无其它 provider 字符串含 opencode,无歧义
   opencode: { logo: 'assets/providers/opencode.svg' },

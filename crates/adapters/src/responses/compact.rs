@@ -274,25 +274,15 @@ pub(crate) fn strip_compaction_trigger(body: &[u8]) -> Result<Vec<u8>, AdapterEr
         .map_err(|e| AdapterError::Internal(format!("compact v2 body re-serialize: {e}")))
 }
 
-/// 把 Codex CLI 的 `CompactionInput` JSON 改写成上游 `/chat/completions` 请求体。
-///
-/// 策略(v2.0.12 调整):
-/// - **注入 `COMPACT_SUMMARIZATION_PROMPT` 作为最后一条 user message**(append
-///   到 input 数组末尾),而不是 instructions/system。原因:
-///   * 第三方 provider 对 user 服从度普遍 > system,structured prompt 更被尊重
-///   * 避免 system prompt cache 截断 / 去重(部分 provider 把超长 system 截短)
-///   * 对齐 Codex CLI 自家做法(`compact.rs::build_compact_request` 把 prompt
-///     当 `UserInput::Text` 注入)
-/// - 保留 `input` 数组(原对话历史),交给现有 `responses_body_to_chat_body_for_provider`
-///   做 ResponseItem → ChatMessage 转换、merge consecutive、tool call repair、vision 剥离等
-/// - `stream = false`(上游回完整 chat completion JSON,不是 SSE)
-/// - 丢弃 `instructions`(摘要任务不应受原任务 system prompt 影响)
-/// - 保留 `tools`(`ensure_thinking_tool_call_reasoning` 的 `has_tool_loop`
-///   检测需要,且第三方 provider 看到 tools 字段不会 400)
-pub(crate) fn build_compact_chat_request(
+/// [MOC-299] 抽出 [`build_compact_chat_request`] 的前半段:把 Codex `CompactionInput`
+/// JSON 构造成**合成 Responses body**(normalize input → strip `type=reasoning` → 算
+/// `reconstruct_history` → append summarize prompt → 建 `{model, input, stream:false,
+/// max_output_tokens, (透传) reasoning / tools / previous_response_id}`)。chat 路径
+/// ([`build_compact_chat_request`])与 responses-wire 路径([`build_compact_responses_body`])
+/// 共享此前半段;逻辑与抽出前逐字一致。返回 `(synthetic_responses_body, reconstruct_history)`。
+fn build_compact_synthetic_responses_body(
     body_bytes: &[u8],
-    provider: &Provider,
-) -> Result<Vec<u8>, AdapterError> {
+) -> Result<(Value, bool), AdapterError> {
     let parsed: Value = serde_json::from_slice(body_bytes)
         .map_err(|e| AdapterError::BadRequest(format!("compact body 不是合法 JSON: {e}")))?;
     let model = parsed.get("model").cloned().unwrap_or(Value::Null);
@@ -404,6 +394,69 @@ pub(crate) fn build_compact_chat_request(
     if reconstruct_history {
         synthetic_responses_body["previous_response_id"] = Value::String(prev_id.clone());
     }
+
+    Ok((synthetic_responses_body, reconstruct_history))
+}
+
+/// [MOC-299] responses-wire 本地 compaction:合成摘要 body 直接发上游 /responses(不转 chat)。
+/// 用于 api_format=responses 但上游无 Codex compaction 能力的第三方(grok)。stream:false,
+/// 上游回完整 JSON,响应侧复用 build_compact_v2_response_plan / build_compact_response_plan。
+pub(crate) fn build_compact_responses_body(body_bytes: &[u8]) -> Result<Vec<u8>, AdapterError> {
+    let (mut synthetic_responses_body, reconstruct_history) =
+        build_compact_synthetic_responses_body(body_bytes)?;
+    if reconstruct_history {
+        // responses-wire 无本地 session cache 重建(grok store=false 恒发 inline 历史,不该到这)。
+        // 防御性 fail-fast → Codex 回退改发 inline 历史重试。[silent-failure M3] 该分支留痕便于诊断;
+        // 「Codex 对此 400 是否真自愈」尚未实测坐实(followup),但空历史产空摘要更糟,故 fail-fast。
+        tracing::warn!(
+            "compact responses-wire 命中不支持分支(空 inline 历史 + previous_response_id),fail-fast 让 Codex 回退 inline"
+        );
+        return Err(AdapterError::Internal(
+            "compact responses-wire: empty inline history + previous_response_id unsupported; Codex retries with inline".into(),
+        ));
+    }
+    // **摘要请求必须禁工具调用**:responses-wire 上游(grok)看到 tools 会**去调工具而非产出文本
+    // 摘要** —— 真机实证(2026-07-07):带 tools 的摘要请求 grok output = [reasoning, function_call×4]
+    // 无 message → `extract_compact_summary_text` 抽不到 → "missing summary text"。修法 = 保留 tools
+    // 但 `tool_choice:"none"`(grok output = [reasoning, message])。**真 compaction(完整
+    // SUMMARIZATION_PROMPT + 真历史)实测摘要 6696 字符,远超 quality gate 的 800 门槛**(那个曾担心的
+    // 532 是「一句话」短探针产物、非真 compaction);responses-wire 路径质量门槛无需特调。**不能删 tools**:
+    // grok 约束「tool_choice 存在必须有 tools 陪」,删 tools 留 tool_choice → 400 "tool_choice set but
+    // no tools",故仅在 body 确有非空 tools 时才加 tool_choice=none(无 tools 时 grok 本就不会调,跳过)。
+    if let Some(obj) = synthetic_responses_body.as_object_mut() {
+        let has_tools = obj
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if has_tools {
+            obj.insert("tool_choice".to_owned(), json!("none"));
+        }
+    }
+    serde_json::to_vec(&synthetic_responses_body)
+        .map_err(|e| AdapterError::Internal(format!("re-serialize compact responses body: {e}")))
+}
+
+/// 把 Codex CLI 的 `CompactionInput` JSON 改写成上游 `/chat/completions` 请求体。
+///
+/// 策略(v2.0.12 调整):
+/// - **注入 `COMPACT_SUMMARIZATION_PROMPT` 作为最后一条 user message**(append
+///   到 input 数组末尾),而不是 instructions/system。原因:
+///   * 第三方 provider 对 user 服从度普遍 > system,structured prompt 更被尊重
+///   * 避免 system prompt cache 截断 / 去重(部分 provider 把超长 system 截短)
+///   * 对齐 Codex CLI 自家做法(`compact.rs::build_compact_request` 把 prompt
+///     当 `UserInput::Text` 注入)
+/// - 保留 `input` 数组(原对话历史),交给现有 `responses_body_to_chat_body_for_provider`
+///   做 ResponseItem → ChatMessage 转换、merge consecutive、tool call repair、vision 剥离等
+/// - `stream = false`(上游回完整 chat completion JSON,不是 SSE)
+/// - 丢弃 `instructions`(摘要任务不应受原任务 system prompt 影响)
+/// - 保留 `tools`(`ensure_thinking_tool_call_reasoning` 的 `has_tool_loop`
+///   检测需要,且第三方 provider 看到 tools 字段不会 400)
+pub(crate) fn build_compact_chat_request(
+    body_bytes: &[u8],
+    provider: &Provider,
+) -> Result<Vec<u8>, AdapterError> {
+    let (synthetic_responses_body, reconstruct_history) =
+        build_compact_synthetic_responses_body(body_bytes)?;
 
     // MOC-190: compact 转换不保留最新 tool 全文(压缩历史)。set→convert→reset(即使 Err 也 reset)。
     super::request::set_compact_no_keep_recent(true);
@@ -709,7 +762,7 @@ fn omitted_user_excerpts(groups: &[Vec<Value>], max: usize) -> Vec<String> {
     excerpts
 }
 
-fn message_text(message: &Value) -> String {
+pub(crate) fn message_text(message: &Value) -> String {
     match message.get("content") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(parts)) => {
@@ -964,6 +1017,20 @@ fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
         let text: String = parts
             .iter()
             .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    // responses(非流式 JSON):output[] 里 message item 的 output_text(跳过 reasoning item)
+    if let Some(output) = root.get("output").and_then(|v| v.as_array()) {
+        let text: String = output
+            .iter()
+            .filter(|it| it.get("type").and_then(|t| t.as_str()) == Some("message"))
+            .filter_map(|it| it.get("content").and_then(|c| c.as_array()))
+            .flatten()
+            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("output_text"))
             .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
             .collect();
         if !text.is_empty() {
@@ -2230,6 +2297,143 @@ mod tests {
         assert_eq!(
             extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": []}}]})),
             None
+        );
+    }
+
+    #[test]
+    fn extract_compact_summary_text_handles_responses_output_shape() {
+        // [MOC-299] responses(非流式 JSON):output[] 里 message item 的 output_text
+        // 抽出,reasoning item 跳过。
+        let resp = json!({
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "S"}
+                ]}
+            ]
+        });
+        assert_eq!(
+            extract_compact_summary_text(&resp).as_deref(),
+            Some("S"),
+            "应从 output message 的 output_text 抽出,忽略 reasoning item"
+        );
+        // 上游把 responses 裹在 {"response": {...}} 里(root 已 unwrap)也覆盖。
+        let wrapped = json!({"response": {"output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "W"}]}
+        ]}});
+        assert_eq!(extract_compact_summary_text(&wrapped).as_deref(), Some("W"));
+    }
+
+    #[test]
+    fn build_compact_responses_body_strips_v2_trigger_and_injects_summarize_prompt() {
+        // [MOC-299] responses-wire 本地 compaction:V2 body(input 末尾 compaction_trigger)
+        // → detect V2 → strip trigger → 注入 summarize prompt、stream:false,产出普通
+        // /responses 摘要请求(不转 chat)。
+        let body = json!({
+            "model": "grok-build",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hello grok"}
+                ]},
+                {"type": "compaction_trigger"}
+            ],
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        // 普通 /responses + input 含 compaction_trigger → V2。
+        assert_eq!(detect_compact("/responses", &bytes), Some(CompactKind::V2));
+        let stripped = strip_compaction_trigger(&bytes).unwrap();
+        let out = build_compact_responses_body(&stripped).unwrap();
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        let input = parsed["input"].as_array().unwrap();
+        // compaction_trigger 已剥。
+        assert!(
+            !input.iter().any(|it| it["type"] == "compaction_trigger"),
+            "compaction_trigger 必须被剥掉"
+        );
+        // 最后一条是注入的 summarize prompt(user message,responses 形态 content 是字符串)。
+        let last = input.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(
+            last["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("CONTEXT CHECKPOINT"),
+            "必须注入 summarize prompt(含 'CONTEXT CHECKPOINT')"
+        );
+        // 历史 message 保留。
+        assert!(input.iter().any(|it| it["type"] == "message"
+            && it["content"]
+                .as_array()
+                .map(|c| c.iter().any(|p| p["text"] == "hello grok"))
+                .unwrap_or(false)));
+        // stream:false(走上游普通非流式 /responses),max_output_tokens 透传。
+        assert_eq!(parsed["stream"], false);
+        assert_eq!(parsed["max_output_tokens"].as_u64(), Some(20_000));
+    }
+
+    #[test]
+    fn build_compact_responses_body_sets_tool_choice_none_when_tools_present() {
+        // [review gap1] 核心修复:body 带非空 tools 时必须注入 tool_choice:"none"(否则 grok 去调
+        // 工具而非产摘要),且 tools 仍保留(删 tools 会撞 grok "tool_choice set but no tools")。
+        let body = json!({
+            "model": "grok-build",
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"function","name":"exec_command","parameters":{"type":"object"}}],
+        });
+        let out = build_compact_responses_body(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed["tool_choice"], "none",
+            "有 tools 时注入 tool_choice:none"
+        );
+        assert!(
+            parsed["tools"].as_array().is_some_and(|a| !a.is_empty()),
+            "tools 保留、不删"
+        );
+    }
+
+    #[test]
+    fn build_compact_responses_body_no_tool_choice_when_no_tools() {
+        // [review gap2] grok 约束 tool_choice 必须有 tools 陪:无 tools 时**不能**加 tool_choice。
+        let body =
+            json!({"model":"grok-build","input":[{"type":"message","role":"user","content":"hi"}]});
+        let out = build_compact_responses_body(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            parsed.get("tool_choice").is_none(),
+            "无 tools 不加 tool_choice"
+        );
+    }
+
+    #[test]
+    fn build_compact_responses_body_errs_on_empty_inline_history_with_prev_id() {
+        // [review gap3] 空 inline input + previous_response_id → fail-fast Err(让 Codex 回退 inline,
+        // 不产空摘要)。
+        let body = json!({
+            "model": "grok-build",
+            "input": [],
+            "previous_response_id": "resp_x",
+        });
+        assert!(
+            build_compact_responses_body(&serde_json::to_vec(&body).unwrap()).is_err(),
+            "空历史 + prev_id 必须 Err"
+        );
+    }
+
+    #[test]
+    fn extract_compact_summary_text_returns_none_for_reasoning_and_function_call_only() {
+        // [review gap4] 那个正是触发 tool_choice 修法的真机失败形状:output 只有 reasoning +
+        // function_call、无 message → 抽不到摘要 → None(绝不把 reasoning 的 summary_text 当摘要)。
+        let resp = json!({
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking about summary"}]},
+                {"type": "function_call", "name": "exec_command", "arguments": "{}", "call_id": "c1"}
+            ]
+        });
+        assert_eq!(
+            extract_compact_summary_text(&resp),
+            None,
+            "无 message → None,不误把 reasoning summary 当摘要"
         );
     }
 

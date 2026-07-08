@@ -17,6 +17,12 @@ codex-app-transfer-qoder-auth = { path = "../qoder_auth" }
 axum = { version = "0.8", features = ["http1", "http2", "tokio", "ws"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# [入站解压] Codex 对大请求体用 zstd(偶尔 gzip)压缩;上游(如 grok cli-chat-proxy)
+# 不支持该 content-encoding 时,透传压缩字节会被当非 JSON 拒(400),且压缩 body 让 resolver
+# 解析不出 model → 模型映射静默失效。故转发前按 content-encoding 解压成明文 JSON。两者已在
+# workspace 依赖树(各平台 CI 已编译),复用不引新构建风险。
+flate2 = "1"
+zstd = "0.13"
 futures-core = "0.3"
 futures-util = "0.3"
 http = "1"

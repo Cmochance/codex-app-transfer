@@ -56,7 +56,10 @@ mod tests {
         // (2026-07-03 加 qoder-login:QoderWork CN 账号登录 OAuth 路,authScheme
         //  qoder_oauth;纯客户端 PKCE device flow 轮询登录 + 自动 refresh。阶段一仅
         //  login+save,模型路由 jobToken 交换注入在阶段二实测后接入)
-        assert_eq!(builtin_presets().len(), 21);
+        // (2026-07-06 加 grok-build:xAI grok CLI 编码后端,authScheme grok_build_oauth;
+        //  responses passthrough,OAuth2 device flow 自建登录 + 自动 refresh,上游
+        //  cli-chat-proxy.grok.com/v1;models.default=grok-build 防 Codex gpt-5.x 名透传上游)
+        assert_eq!(builtin_presets().len(), 22);
     }
 
     #[test]

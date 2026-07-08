@@ -8,6 +8,7 @@ pub(crate) mod anthropic_messages;
 pub(crate) mod chat;
 pub(crate) mod cloud_code;
 pub(crate) mod gemini_native;
+pub(crate) mod grok_build;
 pub(crate) mod grok_web;
 // [MOC-234] responses ↔ responses 1:1 直透 mapper(原生 Responses 上游纳入统一框架)。
 pub(crate) mod responses;

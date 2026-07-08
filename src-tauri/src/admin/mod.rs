@@ -295,6 +295,7 @@ pub fn build_app_router(state: AdminState) -> Router {
         // WorkBuddy(腾讯 CodeBuddy)账号登录 OAuth(login / status / logout / cancel)
         .merge(handlers::workbuddy_oauth::routes())
         .merge(handlers::qoder_oauth::routes())
+        .merge(handlers::grok_build_oauth::routes())
         // Codex AGENTS.md(Agents tab):raw 全文编辑 + history/backup/restore + 路径管理。
         // [MOC-261 二-1] 旧受管块 marker 模式(status/preview/apply/rollback/clear)已删:
         // 被 raw 整文件编辑取代、前端零引用、无内部调用方,按死代码移除。

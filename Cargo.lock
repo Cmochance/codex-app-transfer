@@ -1026,6 +1026,7 @@ dependencies = [
  "codex-app-transfer-qoder-auth",
  "codex-app-transfer-registry",
  "ctor 1.0.7",
+ "flate2",
  "futures-core",
  "futures-util",
  "http",
@@ -1044,6 +1045,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "webpki-roots 1.0.8",
+ "zstd",
 ]
 
 [[package]]

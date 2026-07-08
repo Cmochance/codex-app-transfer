@@ -171,6 +171,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | 浏览器登录 Google 一次,免 API key |
 | Anthropic Messages(custom Claude-compatible) | ✅(PR #153) | ✅(PR #153) | ✅(PR #153) | `apiFormat=anthropic_messages`,Claude preset 待真实验证后开放 |
 | Grok Web(SuperGrok / X Premium+) | ✅ | ✅ | ✅(v2.1.6 加 tool_calls flatten) | 实验性,TOS 灰色,仅本机个人使用 |
+| Grok Build(xAI grok CLI 编码后端,`cli-chat-proxy.grok.com/v1`,responses) | 🧪 | 🧪 | 🧪 | **代码就绪,登录 + 端到端待真机验证(MOC-299)**。协议走原生 responses 透传(复用 `ResponsesPassthroughMapper`,无新 adapter/mapper);账号登录 OAuth2 device flow(`authScheme=grok_build_oauth`,点登录经 `accounts.x.ai/oauth2/{device/code,token}` 浏览器授权 + 自动 refresh,凭证落 `grok-build-oauth.json`,**不依赖本地装 grok CLI**);出站注入 grok-shell 客户端指纹头(UA / x-xai-token-auth / x-grok-client-* / x-grok-model-override,见 forward.rs `injects_grok_build_headers`)避风控。**模型映射**:Codex 的 gpt-5.x 名经 `provider.models` 槽位映射为 grok 模型,不透传到上游(否则 cli-chat-proxy 不识别)。模型:grok-build(512k,编码主力)/ grok-composer-2.5-fast(200k)。TOS 灰色、默认隐藏、仅本机个人使用 |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | 后端就绪,UI 待 PR;gemini 全系上下文 1M(带后缀 id 此前误落 258k 兜底,MOC-221);**支持 Codex 内置 image_gen 工具原生出图**(MOC-210,gemini-3.1-flash-image;可 provider 覆盖) |
 | 智谱 GLM(5.2 / 5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代;5.2 为 1M context |
 | 智谱 GLM Coding(4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan 订阅套餐专属端点(`/api/coding/paas/v4`);代理代码层注入完整 ZCode 指纹头(含运行时 `X-Platform`),与 OAuth 登录路径完全对齐,获取 Coding Plan 150% 配额加成 |
@@ -377,7 +378,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 上游 API key / OAuth token 仅保存在本机 `~/.codex-app-transfer/`(Unix 0600 + atomic write);转发服务只监听 `127.0.0.1`,不接管系统代理，除反馈功能外不涉及第三方联网行为。
 
-部分实验性 provider(Grok Web / Gemini CLI OAuth / Antigravity OAuth)涉及上游 TOS 灰色地带 — Grok Web 反代 grok.com Web 后端协议、Gemini CLI OAuth 借用 `cloudcode-pa.googleapis.com/v1internal` 内部端点 — 严格限定**个人使用**,**不应**作为对外服务发布,且存在封号风险，**用户自担风险**。这些灰色 provider 在「添加提供商」列表中**默认隐藏**,需到设置页打开「**显示灰色提供商**」开关才出现(MOC-91)。
+部分实验性 provider(Grok Web / Grok Build / Gemini CLI OAuth / Antigravity OAuth)涉及上游 TOS 灰色地带 — Grok Web 反代 grok.com Web 后端协议、Grok Build 复用 xAI grok CLI 的编码后端(`cli-chat-proxy.grok.com`)+ grok-shell 客户端指纹、Gemini CLI OAuth 借用 `cloudcode-pa.googleapis.com/v1internal` 内部端点 — 严格限定**个人使用**,**不应**作为对外服务发布,且存在封号风险，**用户自担风险**。这些灰色 provider 在「添加提供商」列表中**默认隐藏**,需到设置页打开「**显示灰色提供商**」开关才出现(MOC-91)。
 
 ## 致谢
 

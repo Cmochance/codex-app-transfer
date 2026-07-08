@@ -77,6 +77,13 @@ pub enum AuthScheme {
     /// `gemini_oauth::qoder` 多账号池持久化 + 请求时 refresh。签名/加密/整份出站
     /// url+header+body 在 `forward.rs` 的 build_and_send_upstream QoderCosy 分支产出。
     QoderCosy,
+    /// grok build(xAI grok CLI 编码后端)账号登录。access token 不在 `provider.api_key`,
+    /// 由 `gemini_oauth::grok_build::GrokBuildCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/grok-build-oauth.json`)+ 请求时 `ensure_valid_grok_build_token`
+    /// load + **自动 refresh**(`accounts.x.ai/oauth2/token`,grant_type=refresh_token)。打
+    /// `cli-chat-proxy.grok.com/v1/responses` 的 OpenAI Responses wire(passthrough),
+    /// forward.rs 注 `Authorization: Bearer <access_token>` + 完整 grok-shell 客户端指纹头。
+    GrokBuildOauth,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -100,6 +107,7 @@ impl AuthScheme {
             "bigmodel_oauth" | "bigmodel" => AuthScheme::ZaiOauth(ZaiProvider::BigModel),
             "workbuddy_oauth" | "workbuddy_login" => AuthScheme::WorkbuddyOauth,
             "qoder_oauth" | "qoder" | "qoder_cosy" => AuthScheme::QoderCosy,
+            "grok_build_oauth" | "grok_build" | "grokbuild" => AuthScheme::GrokBuildOauth,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -331,6 +339,10 @@ impl ProviderResolver for StaticResolver {
             // 外泄到非官方 host(codex review P2)。
             AuthScheme::WorkbuddyOauth => "https://copilot.tencent.com/v2".to_string(),
             AuthScheme::QoderCosy => "https://gateway.qoder.com.cn".to_string(),
+            // grok build:access token scoped 给 cli-chat-proxy.grok.com,pin 官方端点防
+            // user 把 authScheme=grok_build_oauth 配到任意 baseUrl 致账号 token 外泄到非官方
+            // host(同 WorkBuddy/Qoder 先例)。preset baseUrl 已带 /v1,pin 与之一致。
+            AuthScheme::GrokBuildOauth => "https://cli-chat-proxy.grok.com/v1".to_string(),
             _ => provider.base_url.clone(),
         };
 
@@ -732,6 +744,43 @@ mod tests {
         assert_eq!(res.provider_id, "deepseek");
         assert_eq!(res.api_key, "sk-2");
         assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn grok_build_scheme_parses_and_maps_codex_models_and_pins_upstream() {
+        // MOC-299 核心回归:grok-build preset(models.default=grok-build)必须把 Codex 发的
+        // gpt-5.x 模型名映射成 grok-build,**不透传 gpt 名到上游**(否则 cli-chat-proxy 400);
+        // 且 authScheme=grok_build_oauth 解析正确、upstream_base 钉死官方 host。
+        assert_eq!(
+            AuthScheme::parse("grok_build_oauth"),
+            AuthScheme::GrokBuildOauth
+        );
+        assert_eq!(AuthScheme::parse("grok-build"), AuthScheme::GrokBuildOauth);
+
+        let mut gb = provider("grok-build", "https://cli-chat-proxy.grok.com/v1", "");
+        gb.auth_scheme = "grok_build_oauth".into();
+        gb.api_format = "responses".into();
+        gb.models.clear();
+        gb.models.insert("default".into(), "grok-build".into());
+
+        let r = StaticResolver::new(None, vec![gb], Some("grok-build".into()));
+        let p = parts_with(&[]);
+        // Codex 实际会发的 slot 模型名(见 model_alias::MODEL_SLOTS),均未在 grok models 里
+        // 显式映射 → fallback default = grok-build。
+        for codex_model in ["gpt-5.3-codex", "gpt-5.5", "gpt-5.2", "gpt-5.4-mini"] {
+            let body = format!(r#"{{"model":"{codex_model}"}}"#);
+            let res = r.resolve(&p, body.as_bytes()).unwrap();
+            assert_eq!(
+                res.rewritten_model.as_deref(),
+                Some("grok-build"),
+                "{codex_model} 必须映射为 grok-build,不透传 gpt 名到上游"
+            );
+            assert_eq!(res.auth_scheme, AuthScheme::GrokBuildOauth);
+            assert_eq!(
+                res.upstream_base, "https://cli-chat-proxy.grok.com/v1",
+                "upstream_base 必须钉死官方 host,不随 user baseUrl 漂移"
+            );
+        }
     }
 
     #[test]

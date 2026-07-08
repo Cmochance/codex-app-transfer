@@ -64,11 +64,54 @@ impl RequestMapper for ResponsesPassthroughMapper {
         &self,
         client_path: &str,
         body: Bytes,
-        _provider: &Provider,
+        provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        // [MOC-299] api_format=responses 但上游无 compaction 能力的第三方(grok):Codex 的 autocompact
+        // (V1 /responses/compact 或 V2 compaction_trigger)grok 不认(404/422)。像 chat 路径一样本地摘要:
+        // strip → 注入 summarize prompt → 走上游普通 /responses(stream:false)→ 响应侧包成单 compaction item。
+        if crate::mapper::grok_build::responses_upstream_lacks_compaction(provider) {
+            if let Some(kind) = crate::responses::compact::detect_compact(client_path, &body) {
+                let stripped = match kind {
+                    crate::responses::compact::CompactKind::V1 => body.to_vec(),
+                    crate::responses::compact::CompactKind::V2 => {
+                        crate::responses::compact::strip_compaction_trigger(&body)?
+                    }
+                };
+                let summ = Bytes::from(crate::responses::compact::build_compact_responses_body(
+                    &stripped,
+                )?);
+                // 套 grok_build 适配(tools/reasoning 归一),让摘要请求也被 grok 接受
+                let summ =
+                    crate::mapper::grok_build::adapt_grok_build_request_body(&summ, provider)
+                        .unwrap_or(summ);
+                return Ok(RequestPlan {
+                    // 摘要请求走普通 /responses(V1 的 client_path=/responses/compact 必须改路由否则 grok 404)
+                    upstream_path: rewrite_local_path_for_upstream("/responses"),
+                    body: summ,
+                    upstream_headers: HeaderMap::new(),
+                    response_session: None,
+                    adapter_metadata: None,
+                    is_compact: true,
+                    compact_v2: kind == crate::responses::compact::CompactKind::V2,
+                    original_responses_request: None,
+                });
+            }
+        }
+
+        // [MOC-299] grok-build:/responses 是真 Responses API 但工具集受限(不认 Codex 的
+        // custom/namespace/tool_search/image_generation)且不支持 reasoning.effort。进 1:1 透传
+        // 前把请求体适配成 grok 接受的形态(工具转换复用 chat 路径决策,见 mapper::grok_build)。
+        // 非 grok-build provider 恒不改,透传语义与 MOC-234 完全一致。其余 provider 仍严格 1:1。
+        let body = if crate::mapper::grok_build::is_grok_build_provider(provider) {
+            crate::mapper::grok_build::adapt_grok_build_request_body(&body, provider)
+                .unwrap_or(body)
+        } else {
+            body
+        };
+
         // [MOC-234] 只读观测整合(gate=breakdown_enabled,默认关零开销):旁路 parse 一份
-        // 副本算 responses 原生 context_breakdown + 喂会话观测镜像,**绝不改 body**。返回的
-        // adapter_metadata 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
+        // 副本算 responses 原生 context_breakdown + 喂会话观测镜像。返回的 adapter_metadata
+        // 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
         let adapter_metadata = build_observe_metadata(client_path, &body);
 
         // 路径 normalize:剥 `/openai` legacy prefix + `/claude/v1/messages` alias +
@@ -76,8 +119,10 @@ impl RequestMapper for ResponsesPassthroughMapper {
         // 否则 `/openai/v1/responses` 透传成 `…/v1/openai/v1/responses` → 上游 404。
         Ok(RequestPlan {
             upstream_path: rewrite_local_path_for_upstream(client_path),
-            // 1:1 字节直透:model 已由 forward.rs 在 adapter 前 rewrite/strip,
-            // 此处不再改写任何字段(compact / web_search / namespace 全部原样)。
+            // model 已由 forward.rs 在 adapter 前 rewrite/strip。**非 grok** provider:1:1 字节直透,
+            // 此处不改写任何字段(compact / web_search / namespace 全部原样)。**grok-build**:上方
+            // `adapt_grok_build_request_body` 已改写(工具归一 / reasoning / 去重),此处 `body` 是适配后
+            // 的字节(compact 请求则更早在函数开头就走了本地 compaction 分支 return,不到这)。
             body,
             upstream_headers: HeaderMap::new(),
             // 上游自管 session,不写本项目 chat 形 cache(见模块 doc)。
@@ -101,6 +146,24 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         _provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
+        // [MOC-299] 本地 compaction:上游是我们发的 stream:false 摘要请求,回来的完整 JSON 在此包成
+        // Codex 期待的 compaction 响应(V2 单 compaction item SSE / V1 非流式 JSON)。复用 chat 路径包装。
+        if request_plan.is_compact {
+            return if request_plan.compact_v2 {
+                crate::responses::compact::build_compact_v2_response_plan(
+                    upstream_status,
+                    upstream_headers,
+                    upstream_stream,
+                )
+            } else {
+                crate::responses::compact::build_compact_response_plan(
+                    upstream_status,
+                    upstream_headers,
+                    upstream_stream,
+                )
+            };
+        }
+
         // [MOC-234] **上游非 2xx → 合规 `response.failed` SSE**,绝不裸传错误体 —— **仅限流式
         // `/responses` create 请求**(body `stream:true`)。实测原生 Responses 上游(及第三方反代)
         // 报错常返 HTTP 4xx/5xx + JSON error body(甚至 `content-type: text/event-stream` 但 body
