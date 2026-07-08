@@ -35,7 +35,7 @@ url = "2"
 # (ECDSA-P256-SHA256,DER 编码——对齐 Trae 主进程 Node `crypto.sign("sha256",...)`
 # 默认输出 ASN.1 DER)。pem/pkcs8 把私钥/公钥导出 PKCS8/SPKI PEM 落盘 + 作为
 # DeviceInfo.DevicePublicKey 上传。
-p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdsa", "pem", "pkcs8"] }
 # Trae PKCE code_challenge = base64url(sha256(verifier));与 workspace 其它 crate 同版。
 sha2 = "0.10"
 # base64url(PKCE)+ base64(DeviceProof 签名编码)。
