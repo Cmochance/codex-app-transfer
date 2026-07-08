@@ -63,14 +63,67 @@ fn cleanup_slot(my_epoch: u64) {
     }
 }
 
-/// 取消 in-flight 登录(UI 关窗 / 新登录抢占 / 显式 cancel / app 退出)。返回是否有在飞登录被取消。
-pub fn cancel_in_flight_login() -> bool {
+/// 取消结果:是否取消 + 被取消的 epoch(供 app 退出路径 [`wait_for_login_epoch_complete`] 等该 task 真退出)。
+#[derive(Debug, Clone, Copy)]
+pub struct CancelOutcome {
+    pub cancelled: bool,
+    pub cancelled_epoch: Option<u64>,
+}
+
+/// 取消 in-flight 登录(UI 关窗 / 新登录抢占 / 显式 cancel / app 退出)。返回是否取消 + 被取消的 epoch。
+pub fn cancel_in_flight_login() -> CancelOutcome {
     let mut guard = lock_cancel_slot();
-    if let Some((_, sender)) = guard.take() {
+    if let Some((epoch, sender)) = guard.take() {
         let _ = sender.send(true);
-        true
+        CancelOutcome {
+            cancelled: true,
+            cancelled_epoch: Some(epoch),
+        }
     } else {
-        false
+        CancelOutcome {
+            cancelled: false,
+            cancelled_epoch: None,
+        }
+    }
+}
+
+/// [AI review P2] 每个 login_handler 完成(成功/失败/取消)时经此 channel 广播自己的 epoch;
+/// app 退出路径 [`wait_for_login_epoch_complete`] 据此等 in-flight 登录真跑完(避免退出后 grok
+/// device flow 仍写 grok-build-oauth.json ghost 凭证)。grok 独立 static,不复用别的 provider。
+fn login_done_channel() -> &'static (watch::Sender<u64>, watch::Receiver<u64>) {
+    static C: OnceLock<(watch::Sender<u64>, watch::Receiver<u64>)> = OnceLock::new();
+    C.get_or_init(|| watch::channel(0))
+}
+
+/// app 退出时等当前 in-flight grok 登录跑完(对齐 workbuddy/qoder/zai/trae/gemini 的退出清理)。
+pub async fn wait_for_login_epoch_complete(target_epoch: u64) {
+    let mut rx = login_done_channel().1.clone();
+    loop {
+        if *rx.borrow() >= target_epoch {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// login_handler 持有它;返回(含 early return / panic)时 Drop 广播本次 epoch 已完成。
+struct LoginDoneGuard {
+    epoch: u64,
+}
+impl Drop for LoginDoneGuard {
+    fn drop(&mut self) {
+        let (tx, _) = login_done_channel();
+        let my = self.epoch;
+        let _ = tx.send_if_modified(|cur| {
+            if my > *cur {
+                *cur = my;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
@@ -141,12 +194,12 @@ async fn status_handler() -> impl IntoResponse {
 }
 
 async fn cancel_login_handler() -> impl IntoResponse {
-    let cancelled = cancel_in_flight_login();
+    let outcome = cancel_in_flight_login();
     web_session_quota::close_external_login_window(GROK_BUILD_LOGIN_WIN);
-    if cancelled {
+    if outcome.cancelled {
         tracing::info!("grok build OAuth login cancelled by user request");
     }
-    Json(json!({ "cancelled": cancelled })).into_response()
+    Json(json!({ "cancelled": outcome.cancelled })).into_response()
 }
 
 async fn logout_handler() -> impl IntoResponse {
@@ -162,6 +215,8 @@ async fn logout_handler() -> impl IntoResponse {
 
 async fn login_handler() -> impl IntoResponse {
     let my_epoch = next_epoch();
+    // [AI review P2] 任何返回路径(成功/失败/取消/panic)Drop 都广播本 epoch 完成,供 app 退出等待。
+    let _login_done_guard = LoginDoneGuard { epoch: my_epoch };
     let http = match shared_grok_http_client() {
         Ok(c) => c,
         Err(msg) => return err(StatusCode::INTERNAL_SERVER_ERROR, msg.to_string()).into_response(),
@@ -261,6 +316,8 @@ mod tests {
     #[test]
     fn cancel_with_no_in_flight_returns_false() {
         let _ = lock_cancel_slot().take();
-        assert!(!cancel_in_flight_login());
+        let outcome = cancel_in_flight_login();
+        assert!(!outcome.cancelled);
+        assert!(outcome.cancelled_epoch.is_none());
     }
 }

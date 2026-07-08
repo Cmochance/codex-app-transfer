@@ -476,12 +476,23 @@ fn jwt_email_and_sub(jwt: &str) -> (Option<String>, Option<String>) {
     (email, sub)
 }
 
-/// refresh 失败是否瞬时(可沿用旧凭证重试)。网络 / 5xx / 429 / parse = 瞬时;
-/// 4xx / OAuth 业务错(invalid_grant 等)= 明确鉴权失败(删凭证重登)。
+/// refresh 失败是否瞬时(可沿用旧凭证重试,**不删凭证**)。
+///
+/// [AI review P2] **不透明 HTTP 错误(含 4xx)一律判瞬时**:`accounts.x.ai` 会回 Cloudflare/edge
+/// 临时拦(非 JSON 4xx body),`refresh_token_request` 已先 parse `OAuthErrorBody`,parse 不出才落
+/// `Status`——即 `Status` 恒是「上游没给可解析 OAuth 错」的不透明失败,不能当撤销强制登出。真正的
+/// refresh token 撤销由上游回**可解析的 OAuth `invalid_grant`**(→ `OAuth` 变体)。故:
+/// - `Http` / `Parse` / **任意 `Status`(含 4xx)** = 瞬时,沿用旧凭证、下周期重试;
+/// - `OAuth{invalid_grant/invalid_client/unauthorized_client}` = 明确 token/client 失效 → 删凭证重登;
+/// - 其余 `OAuth`(temporarily_unavailable 等临时/配置类)= 瞬时,不删。
 fn is_transient_refresh_error(e: &GrokBuildError) -> bool {
     match e {
         GrokBuildError::Http(_) | GrokBuildError::Parse(_) => true,
-        GrokBuildError::Status { status, .. } => *status >= 500 || *status == 429,
+        GrokBuildError::Status { .. } => true,
+        GrokBuildError::OAuth { error, .. } => !matches!(
+            error.as_str(),
+            "invalid_grant" | "invalid_client" | "unauthorized_client"
+        ),
         _ => false,
     }
 }
@@ -507,12 +518,19 @@ mod tests {
             status: 429,
             body: String::new()
         }));
-        assert!(!is_transient_refresh_error(&GrokBuildError::Status {
+        // [AI review P2] 不透明 4xx(CF/edge 临时拦)现判**瞬时**、不删凭证。
+        assert!(is_transient_refresh_error(&GrokBuildError::Status {
             status: 400,
-            body: String::new()
+            body: "<html>cloudflare</html>".into()
         }));
+        // 可解析 OAuth 撤销错 → 非瞬时(删凭证重登)。
         assert!(!is_transient_refresh_error(&GrokBuildError::OAuth {
             error: "invalid_grant".into(),
+            description: String::new()
+        }));
+        // 其余 OAuth(临时/配置类)→ 瞬时,不删。
+        assert!(is_transient_refresh_error(&GrokBuildError::OAuth {
+            error: "temporarily_unavailable".into(),
             description: String::new()
         }));
         assert!(!is_transient_refresh_error(&GrokBuildError::NotLoggedIn));

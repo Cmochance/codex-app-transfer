@@ -9,12 +9,13 @@
 //!
 //! 未适配时上游 422 `unknown variant 'custom'` / 400 `does not support parameter
 //! reasoningEffort`。这里在 1:1 透传前把 Codex 请求体改成 grok 接受的形态:
-//! - 工具转换:`custom`(apply_patch)/ `namespace` **复用 chat 路径决策**
-//!   ([`convert_responses_tool_to_chat_tool`]:apply_patch → 单字符串 function、namespace 摊平),
-//!   再把它输出的 chat 形 `{type:function, function:{…}}` **unwrap 回 responses-flat**
+//! - 工具转换:`namespace`(MCP 包)**复用 chat 路径决策**([`convert_responses_tool_to_chat_tool`]:
+//!   摊平成 function),再把它输出的 chat 形 `{type:function, function:{…}}` **unwrap 回 responses-flat**
 //!   `{type:function, …}`(grok 的 function 工具就是 responses-flat);`web_search` 剥成 bare
-//!   `{type:web_search}`;`tool_search` / `image_generation` / 未知类型**在本文件 `_` 臂直接 drop**
-//!   (**不入** convert —— convert 对 tool_search 是降级成 function 而非 drop)。
+//!   `{type:web_search}`;`custom`(apply_patch)/ `tool_search` / `image_generation` / 未知类型
+//!   **直接 drop 不 advertise**。`custom`(apply_patch)之所以 drop 而非转 function:响应侧 shim 未接线
+//!   (见下方「响应侧」),转了会静默失败。`tool_search` drop 会让 defer 的 MCP/连接器工具在 grok 上
+//!   无法发现(见 MOC-304)。
 //! - `reasoning` 归一为 `{"summary": "concise"}`(对齐真实 grok CLI 抓包)。grok 不支持
 //!   `effort`,且靠 `summary` 指令生成 + 跨轮解密**加密 reasoning**(`encrypted_content`);
 //!   Codex 发 `{"effort":...}` 无 summary,若只剥成 `{}`,grok 下一轮回灌 encrypted_content 时
@@ -24,12 +25,12 @@
 //! 真机实证(2026-07-07):适配后 grok `/responses` 返 200 并正常推理 + 调 function 工具。
 //! model 映射(gpt-5.x → grok-build)由 resolver 负责,不在此。
 //!
-//! **响应侧(TODO,尚未接线)**:exec_command 等普通 function 两边同构、透传即可;但 apply_patch
-//! (此处请求侧转成了 function,会真被模型调用)若被调用,响应侧需把 `function_call` 重打包回
-//! Codex 的 `custom_tool_call`。`responses::converter` 有现成 apply_patch shim,但 responses
-//! passthrough 的 map_response **非 compact 分支是 1:1 透传、不经 converter** —— 即 grok 普通轮
-//! 回的 apply_patch function_call **当前不会被重打包**。故 grok 用 apply_patch 改文件尚未端到端
-//! 闭环,是待办精修(见 followup);本文件只管请求侧。
+//! **响应侧 + apply_patch(followup MOC-301)**:exec_command 等普通 function 两边同构、透传即可。
+//! apply_patch 要端到端可用(grok 能改文件),需请求侧转 function + 响应侧把 `function_call` 重打包回
+//! Codex 的 `custom_tool_call`(Codex apply_patch handler 硬要 ToolPayload::Custom)。但 responses
+//! passthrough 的 map_response 成功流是 1:1 字节直透、不经 `responses::converter` 的 shim,响应侧改写
+//! 需给 passthrough 加流式 SSE 转换层。接线前**请求侧先 drop apply_patch**(见上,不 advertise),避免
+//! grok 假装能改文件然后静默失败。全 shim(请求侧转 + 响应侧改写)在 MOC-301。
 
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
@@ -84,13 +85,20 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
                 // web_search:grok 认 bare `{type:web_search}`,剥 Codex 的
                 // external_web_access / search_content_types 等子字段。
                 "web_search" | "web_search_preview" => out.push(json!({ "type": "web_search" })),
-                // custom(apply_patch)/ namespace:复用 chat 路径转换决策,再 unwrap 回 flat。
-                "custom" | "namespace" => {
+                // namespace(MCP 包):复用 chat 路径转换决策(摊平成 function),再 unwrap 回 flat。
+                "namespace" => {
                     for ct in convert_responses_tool_to_chat_tool(t, Some(provider)) {
                         out.push(unwrap_chat_tool_to_responses_flat(ct));
                     }
                 }
+                // custom(apply_patch freeform):[AI review P1] **暂 drop 不 advertise**。转成 function 后
+                // grok 会调用它,但 responses passthrough 的 map_response 非 compact 分支是 1:1 字节直透、
+                // **不把 function_call 重打包回 Codex 的 custom_tool_call**(Codex apply_patch handler 硬要
+                // ToolPayload::Custom)→ grok 改文件会**静默失败**。响应侧流式 shim 见 MOC-301;接线前先不
+                // advertise,让 grok 暂只读/跑命令,而不是「假装能改文件然后静默失败」。
+                "custom" => {}
                 // tool_search / image_generation / 未知:grok 无等价 → **本臂直接 drop**(不入 convert)。
+                // 注:tool_search 关掉会让 defer 的 MCP/连接器工具在 grok 上无法发现(见 MOC-304)。
                 _ => {}
             }
         }
@@ -342,8 +350,8 @@ mod tests {
 
     #[test]
     fn adapts_tools_and_normalizes_reasoning() {
-        // Codex 请求:function(保留)+ custom apply_patch(→function)+ namespace(摊平)+
-        // web_search(→bare)+ tool_search / image_generation(drop);reasoning.effort(剥)。
+        // Codex 请求:function(保留)+ namespace(摊平→function)+ web_search(→bare)+
+        // custom apply_patch / tool_search / image_generation(drop);reasoning.effort(剥)。
         let body = serde_json::to_vec(&json!({
             "model": "grok-build",
             "input": [],
@@ -380,15 +388,11 @@ mod tests {
             !types.contains(&"image_generation"),
             "image_generation 应 drop"
         );
-        // apply_patch 转成了 responses-flat function(顶层有 name,无嵌套 function 对象)。
-        let ap = tools
-            .iter()
-            .find(|t| t["name"] == "apply_patch")
-            .expect("apply_patch 保留为 function");
-        assert_eq!(ap["type"], "function");
+        // [AI review P1] apply_patch(custom)现在 **drop 不 advertise**(响应侧 shim 未接线,转 function
+        // 会静默失败 —— 见 MOC-301),故不应出现在输出里。
         assert!(
-            ap.get("function").is_none(),
-            "必须 unwrap 成 responses-flat(顶层 name),不留 chat 嵌套"
+            !tools.iter().any(|t| t["name"] == "apply_patch"),
+            "apply_patch 应被 drop(响应侧 shim 未接线前不 advertise)"
         );
         // namespace 摊平出内层 function。
         assert!(
