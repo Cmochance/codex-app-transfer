@@ -558,10 +558,11 @@ impl QoderAuth {
         let mut store = Store::new(&engine, HostState::new());
         let mut linker: Linker<HostState> = Linker::new(&engine);
         imports::register(&mut linker)?;
+        // wasmi 1.0 起 `Linker::instantiate(→InstancePre).start()` 合并为
+        // `instantiate_and_start`,直接返回 `Instance`;本 WASM 无 start section、
+        // `__wbindgen_start` 仍在下方手动调,语义与旧两步链等价。
         let instance = linker
-            .instantiate(&mut store, &module)
-            .map_err(|e| QoderAuthError::Engine(e.to_string()))?
-            .start(&mut store)
+            .instantiate_and_start(&mut store, &module)
             .map_err(|e| QoderAuthError::Engine(e.to_string()))?;
 
         // wasm-bindgen 的 init(若以导出函数形式提供)
