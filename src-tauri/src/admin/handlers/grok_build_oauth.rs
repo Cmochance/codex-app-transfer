@@ -30,10 +30,11 @@ use codex_app_transfer_gemini_oauth::{
     complete_grok_build_login, grok_build_logout, prepare_grok_build_authorization,
     GrokBuildCredentialStore, GrokBuildError, LOOPBACK_PORT, REDIRECT_URI,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// 登录总超时(用户在授权页停留上限;超时 loopback 停止等待)。
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -69,6 +70,49 @@ fn cleanup_slot(my_epoch: u64) {
     if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
         slot.take();
     }
+}
+
+// ── 手动粘 code slot（[MOC-300] xAI 授权页显示 code 让用户粘回，而非重定向到 loopback）──────
+// grok/xAI 的 authorize 页对本 client 显示「复制此 code 到 app」而非跳 loopback（实证 2026-07-09，
+// 与官方 grok CLI / pi-xai-oauth 手动粘贴兜底一致）。前端在登录中态提供输入框，用户粘 code 经
+// submit-code 端点送到此 slot 唤醒等待中的 login_handler。与 loopback 二选一先到者胜。
+
+fn manual_code_slot() -> &'static Mutex<Option<(u64, oneshot::Sender<String>)>> {
+    static SLOT: OnceLock<Mutex<Option<(u64, oneshot::Sender<String>)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn lock_manual_code_slot() -> std::sync::MutexGuard<'static, Option<(u64, oneshot::Sender<String>)>>
+{
+    manual_code_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn cleanup_manual_code_slot(my_epoch: u64) {
+    let mut slot = lock_manual_code_slot();
+    if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+        slot.take();
+    }
+}
+
+/// 从用户粘贴内容提取 authorization code：支持「裸 code」或「完整 callback URL / query 串」
+/// （pi-xai-oauth 手动路径同款：bare `[A-Za-z0-9_-]{20,}` 或带 `code=` 的 URL）。
+fn extract_manual_code(raw: &str) -> String {
+    let s = raw.trim();
+    if s.contains("code=") {
+        let parsed = tauri::Url::parse(s)
+            .or_else(|_| tauri::Url::parse(&format!("http://127.0.0.1/?{s}")))
+            .ok();
+        if let Some(u) = parsed {
+            if let Some((_, v)) = u.query_pairs().find(|(k, _)| k == "code") {
+                if !v.is_empty() {
+                    return v.into_owned();
+                }
+            }
+        }
+    }
+    s.to_string()
 }
 
 /// 取消结果:是否取消 + 被取消的 epoch(供 app 退出路径 [`wait_for_login_epoch_complete`] 等该 task 真退出)。
@@ -167,10 +211,30 @@ pub fn routes() -> Router<AdminState> {
         .route("/api/grok-build-oauth/status", get(status_handler))
         .route("/api/grok-build-oauth/login", post(login_handler))
         .route(
+            "/api/grok-build-oauth/submit-code",
+            post(submit_code_handler),
+        )
+        .route(
             "/api/grok-build-oauth/login/cancel",
             delete(cancel_login_handler),
         )
         .route("/api/grok-build-oauth/logout", delete(logout_handler))
+}
+
+#[derive(Deserialize)]
+struct SubmitCodeBody {
+    code: String,
+}
+
+/// 用户把授权页显示的 code 粘回：送到等待中的 login_handler（[MOC-300] 手动路径）。
+async fn submit_code_handler(Json(body): Json<SubmitCodeBody>) -> impl IntoResponse {
+    match lock_manual_code_slot().take() {
+        Some((_, tx)) => {
+            let accepted = tx.send(body.code).is_ok();
+            Json(json!({ "accepted": accepted })).into_response()
+        }
+        None => Json(json!({ "accepted": false, "error": "无进行中的登录" })).into_response(),
+    }
 }
 
 async fn status_handler() -> impl IntoResponse {
@@ -478,9 +542,33 @@ async fn login_handler() -> impl IntoResponse {
         });
     }
 
-    // 5. 等 loopback 捕获 code(cancel / 超时 / 授权被拒可中断;state 在 capture 内就地校验)。
-    let capture = capture_callback(listener, &auth_req.state, cancel_rx, LOGIN_TIMEOUT).await;
+    // 5. 等 code:loopback 自动捕获 **或** 用户手动粘回(先到者胜)。xAI 授权页对本 client 显示
+    //    code 让用户复制粘回(不跳 loopback,实证 2026-07-09),故手动路径是主路径;loopback 保留
+    //    兜底(万一某些情况真跳回来)。
+    let (code_tx, code_rx) = oneshot::channel::<String>();
+    {
+        let mut slot = lock_manual_code_slot();
+        // 抢占旧的 pending(与 cancel slot 一致);旧 sender 直接丢弃。
+        *slot = Some((my_epoch, code_tx));
+    }
+    let capture = tokio::select! {
+        r = capture_callback(listener, &auth_req.state, cancel_rx, LOGIN_TIMEOUT) => r,
+        manual = code_rx => match manual {
+            Ok(raw) => {
+                let code = extract_manual_code(&raw);
+                if code.is_empty() {
+                    Err(CaptureError::Denied("粘贴的内容里没有可识别的 code".into()))
+                } else {
+                    // 手动粘贴 = 用户可信来源(非杂散本地回调),state 用本次登录 expected,
+                    // complete 内的 state 校验直接通过(CSRF 由「用户亲手粘」这一动作保证)。
+                    Ok(CallbackParams { code, state: auth_req.state.clone() })
+                }
+            }
+            Err(_) => Err(CaptureError::Cancelled), // sender 被抢占/丢弃
+        },
+    };
     login_done.store(true, Ordering::Relaxed);
+    cleanup_manual_code_slot(my_epoch);
     web_session_quota::close_external_login_window(GROK_BUILD_LOGIN_WIN);
 
     // 6. 换 token 落盘(complete 内校验 state + PKCE code_verifier)。
@@ -529,5 +617,23 @@ mod tests {
         let outcome = cancel_in_flight_login();
         assert!(!outcome.cancelled);
         assert!(outcome.cancelled_epoch.is_none());
+    }
+
+    #[test]
+    fn extract_manual_code_handles_bare_url_and_query() {
+        // 裸 code(xAI 授权页显示的形态)原样。
+        assert_eq!(
+            extract_manual_code("  TpKQG9jySp_uFU6ahZcpAIWEBxhEO1Uzd7szAn  "),
+            "TpKQG9jySp_uFU6ahZcpAIWEBxhEO1Uzd7szAn"
+        );
+        // 完整 callback URL → 取 code。
+        assert_eq!(
+            extract_manual_code("http://127.0.0.1:56121/callback?code=ABC123&state=xy"),
+            "ABC123"
+        );
+        // 裸 query 串(无 scheme)→ 取 code。
+        assert_eq!(extract_manual_code("code=ZZ9&state=q"), "ZZ9");
+        // 不含 code= 的裸串原样(不误判)。
+        assert_eq!(extract_manual_code("plaincode123"), "plaincode123");
     }
 }

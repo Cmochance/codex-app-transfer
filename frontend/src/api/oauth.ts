@@ -70,6 +70,12 @@ export function oauthCancelLogin(kind: OAuthKind) {
   const { base } = endpoint(kind)
   return api('DELETE', `${base}/login/cancel`)
 }
+// [MOC-300] 手动粘 code(仅 grokBuild):xAI 授权页显示 code 让用户复制粘回,而非重定向到
+// loopback。粘回的 code 送到等待中的 login,唤醒它换 token。返回 {accepted}。
+export function oauthSubmitCode(kind: OAuthKind, code: string) {
+  const { base } = endpoint(kind)
+  return api<{ accepted: boolean; error?: string }>('POST', `${base}/submit-code`, { code })
+}
 export function oauthLogout(kind: OAuthKind, providerId?: string) {
   const { base, query } = endpoint(kind, providerId)
   return api('DELETE', `${base}/logout${query}`)
