@@ -102,6 +102,15 @@ impl RequestMapper for ResponsesPassthroughMapper {
         // custom/namespace/tool_search/image_generation)且不支持 reasoning.effort。进 1:1 透传
         // 前把请求体适配成 grok 接受的形态(工具转换复用 chat 路径决策,见 mapper::grok_build)。
         // 非 grok-build provider 恒不改,透传语义与 MOC-234 完全一致。其余 provider 仍严格 1:1。
+        // [MOC-301/304 review P1] grok 响应侧 shim 的 context 必须从**适配前** body 提取 —— 此时
+        // tools 还带 custom/tool_search/namespace 类型;`adapt_grok_build_request_body` 之后它们全变
+        // function,`grok_shim_request_context` 就认不出了(会得空 context → shim 永不 repack)。
+        // 提取后 stash 进 adapter_metadata,response 侧从那读(而非从已适配的 request_plan.body 重推)。
+        let grok_shim_ctx = if crate::mapper::grok_build::is_grok_build_provider(provider) {
+            Some(crate::mapper::grok_build::grok_shim_request_context(&body))
+        } else {
+            None
+        };
         let body = if crate::mapper::grok_build::is_grok_build_provider(provider) {
             crate::mapper::grok_build::adapt_grok_build_request_body(&body, provider)
                 .unwrap_or(body)
@@ -112,7 +121,17 @@ impl RequestMapper for ResponsesPassthroughMapper {
         // [MOC-234] 只读观测整合(gate=breakdown_enabled,默认关零开销):旁路 parse 一份
         // 副本算 responses 原生 context_breakdown + 喂会话观测镜像。返回的 adapter_metadata
         // 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
-        let adapter_metadata = build_observe_metadata(client_path, &body);
+        let mut adapter_metadata = build_observe_metadata(client_path, &body);
+        if let Some(ctx) = grok_shim_ctx {
+            if let Ok(v) = serde_json::to_value(&ctx) {
+                match adapter_metadata.as_mut() {
+                    Some(Value::Object(m)) => {
+                        m.insert("grok_shim_ctx".into(), v);
+                    }
+                    _ => adapter_metadata = Some(serde_json::json!({ "grok_shim_ctx": v })),
+                }
+            }
+        }
 
         // 路径 normalize:剥 `/openai` legacy prefix + `/claude/v1/messages` alias +
         // 前导 `/v1`(provider.base_url 已带 `/v1`)+ 保 query。**不能**只剥 `/v1`,
@@ -143,7 +162,7 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         upstream_status: StatusCode,
         upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
-        _provider: &Provider,
+        provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
         // [MOC-299] 本地 compaction:上游是我们发的 stream:false 摘要请求,回来的完整 JSON 在此包成
@@ -203,6 +222,54 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         // 非阻塞入队后原样立即返回,**不改字节、不 await、不解析**;SSE 抽行找 `response.completed`、
         // 把本轮(input+output)记进 always-on 会话观测镜像(供 breakdown 拼全历史 + orphan-400 降级
         // 重建上下文),全在独立 spawned task 异步完成(见 `ObserveTeeStream` doc)。
+        // [MOC-301/304] grok:响应侧 tool-call shim —— 把 grok 回的 `function_call`(name=apply_patch /
+        // tool_search,因请求侧转了 function)重打包回 Codex 认的 `custom_tool_call` / `tool_search_call`,
+        // 并给发现的 namespace 工具补 `namespace`。**仅 grok**;其余 responses passthrough 仍严格 1:1。
+        // cwd 供 apply_patch preflight;ctx 携带请求侧「哪些工具真被 lower + name→namespace」元数据
+        // (review:只 repack 真被 lower 的、给 MCP 工具补 namespace)。
+        if crate::mapper::grok_build::is_grok_build_provider(provider) {
+            let parsed = serde_json::from_slice::<Value>(&request_plan.body).ok();
+            let cwd = parsed
+                .as_ref()
+                .and_then(|v| crate::responses::apply_patch_preflight::extract_cwd(Some(v)));
+            // [review P1] 从 map_request stash 的适配前元数据读(而非从已适配 body 重推,那会得空 ctx)。
+            let ctx = request_plan
+                .adapter_metadata
+                .as_ref()
+                .and_then(|m| m.get("grok_shim_ctx").cloned())
+                .and_then(|v| {
+                    serde_json::from_value::<crate::mapper::grok_build::GrokShimContext>(v).ok()
+                })
+                .unwrap_or_default();
+            // [review thread2] stream:false 的 grok 成功响应是单 JSON(非 SSE),SSE shim 不改写它 →
+            // 走 JSON 改写路径;流式(Codex Desktop 常态)走 SSE shim + ObserveTee。
+            if !request_is_streaming(request_plan) {
+                return grok_rewrite_json_response(
+                    upstream_status,
+                    upstream_headers,
+                    upstream_stream,
+                    cwd,
+                    ctx,
+                );
+            }
+            // [review Pit5Z] observe **在 shim 之前**套 —— 观测镜像记的是**原始 grok 上游**
+            // (function_call),客户端拿的是 shim 后的 custom_tool_call/tool_search_call。理由:
+            // orphan-400 transparent retry(store:false 续轮兜底)从观测镜像重建 body 后**直接回灌
+            // 上游、不再过 adapt_grok_build_request_body**,故镜像必须是 grok 认的 function_call;若
+            // 记 shim 后的 custom_tool_call/tool_search_call,retry 会把 grok 不认的类型送回去 → 422。
+            let observed = Box::pin(ObserveTeeStream::new(
+                upstream_stream,
+                observe_ctx_from_plan(request_plan),
+            )) as ByteStream;
+            let stream = Box::pin(crate::responses::grok_tool_shim::GrokShimStream::new(
+                observed, cwd, ctx,
+            )) as ByteStream;
+            return Ok(ResponsePlan {
+                status: upstream_status,
+                headers: upstream_headers,
+                stream,
+            });
+        }
         let stream = Box::pin(ObserveTeeStream::new(
             upstream_stream,
             observe_ctx_from_plan(request_plan),
@@ -325,6 +392,45 @@ fn request_is_streaming(plan: &RequestPlan) -> bool {
         .ok()
         .and_then(|v| v.get("stream").and_then(Value::as_bool))
         .unwrap_or(false)
+}
+
+/// [MOC-301/304 review thread2] 非流式(`stream:false`)grok 成功响应:上游是单 JSON `{output:[...]}`
+/// (非 SSE)。`GrokShimStream` 只 parse `data:` 帧、不改写它 → apply_patch/tool_search 的 function_call
+/// 原样回客户端被误路由。这里 collect 完整 JSON → 用 shim 的 `rewrite_json_response` 改写 `output[]`
+/// (与流式 envelope 同一套)→ 回改写后的 JSON。Codex Desktop 常态是 `stream:true`,此路径是稳健兜底。
+fn grok_rewrite_json_response(
+    upstream_status: StatusCode,
+    upstream_headers: HeaderMap,
+    upstream_stream: ByteStream,
+    cwd: Option<String>,
+    ctx: crate::mapper::grok_build::GrokShimContext,
+) -> Result<ResponsePlan, AdapterError> {
+    let stream = Box::pin(futures_util::stream::once(async move {
+        use futures_util::StreamExt;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut upstream = upstream_stream;
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(b) => buf.extend_from_slice(&b),
+                Err(e) => return Err(e),
+            }
+        }
+        match serde_json::from_slice::<Value>(&buf) {
+            Ok(mut v) => {
+                let shim = crate::responses::grok_tool_shim::GrokToolCallShim::new(cwd, ctx);
+                shim.rewrite_json_response(&mut v);
+                let out = serde_json::to_vec(&v).unwrap_or(buf);
+                Ok::<Bytes, std::io::Error>(Bytes::from(out))
+            }
+            // 非 JSON(成功路径理论上都是 JSON;兜底原样回,不吞)。
+            Err(_) => Ok(Bytes::from(buf)),
+        }
+    })) as ByteStream;
+    Ok(ResponsePlan {
+        status: upstream_status,
+        headers: upstream_headers,
+        stream,
+    })
 }
 
 /// 从 `RequestPlan.adapter_metadata` 取出 response 侧记录所需的观测上下文。

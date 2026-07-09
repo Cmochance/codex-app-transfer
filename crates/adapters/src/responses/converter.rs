@@ -112,7 +112,7 @@ struct PendingToolCall {
 ///
 /// 名字以常量集中是为了和 `request/tools.rs::APPLY_PATCH_TOOL_NAME` 对齐
 /// 字符串一致性(请求侧的特判描述 / 响应侧的 wire 重打包必须按同一 name 触发)。
-fn is_apply_patch_tool_name(name: &str) -> bool {
+pub(crate) fn is_apply_patch_tool_name(name: &str) -> bool {
     name == "apply_patch"
 }
 
@@ -127,7 +127,7 @@ fn is_apply_patch_tool_name(name: &str) -> bool {
 /// 跟 `request/tools.rs` 的 `"tool_search"` match arm 字符串对齐(请求侧把
 /// tool_search 降级成 chat function;响应侧把 chat function_call 升回
 /// `tool_search_call`,name 必须一致才能触发本特判)。
-fn is_tool_search_tool_name(name: &str) -> bool {
+pub(crate) fn is_tool_search_tool_name(name: &str) -> bool {
     name == "tool_search"
 }
 
@@ -156,7 +156,7 @@ fn should_redirect_to_tool_search(name: &str) -> bool {
 /// tool_search 期望 arguments `{query, limit?}`。redirect 来的 legacy 工具
 /// arguments 是 `{server:X[, uri:Y]}` / `{cursor:...}` 等,转成 `{query:X}`。
 /// 已经是 `{query}` 形态(LLM 直接调 tool_search)则原样返回。
-fn normalize_tool_search_arguments(args: Value) -> Value {
+pub(crate) fn normalize_tool_search_arguments(args: Value) -> Value {
     let Some(obj) = args.as_object() else {
         return args;
     };
@@ -1908,7 +1908,7 @@ fn translate_annotation(a: &Value) -> Value {
     Value::Object(out)
 }
 
-fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value) {
+pub(crate) fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value) {
     emit_sse_event(out, seq, event_name, payload);
 }
 
@@ -2100,7 +2100,7 @@ pub(crate) struct V4aError {
 ///
 /// 来源:MOC-57(#321,作者 @Alpaca233114514);返回类型从原 `TruncationInfo`
 /// struct 简化为 `Option<String>`(原 `level` 字段从未被读,去掉避免 dead_code)。
-fn detect_json_truncation(s: &str) -> Option<String> {
+pub(crate) fn detect_json_truncation(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return None;
@@ -2149,7 +2149,7 @@ fn detect_json_truncation(s: &str) -> Option<String> {
 /// 的安全判定(仅认列 0、无前缀整行),故正文里的 `+*** End Patch` 不会误判为结尾。
 ///
 /// 来源:MOC-57(#321,作者 @Alpaca233114514)。
-fn detect_v4a_truncation(v4a: &str) -> Option<String> {
+pub(crate) fn detect_v4a_truncation(v4a: &str) -> Option<String> {
     if v4a.is_empty() {
         return None;
     }
