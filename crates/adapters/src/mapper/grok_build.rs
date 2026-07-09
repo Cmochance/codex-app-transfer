@@ -214,15 +214,15 @@ pub(crate) fn grok_shim_request_context(body: &[u8]) -> GrokShimContext {
                     }
                 }
                 Some("tool_search") => ctx.tool_search_lowered = true,
-                Some("namespace") => collect_namespace_map(t, &mut ctx.namespace_map),
                 _ => {}
             }
         }
     }
-    // 发现的工具(tool_search_output.tools)也可能是 namespace 包 → 同样收 name→namespace。
-    for t in crate::responses::request::discovered_tools_from_tool_search_output(&v) {
-        collect_namespace_map(&t, &mut ctx.namespace_map);
-    }
+    // [review Pit5W] namespace_map 用 core::events::build_tool_namespace_map —— 它扫 tools[] namespace 包
+    // + input tool_search_output.tools 并**累积进进程级缓存**返回全量,解决多轮里早轮 tool_search 发现的
+    // 工具在后续轮 tool_search_output 消失后 namespace 丢失(否则 add_namespace_if_mapped 补不上 →
+    // grok 回的 function_call 缺 namespace → Codex 当 unsupported 拒)。与 chat 路径同一累积器(DRY)。
+    ctx.namespace_map = crate::core::events::build_tool_namespace_map(Some(&v));
     ctx
 }
 
@@ -253,24 +253,6 @@ fn normalize_grok_tool_choice(tc: &Value, orig_tools: &[Value]) -> Option<Value>
             present.then(|| json!({ "type": "function", "name": "tool_search" }))
         }
         _ => None,
-    }
-}
-
-/// 把一个 namespace 包的内层 function name → namespace 名收进 `map`。
-fn collect_namespace_map(t: &Value, map: &mut std::collections::HashMap<String, String>) {
-    if t.get("type").and_then(Value::as_str) != Some("namespace") {
-        return;
-    }
-    let (Some(ns), Some(inner)) = (
-        t.get("name").and_then(Value::as_str),
-        t.get("tools").and_then(Value::as_array),
-    ) else {
-        return;
-    };
-    for f in inner {
-        if let Some(n) = f.get("name").and_then(Value::as_str) {
-            map.insert(n.to_owned(), ns.to_owned());
-        }
     }
 }
 

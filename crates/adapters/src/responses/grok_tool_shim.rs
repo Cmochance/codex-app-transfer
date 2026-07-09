@@ -393,13 +393,36 @@ impl GrokToolCallShim {
     /// 终帧(completed / incomplete / failed):同步重写 `response.output[]` 里的 apply_patch /
     /// tool_search function_call → custom_tool_call / tool_search_call(与流式 done 一致)。
     fn on_terminal(&mut self, event_name: &str, mut data: Value, out: &mut Vec<u8>) {
+        // [review Pit5c] 若终帧(completed/incomplete/failed)到来时还有拦截项 open(grok 中途截断),
+        // **先**把它们 emit 成 incomplete 的 output_item.done —— 必须在终帧之前,否则 tool-call 完成
+        // 事件排在终帧之后、且 envelope 会把它当完整重写,严格客户端会看到「截断响应上却有完成态 tool
+        // call」。同时把这些 item 在 envelope output[] 里也强制 incomplete(rewrite 按 args 算的 status
+        // 可能是 completed,与流式 done 的 incomplete 矛盾)。
+        let mut interrupted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !self.items.is_empty() {
+            let mut leftovers: Vec<(u64, Pending)> = self.items.drain().collect();
+            leftovers.sort_by_key(|(idx, _)| *idx);
+            self.id_to_index.clear();
+            for (output_index, p) in leftovers {
+                interrupted.insert(p.item_id.clone());
+                self.emit_tool_call_done(output_index, &p, true, out);
+            }
+        }
         if let Some(output) = data
             .get_mut("response")
             .and_then(|r| r.get_mut("output"))
             .and_then(|o| o.as_array_mut())
         {
             for item in output.iter_mut() {
+                let id = item.get("id").and_then(|v| v.as_str()).map(str::to_owned);
                 self.rewrite_envelope_item(item);
+                if let Some(id) = id {
+                    if interrupted.contains(&id) {
+                        if let Some(o) = item.as_object_mut() {
+                            o.insert("status".into(), Value::String("incomplete".into()));
+                        }
+                    }
+                }
             }
         }
         emit_event(out, &mut self.seq, event_name, data);

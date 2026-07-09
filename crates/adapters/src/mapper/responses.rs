@@ -252,15 +252,17 @@ impl ResponseMapper for ResponsesPassthroughMapper {
                     ctx,
                 );
             }
-            // shim 在 ObserveTee 之前套,让观测镜像看到 Codex 实际收到的转换后流。
-            let shimmed = Box::pin(crate::responses::grok_tool_shim::GrokShimStream::new(
+            // [review Pit5Z] observe **在 shim 之前**套 —— 观测镜像记的是**原始 grok 上游**
+            // (function_call),客户端拿的是 shim 后的 custom_tool_call/tool_search_call。理由:
+            // orphan-400 transparent retry(store:false 续轮兜底)从观测镜像重建 body 后**直接回灌
+            // 上游、不再过 adapt_grok_build_request_body**,故镜像必须是 grok 认的 function_call;若
+            // 记 shim 后的 custom_tool_call/tool_search_call,retry 会把 grok 不认的类型送回去 → 422。
+            let observed = Box::pin(ObserveTeeStream::new(
                 upstream_stream,
-                cwd,
-                ctx,
-            )) as ByteStream;
-            let stream = Box::pin(ObserveTeeStream::new(
-                shimmed,
                 observe_ctx_from_plan(request_plan),
+            )) as ByteStream;
+            let stream = Box::pin(crate::responses::grok_tool_shim::GrokShimStream::new(
+                observed, cwd, ctx,
             )) as ByteStream;
             return Ok(ResponsePlan {
                 status: upstream_status,
