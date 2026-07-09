@@ -9,6 +9,7 @@ import {
   oauthLogin,
   oauthCancelLogin,
   oauthLogout,
+  oauthSubmitCode,
   type OAuthKind,
   type OAuthStatus,
 } from '@/api/oauth'
@@ -24,6 +25,9 @@ const { show: toast } = useToast()
 const status = ref<OAuthStatus | null>(null)
 const logging = ref(false)
 let cancelled = false
+// [MOC-300] 仅 grokBuild:xAI 授权页显示 code 让用户粘回(不跳 loopback),登录中态提供输入框。
+const manualCode = ref('')
+const submittingCode = ref(false)
 
 function errMsg(e: unknown): string {
   return (e as Error)?.message || String(e)
@@ -68,6 +72,24 @@ async function onCancel() {
     /* 取消本身失败不影响:login 那边会自行结束 */
   }
 }
+// grokBuild 手动粘 code:送到后端等待中的 login,由它换 token(login 随即返回并 refresh)。
+async function onSubmitCode() {
+  const code = manualCode.value.trim()
+  if (!code || submittingCode.value) return
+  submittingCode.value = true
+  try {
+    const res = await oauthSubmitCode(props.kind, code)
+    if (!res?.accepted) {
+      toast(res?.error || t('oauth.submitCodeFailed'), 'error')
+    } else {
+      manualCode.value = ''
+    }
+  } catch (e) {
+    toast(errMsg(e), 'error')
+  } finally {
+    submittingCode.value = false
+  }
+}
 async function onLogout() {
   try {
     await oauthLogout(props.kind, props.providerId)
@@ -83,6 +105,24 @@ async function onLogout() {
     <template v-if="logging">
       <span class="oauth__msg">{{ t('oauth.loggingIn') }}</span>
       <AppButton size="sm" variant="secondary" :label="t('common.cancel')" @click="onCancel" />
+      <template v-if="kind === 'grokBuild'">
+        <input
+          v-model="manualCode"
+          class="oauth__code-input"
+          :placeholder="t('oauth.pasteCodePlaceholder')"
+          spellcheck="false"
+          autocomplete="off"
+          @keyup.enter="onSubmitCode"
+        />
+        <AppButton
+          size="sm"
+          variant="primary"
+          :label="t('oauth.submitCode')"
+          :disabled="!manualCode.trim() || submittingCode"
+          @click="onSubmitCode"
+        />
+        <span class="oauth__hint">{{ t('oauth.pasteCodeHint') }}</span>
+      </template>
     </template>
     <template v-else-if="status?.loggedIn">
       <span class="oauth__msg oauth__msg--ok">{{
@@ -110,5 +150,21 @@ async function onLogout() {
 }
 .oauth__msg--ok {
   color: var(--success);
+}
+.oauth__code-input {
+  flex: 1 1 180px;
+  min-width: 120px;
+  font-size: var(--fs-sm);
+  font-family: var(--font-mono, monospace);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+}
+.oauth__hint {
+  flex-basis: 100%;
+  font-size: var(--fs-xs, 11px);
+  color: var(--text-muted);
 }
 </style>

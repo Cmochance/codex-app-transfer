@@ -261,6 +261,23 @@
   > **算法**(参考 chenyme/grok2api `app/dataplane/proxy/adapters/headers.py::_statsig_id`):...
   > chenyme `sso={t}; sso-rw={t}` 行为复刻:用户只提供 sso 时自动双写。
 
+## BlockedPath/pi-xai-oauth
+
+- **Link**: https://github.com/BlockedPath/pi-xai-oauth
+- **License**: 见上游 LICENSE
+- **借鉴形式**: 反向工程产物借鉴
+- **首次借鉴 PR / 时间**: MOC-300 grok CF 登录修复(2026-07-09,device flow → auth-code + PKCE)
+- **借鉴清单**:
+  - 官方 grok CLI 的 OAuth **authorization code + PKCE** 流程反向工程结论(issuer `auth.x.ai`、OIDC discovery `/.well-known/openid-configuration`、`client_id=b1a00492-073a-47ea-816f-4c329264a828`、scope、固定 loopback redirect `http://127.0.0.1:56121/callback`、PKCE S256、`grant_type`) → `crates/gemini_oauth/src/grok_build/mod.rs`(`discover_endpoints` / `build_authorize_url` / `prepare_grok_build_authorization` / `complete_grok_build_login`)
+  - 「浏览器/webview 导航授权页过 Cloudflare、code→token 纯 API POST 不被拦」的结论(据此弃用被 CF 拦的 device flow) → 同上 + `src-tauri/src/admin/handlers/grok_build_oauth.rs`(loopback callback server)
+- **本项目差异 / 扩展**:
+  - Rust 实现;loopback server 用 tokio `TcpListener`(pi-xai-oauth 是 Node);endpoint 走 OIDC discovery + 硬编码兜底;端点 / CF 行为仍待真机验证(见 MOC-300)
+- **同步策略**: monitor only(grok CLI OAuth 端点 / client_id 变动时关注上游)
+- **TOS / 法律注意**: ⚠️ 复用 xAI grok CLI 编码后端,TOS 灰色区;仅限本机个人使用、不作对外服务(与 grok_web 一致)
+- **关联 PR / followup / issue**: MOC-300 / MOC-299(grok build 接入)
+- **代码层引用**(节选):
+  > 参考实证:github.com/BlockedPath/pi-xai-oauth(逆向官方 grok CLI 的 auth-code + PKCE 流程)。
+
 ## galaxywk223/codex-plugin-unlocker
 
 - **Link**: https://github.com/galaxywk223/codex-plugin-unlocker

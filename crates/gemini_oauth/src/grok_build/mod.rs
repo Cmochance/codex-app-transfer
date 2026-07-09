@@ -3,26 +3,35 @@
 //! 跟 [`super::workbuddy`] / [`super::trae`] 并行:浏览器授权一次 → 本地持久化凭证 →
 //! 后续复用 + 临期自动 refresh,免手填 key、**不依赖本地安装 grok CLI**。
 //!
-//! ## 鉴权 wire(2026-07-06 抓包 + 二进制静态实证)
+//! ## 鉴权 wire(2026-07-06 抓包 + 2026-07-09 CF 拦截调研,MOC-300)
 //!
-//! 标准 **OAuth2 device authorization grant(RFC 8628)**,`accounts.x.ai`:
-//! 1. `POST /oauth2/device/code`(form:`client_id` + `scope`)→ `{device_code, user_code,
-//!    verification_uri, verification_uri_complete, expires_in, interval}`
-//! 2. 用户浏览器打开 `verification_uri_complete` 授权
-//! 3. `POST /oauth2/token`(form:`grant_type=urn:ietf:params:oauth:grant-type:device_code`
-//!    + `device_code` + `client_id`)轮询 → `{access_token, refresh_token, token_type,
-//!    expires_in, id_token}`;授权前返 `{error:"authorization_pending"|"slow_down"}`
-//! 4. 临期:`POST /oauth2/token`(`grant_type=refresh_token` + `refresh_token` + `client_id`)
+//! 标准 **OAuth2 authorization code + PKCE(S256)**,issuer `https://auth.x.ai`:
+//! 1. **OIDC discovery** `GET https://auth.x.ai/.well-known/openid-configuration` 取
+//!    `authorization_endpoint` / `token_endpoint`(端点漂移兜底见 [`FALLBACK_AUTHORIZE_URL`])。
+//! 2. 生成 PKCE(verifier/challenge S256)+ state + nonce,拼 authorize URL,**在浏览器/内置
+//!    webview 里导航打开**(关键:授权页导航由真实 webview 发起,自然过 Cloudflare challenge —— 这
+//!    正是弃用 device flow 的原因:device flow 的 `POST /oauth2/device/code` 是**无浏览器的裸
+//!    HTTP**,被 CF WAF 拦返 block page,见 MOC-300)。
+//! 3. 用户授权后 —— **实证(2026-07-09 真机)**:xAI 对本 client **不重定向到 loopback**,而是显示
+//!    一个 code 让用户复制粘回 app 完成(与官方 grok CLI / pi-xai-oauth 手动兜底一致);loopback
+//!    `http://127.0.0.1:56121/callback?code=…&state=…` server 保留作兜底自动捕获。redirect_uri
+//!    (换 token 用)**必须与 authorize 请求里的值一致**。code 交给 [`complete_grok_build_login`]。
+//! 4. `POST {token_endpoint}`(form:`grant_type=authorization_code` + `code` + `redirect_uri`
+//!    + `client_id` + `code_verifier`)换 `{access_token, refresh_token, token_type, expires_in,
+//!    id_token}`。此 POST 是纯 API(非 HTML 授权页),CF 不拦(pi-xai-oauth 实证 Node 侧可换)。
+//! 5. 临期:`POST {token_endpoint}`(`grant_type=refresh_token` + `refresh_token` + `client_id`)。
 //!
 //! access token = auth.x.ai 签发的 OIDC JWT(ES256),6h TTL。打 `cli-chat-proxy.grok.com/v1`
 //! 的 Responses wire,`Authorization: Bearer <access_token>` + grok-shell 客户端指纹头(forward.rs)。
+//! 流程拆两段:[`prepare_grok_build_authorization`](discovery+PKCE+URL,不触网授权)+
+//! [`complete_grok_build_login`](校验 state → 换 token → 落盘);loopback server + 开浏览器在
+//! Tauri handler(`admin::handlers::grok_build_oauth`)。参考实证:github.com/BlockedPath/pi-xai-oauth。
 //!
 //! ## client_id
 //!
-//! grok CLI 的 client_id 由远端 `login-config` 下发(可轮换),**未硬编码**。本模块 v1 用
-//! 抓包实证的 [`DEFAULT_CLIENT_ID`](= 登录账号 JWT 的 aud)。login-config 动态取的确切端点
-//! 尚未抓实(登录流被 grok leader 架构挡住,见 MOC-299),[`resolve_client_id`] 预留 seam,
-//! 待端点核实后接入(followup);当前恒返回 pin 值。
+//! grok CLI 的 client_id 由远端 `login-config` 下发(可轮换),**未硬编码**。本模块用抓包实证的
+//! [`DEFAULT_CLIENT_ID`](= 登录账号 JWT 的 aud,与 pi-xai-oauth 逆向值精确一致)。[`resolve_client_id`]
+//! 预留 seam,待 login-config 端点核实后接入(followup);当前恒返回 pin 值。
 
 pub mod token;
 
@@ -33,12 +42,20 @@ use thiserror::Error;
 
 pub use token::{unix_now_ms, GrokBuildCredential, GrokBuildCredentialStore, GrokBuildTokenError};
 
-/// device authorization 端点。
-pub const DEVICE_CODE_URL: &str = "https://accounts.x.ai/oauth2/device/code";
-/// token 端点(device_code 换 token + refresh_token 续期)。
-pub const TOKEN_URL: &str = "https://accounts.x.ai/oauth2/token";
-/// RFC 8628 device_code grant_type。
-pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// OIDC discovery 文档(动态解析 authorize / token 端点,抗端点漂移)。
+pub const OIDC_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
+/// discovery 不可用时的 authorize 端点兜底(issuer=auth.x.ai)。
+pub const FALLBACK_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
+/// discovery 不可用时的 token 端点兜底(authorization_code 换 token + refresh_token 续期);
+/// 也是老凭证(无存储 token_endpoint)refresh 的回落端点。
+pub const FALLBACK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+/// 固定 loopback redirect_uri —— **必须与 xAI OAuth client 注册值精确一致**(pi-xai-oauth 实证
+/// 官方 grok CLI 用端口 56121;xAI 对 public client 未必放开任意 loopback 端口,故固定不用随机端口)。
+pub const REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
+/// loopback callback server 监听端口(与 [`REDIRECT_URI`] 一致)。
+pub const LOOPBACK_PORT: u16 = 56121;
+/// authorization_code grant_type。
+pub const AUTH_CODE_GRANT_TYPE: &str = "authorization_code";
 /// 抓包实证的 OAuth client_id(登录账号 JWT 的 aud);login-config 动态取未接入前的兜底。
 pub const DEFAULT_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 /// 登录 scope(JWT scope claim 实证)。
@@ -139,8 +156,6 @@ pub fn is_grok_build_owned_header(name: &str) -> bool {
 const REFRESH_SKEW_MS: i64 = 300_000;
 /// 服务端未回 `expires_in` 时的兜底 TTL:1 小时(auth.x.ai 实测 6h,取更保守值免过期后每请求 401)。
 const ASSUMED_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
-/// device 授权轮询在服务端 `slow_down` 时的 interval 增量(RFC 8628 §3.5)。
-const SLOW_DOWN_STEP_SECS: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum GrokBuildError {
@@ -154,7 +169,11 @@ pub enum GrokBuildError {
     Parse(String),
     #[error("响应缺少必需字段: {0}")]
     MissingField(&'static str),
-    #[error("设备授权已过期,请重新发起登录")]
+    #[error("PKCE/RNG 失败: {0}")]
+    Rng(String),
+    #[error("回调 state 不匹配(可能的 CSRF / 会话串扰),已中止登录")]
+    StateMismatch,
+    #[error("授权已过期,请重新发起登录")]
     DeviceCodeExpired,
     #[error("用户拒绝了授权")]
     AccessDenied,
@@ -166,25 +185,32 @@ pub enum GrokBuildError {
     NotLoggedIn,
 }
 
-/// `POST /oauth2/device/code` 的响应(RFC 8628)。UI 用 `user_code` +
-/// `verification_uri_complete` 引导用户授权,后台用 `device_code` + `interval` 轮询。
+/// OIDC discovery 文档里我们要的两个端点(其余字段忽略)。
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeviceAuthResponse {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    #[serde(default)]
-    pub verification_uri_complete: Option<String>,
-    pub expires_in: i64,
-    #[serde(default = "default_interval")]
-    pub interval: i64,
+struct OidcDiscovery {
+    authorization_endpoint: String,
+    token_endpoint: String,
 }
 
-fn default_interval() -> i64 {
-    5
+/// 一次 authorization-code 登录的本地状态。handler 据 [`Self::authorize_url`] 开浏览器 + 起
+/// loopback,拿到回调 `code`/`state` 后连同本结构交给 [`complete_grok_build_login`]。
+#[derive(Debug, Clone)]
+pub struct AuthorizationRequest {
+    /// 浏览器/webview 要导航打开的 authorize URL(已带 client_id/redirect/scope/state/nonce/PKCE challenge)。
+    pub authorize_url: String,
+    /// CSRF 防护:回调 `state` 必须与此精确一致,否则 [`GrokBuildError::StateMismatch`]。
+    pub state: String,
+    /// PKCE `code_verifier`(换 token 时上送)。
+    pub verifier: String,
+    /// 本次登录 discovery 到的 token 端点(complete 换 token + 后续 refresh 复用)。
+    pub token_endpoint: String,
+    /// 固定 loopback redirect_uri(换 token 时须原样回送,须与 client 注册值一致)。
+    pub redirect_uri: String,
+    /// 本次登录的 client_id。
+    pub client_id: String,
 }
 
-/// token 端点成功响应(device_code 换取 / refresh)。
+/// token 端点成功响应(authorization_code 换取 / refresh)。
 #[derive(Debug, Clone, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -215,20 +241,108 @@ pub async fn resolve_client_id(_http: &reqwest::Client) -> String {
     DEFAULT_CLIENT_ID.to_string()
 }
 
-/// 第 1 步:发起 device authorization,拿 `user_code` + 授权 URL + `device_code`。
-pub async fn start_device_authorization(
-    http: &reqwest::Client,
+/// OIDC discovery 解析 authorize / token 端点;失败(网络 / CF / 缺字段)回落到硬编码兜底。
+/// discovery 是纯 JSON GET,CF 不像对 device/code 那样拦(它只拦裸 device authorization POST)。
+pub async fn discover_endpoints(http: &reqwest::Client) -> (String, String) {
+    match http.get(OIDC_DISCOVERY_URL).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<OidcDiscovery>().await {
+            Ok(d) if !d.authorization_endpoint.is_empty() && !d.token_endpoint.is_empty() => {
+                return (d.authorization_endpoint, d.token_endpoint);
+            }
+            Ok(_) => tracing::warn!("grok OIDC discovery 缺 authorize/token 端点,用兜底"),
+            Err(e) => tracing::warn!(error = %e, "grok OIDC discovery 解析失败,用兜底"),
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "grok OIDC discovery 非 2xx,用兜底")
+        }
+        Err(e) => tracing::warn!(error = %e, "grok OIDC discovery 请求失败,用兜底"),
+    }
+    (
+        FALLBACK_AUTHORIZE_URL.to_string(),
+        FALLBACK_TOKEN_URL.to_string(),
+    )
+}
+
+/// 拼 authorize URL(query:response_type/client_id/redirect_uri/scope/state/nonce/PKCE challenge)。
+/// 纯函数,便于单测;`code_challenge_method` 固定 S256。
+fn build_authorize_url(
+    authorize_endpoint: &str,
     client_id: &str,
-) -> Result<DeviceAuthResponse, GrokBuildError> {
+    redirect_uri: &str,
+    state: &str,
+    nonce: &str,
+    code_challenge: &str,
+) -> Result<String, GrokBuildError> {
+    let mut url = url::Url::parse(authorize_endpoint)
+        .map_err(|e| GrokBuildError::Parse(format!("authorize 端点非法 URL: {e}")))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", SCOPES)
+        .append_pair("state", state)
+        .append_pair("nonce", nonce)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256");
+    Ok(url.to_string())
+}
+
+/// **第 1 段**:发起 authorization-code + PKCE 登录 —— resolve client_id → OIDC discovery →
+/// 生成 PKCE/state/nonce → 拼 authorize URL。**不触网授权**(授权在浏览器里发生),故不被 CF 拦。
+/// 返回 [`AuthorizationRequest`] 供 handler 开浏览器 + 起 loopback callback server。
+pub async fn prepare_grok_build_authorization(
+    http: &reqwest::Client,
+    redirect_uri: &str,
+) -> Result<AuthorizationRequest, GrokBuildError> {
+    let client_id = resolve_client_id(http).await;
+    let (authorize_endpoint, token_endpoint) = discover_endpoints(http).await;
+    let pkce = crate::pkce::generate().map_err(GrokBuildError::Rng)?;
+    let state = crate::workbuddy::uuid_v4();
+    let nonce = crate::workbuddy::uuid_v4();
+    let authorize_url = build_authorize_url(
+        &authorize_endpoint,
+        &client_id,
+        redirect_uri,
+        &state,
+        &nonce,
+        &pkce.challenge,
+    )?;
+    Ok(AuthorizationRequest {
+        authorize_url,
+        state,
+        verifier: pkce.verifier,
+        token_endpoint,
+        redirect_uri: redirect_uri.to_string(),
+        client_id,
+    })
+}
+
+/// **第 2 段**:回调拿到 `code` + `state` 后完成登录 —— 校验 state(CSRF)→ POST token 端点
+/// (`grant_type=authorization_code` + PKCE `code_verifier`)换 token → 落盘 [`GrokBuildCredential`]
+/// (含本次 `token_endpoint` 供 refresh 复用)。成功即已 save,返回凭证。
+pub async fn complete_grok_build_login(
+    http: &reqwest::Client,
+    req: &AuthorizationRequest,
+    code: &str,
+    returned_state: &str,
+) -> Result<GrokBuildCredential, GrokBuildError> {
+    if returned_state != req.state {
+        return Err(GrokBuildError::StateMismatch);
+    }
     let resp = http
-        .post(DEVICE_CODE_URL)
-        .form(&[("client_id", client_id), ("scope", SCOPES)])
+        .post(&req.token_endpoint)
+        .form(&[
+            ("grant_type", AUTH_CODE_GRANT_TYPE),
+            ("code", code),
+            ("redirect_uri", req.redirect_uri.as_str()),
+            ("client_id", req.client_id.as_str()),
+            ("code_verifier", req.verifier.as_str()),
+        ])
         .send()
         .await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        // device/code 阶段的 4xx 一般是 client_id/scope 配置错,直接失败(非轮询态)。
         if let Ok(err) = serde_json::from_str::<OAuthErrorBody>(&body) {
             return Err(GrokBuildError::OAuth {
                 error: err.error,
@@ -240,101 +354,12 @@ pub async fn start_device_authorization(
             body,
         });
     }
-    serde_json::from_str::<DeviceAuthResponse>(&body)
-        .map_err(|e| GrokBuildError::Parse(e.to_string()))
-}
-
-/// 第 2 步:轮询 token 端点直到用户授权完成 / 拒绝 / 超时 / 取消。成功即**落盘** [`GrokBuildCredential`]。
-///
-/// `authorization_pending` → 继续按 `interval` 轮询;`slow_down` → interval += 5s;
-/// `access_denied` → [`GrokBuildError::AccessDenied`];`expired_token`/`expired` →
-/// [`GrokBuildError::DeviceCodeExpired`]。`cancel` 被置 true 立即中止(不落盘)。
-pub async fn poll_for_token(
-    http: &reqwest::Client,
-    client_id: &str,
-    device: &DeviceAuthResponse,
-    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
-) -> Result<GrokBuildCredential, GrokBuildError> {
-    let deadline_ms = unix_now_ms() + device.expires_in.max(1) * 1000;
-    let mut interval_secs = device.interval.max(1);
-    loop {
-        if is_cancelled(&cancel) {
-            return Err(GrokBuildError::Cancelled);
-        }
-        // 先等 interval(device/code 刚返回,用户还没授权,首轮也应等)。可被 cancel 唤醒。
-        if let Some(rx) = cancel.as_mut() {
-            let sleep = tokio::time::sleep(std::time::Duration::from_secs(interval_secs as u64));
-            tokio::select! {
-                _ = sleep => {}
-                _ = rx.changed() => {
-                    if *rx.borrow() { return Err(GrokBuildError::Cancelled); }
-                }
-            }
-        } else {
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs as u64)).await;
-        }
-        if unix_now_ms() >= deadline_ms {
-            return Err(GrokBuildError::DeviceCodeExpired);
-        }
-
-        let resp = http
-            .post(TOKEN_URL)
-            .form(&[
-                ("grant_type", DEVICE_GRANT_TYPE),
-                ("device_code", device.device_code.as_str()),
-                ("client_id", client_id),
-            ])
-            .send()
-            .await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-
-        if status.is_success() {
-            let tok: TokenResponse =
-                serde_json::from_str(&body).map_err(|e| GrokBuildError::Parse(e.to_string()))?;
-            let cred = credential_from_token(tok, client_id)?;
-            let store = GrokBuildCredentialStore::single()?;
-            store.save(&cred)?;
-            return Ok(cred);
-        }
-
-        // 非 2xx:解析 OAuth error,区分「继续轮询」与「终止」。
-        let err =
-            serde_json::from_str::<OAuthErrorBody>(&body).map_err(|_| GrokBuildError::Status {
-                status: status.as_u16(),
-                body: body.clone(),
-            })?;
-        match err.error.as_str() {
-            "authorization_pending" => continue,
-            "slow_down" => {
-                interval_secs += SLOW_DOWN_STEP_SECS;
-                continue;
-            }
-            "access_denied" => return Err(GrokBuildError::AccessDenied),
-            "expired_token" | "expired" => return Err(GrokBuildError::DeviceCodeExpired),
-            other => {
-                return Err(GrokBuildError::OAuth {
-                    error: other.to_string(),
-                    description: err.error_description.unwrap_or_default(),
-                })
-            }
-        }
-    }
-}
-
-/// 跑完整 device 登录:resolve client_id → `device/code` → 回调交出 `DeviceAuthResponse`
-/// (UI 据 `user_code` + `verification_uri_complete` 引导用户浏览器授权)→ 轮询 token →
-/// 成功**已落盘** [`GrokBuildCredential`] 并返回。与 [`super::qoder::run_qoder_login`] 同形
-/// (callback 交出授权入口,cancel 贯穿全程,返回凭证)。
-pub async fn run_grok_build_login(
-    http: &reqwest::Client,
-    on_device_auth: impl FnOnce(&DeviceAuthResponse),
-    cancel: Option<tokio::sync::watch::Receiver<bool>>,
-) -> Result<GrokBuildCredential, GrokBuildError> {
-    let client_id = resolve_client_id(http).await;
-    let device = start_device_authorization(http, &client_id).await?;
-    on_device_auth(&device);
-    poll_for_token(http, &client_id, &device, cancel).await
+    let tok: TokenResponse =
+        serde_json::from_str(&body).map_err(|e| GrokBuildError::Parse(e.to_string()))?;
+    let cred = credential_from_token(tok, &req.client_id, Some(req.token_endpoint.clone()))?;
+    let store = GrokBuildCredentialStore::single()?;
+    store.save(&cred)?;
+    Ok(cred)
 }
 
 /// 取一个**有效**的 access token:加载凭证,临期 / 已过期则用 refresh_token 续期并落盘,
@@ -361,19 +386,25 @@ pub async fn ensure_valid_grok_build_token(
         .client_id
         .clone()
         .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+    // 老凭证(登录时无 discovery / 早于本改动)无 token_endpoint → 回落兜底端点。
+    let token_endpoint = cred
+        .token_endpoint
+        .clone()
+        .unwrap_or_else(|| FALLBACK_TOKEN_URL.to_string());
     tracing::info!("grok build access token 临期,续期中");
-    let refreshed = match refresh_token_request(http, &client_id, &cred.refresh_token).await {
-        Ok(r) => r,
-        Err(e) if is_transient_refresh_error(&e) => {
-            tracing::warn!(error = %e, "grok build 续期瞬时失败,沿用旧凭证(下个周期重试)");
-            return Ok(cred);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "grok build 续期被拒(鉴权),删凭证 + 需重新登录");
-            let _ = store.delete();
-            return Err(GrokBuildError::NotLoggedIn);
-        }
-    };
+    let refreshed =
+        match refresh_token_request(http, &token_endpoint, &client_id, &cred.refresh_token).await {
+            Ok(r) => r,
+            Err(e) if is_transient_refresh_error(&e) => {
+                tracing::warn!(error = %e, "grok build 续期瞬时失败,沿用旧凭证(下个周期重试)");
+                return Ok(cred);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "grok build 续期被拒(鉴权),删凭证 + 需重新登录");
+                let _ = store.delete();
+                return Err(GrokBuildError::NotLoggedIn);
+            }
+        };
 
     // refresh 响应可能不回新 refresh_token → 保留旧的;不回 expires_in → 用兜底 TTL。
     let now = unix_now_ms();
@@ -387,6 +418,7 @@ pub async fn ensure_valid_grok_build_token(
         expiry_date: now + refreshed.expires_in.unwrap_or(ASSUMED_TOKEN_TTL_MS / 1000) * 1000,
         obtained_at_ms: now,
         client_id: Some(client_id),
+        token_endpoint: Some(token_endpoint),
         email: cred.email,
         user_id: cred.user_id,
     };
@@ -400,14 +432,15 @@ pub fn logout() -> Result<(), GrokBuildError> {
     Ok(())
 }
 
-/// `POST /oauth2/token`(`grant_type=refresh_token`)。
+/// `POST {token_endpoint}`(`grant_type=refresh_token`)。端点随凭证传入(discovery 结果 / 兜底)。
 async fn refresh_token_request(
     http: &reqwest::Client,
+    token_endpoint: &str,
     client_id: &str,
     refresh_token: &str,
 ) -> Result<TokenResponse, GrokBuildError> {
     let resp = http
-        .post(TOKEN_URL)
+        .post(token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
@@ -432,10 +465,12 @@ async fn refresh_token_request(
     serde_json::from_str::<TokenResponse>(&body).map_err(|e| GrokBuildError::Parse(e.to_string()))
 }
 
-/// TokenResponse → 落盘凭证(算 expiry、best-effort 从 id_token 取 email/sub)。
+/// TokenResponse → 落盘凭证(算 expiry、best-effort 从 id_token 取 email/sub)。`token_endpoint`
+/// 随凭证存,供后续 refresh 复用同一端点(登录经 discovery 解析)。
 fn credential_from_token(
     tok: TokenResponse,
     client_id: &str,
+    token_endpoint: Option<String>,
 ) -> Result<GrokBuildCredential, GrokBuildError> {
     if tok.access_token.is_empty() {
         return Err(GrokBuildError::MissingField("access_token"));
@@ -454,6 +489,7 @@ fn credential_from_token(
         expiry_date: now + tok.expires_in.unwrap_or(ASSUMED_TOKEN_TTL_MS / 1000) * 1000,
         obtained_at_ms: now,
         client_id: Some(client_id.to_string()),
+        token_endpoint,
         email,
         user_id,
     })
@@ -495,10 +531,6 @@ fn is_transient_refresh_error(e: &GrokBuildError) -> bool {
         ),
         _ => false,
     }
-}
-
-fn is_cancelled(cancel: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
-    cancel.as_ref().map(|rx| *rx.borrow()).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -583,11 +615,55 @@ mod tests {
     }
 
     #[test]
-    fn device_auth_response_parses_minimal() {
-        let json = r#"{"device_code":"dc","user_code":"ABCD-1234","verification_uri":"https://x.ai/device","expires_in":600}"#;
-        let d: DeviceAuthResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(d.user_code, "ABCD-1234");
-        assert_eq!(d.interval, 5, "缺 interval 默认 5s");
-        assert!(d.verification_uri_complete.is_none());
+    fn authorize_url_has_pkce_and_encoded_params() {
+        let u = build_authorize_url(
+            FALLBACK_AUTHORIZE_URL,
+            DEFAULT_CLIENT_ID,
+            REDIRECT_URI,
+            "st-123",
+            "nonce-abc",
+            "chal-xyz",
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&u).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            q.get("client_id").map(String::as_str),
+            Some(DEFAULT_CLIENT_ID)
+        );
+        // redirect_uri 原样(url crate 解码后应等于常量,验证编码 roundtrip 正确)。
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some(REDIRECT_URI)
+        );
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some("chal-xyz")
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("st-123"));
+        assert_eq!(q.get("scope").map(String::as_str), Some(SCOPES));
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_state_mismatch_before_network() {
+        // state 不匹配必须在任何换 token 网络请求**之前**拦下(CSRF 防护),故无需真实端点即可测。
+        let http = reqwest::Client::new();
+        let req = AuthorizationRequest {
+            authorize_url: "https://auth.x.ai/oauth2/authorize?x=1".into(),
+            state: "expected-state".into(),
+            verifier: "v".into(),
+            token_endpoint: "https://auth.x.ai/oauth2/token".into(),
+            redirect_uri: REDIRECT_URI.into(),
+            client_id: DEFAULT_CLIENT_ID.into(),
+        };
+        let err = complete_grok_build_login(&http, &req, "code123", "attacker-state")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GrokBuildError::StateMismatch));
     }
 }

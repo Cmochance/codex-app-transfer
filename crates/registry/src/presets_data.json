@@ -745,7 +745,7 @@
     "notices": [
       {
         "type": "info",
-        "text": "xAI Grok Build（grok CLI / grok-code 的编码后端，OpenAI Responses 协议）。点「登录」用 xAI 账号在浏览器授权一次（OAuth2 device flow，accounts.x.ai），凭证落盘并在过期前自动 refresh，无需本地安装 grok CLI。上游 cli-chat-proxy.grok.com/v1，默认模型 grok-build（512k，编码主力）/ grok-composer-2.5-fast（200k）。出站自动带 grok 官方客户端头（grok-shell 指纹）避风控。Codex 的 gpt-5.x 模型名经 provider.models 槽位映射为 grok 模型，不会透传到上游。"
+        "text": "xAI Grok Build（grok CLI / grok-code 的编码后端，OpenAI Responses 协议）。点「登录」用 xAI 账号在浏览器授权一次（OAuth2 authorization code + PKCE，auth.x.ai），凭证落盘并在过期前自动 refresh，无需本地安装 grok CLI。上游 cli-chat-proxy.grok.com/v1，默认模型 grok-build（512k，编码主力）/ grok-composer-2.5-fast（200k）。出站自动带 grok 官方客户端头（grok-shell 指纹）避风控。Codex 的 gpt-5.x 模型名经 provider.models 槽位映射为 grok 模型，不会透传到上游。"
       }
     ],
     "isBuiltin": true
