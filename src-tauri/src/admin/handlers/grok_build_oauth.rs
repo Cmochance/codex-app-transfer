@@ -269,10 +269,85 @@ async fn write_html_response(
     let _ = stream.flush().await;
 }
 
-/// 等 xAI 重定向回 loopback,捕获 `code`+`state`。可被 cancel 唤醒、有总超时;非 `/callback`(favicon
-/// 等)回 404 后继续等,缺 code 的畸形回调也继续等(不让噪声请求提前终止登录)。
+/// 单连接处理结果。
+enum ConnOutcome {
+    /// 拿到匹配 `state` 的合法 `code` → 完成捕获。
+    Success(CallbackParams),
+    /// 授权服务器回 `error`(access_denied 等)→ 终止捕获。
+    Denied(String),
+    /// 噪声 / 非 callback / state 不匹配 / 畸形 → 忽略,继续等真回调。
+    Ignore,
+}
+
+/// 处理单个 loopback 连接:读请求行 → 解析 → 回极简 HTML → 判定 [`ConnOutcome`]。`expected_state`
+/// 用于**就地校验 state**(不匹配即忽略、不终止捕获),防别处浏览器发来的伪造/杂散 `/callback`
+/// 令登录失败(review: 本地 DoS)。
+async fn handle_conn(stream: &mut tokio::net::TcpStream, expected_state: &str) -> ConnOutcome {
+    let Some(target) = read_request_target(stream).await else {
+        write_html_response(stream, "400 Bad Request", "<h2>Bad Request</h2>").await;
+        return ConnOutcome::Ignore;
+    };
+    if !target.starts_with("/callback") {
+        write_html_response(stream, "404 Not Found", "").await;
+        return ConnOutcome::Ignore;
+    }
+    // target 是相对路径,配 dummy base 解析 query(tauri 已 re-export url crate)。
+    let pairs: std::collections::HashMap<String, String> =
+        tauri::Url::parse(&format!("http://127.0.0.1{target}"))
+            .map(|u| u.query_pairs().into_owned().collect())
+            .unwrap_or_default();
+    if let Some(err) = pairs.get("error") {
+        let desc = pairs
+            .get("error_description")
+            .cloned()
+            .unwrap_or_else(|| err.clone());
+        write_html_response(
+            stream,
+            "200 OK",
+            "<h2>授权未完成</h2><p>可关闭此页面返回应用。</p>",
+        )
+        .await;
+        return ConnOutcome::Denied(desc);
+    }
+    match (pairs.get("code"), pairs.get("state")) {
+        (Some(code), Some(state)) if !code.is_empty() && state == expected_state => {
+            write_html_response(
+                stream,
+                "200 OK",
+                "<h2>✅ 登录成功</h2><p>可以关闭此页面返回应用。</p>",
+            )
+            .await;
+            ConnOutcome::Success(CallbackParams {
+                code: code.clone(),
+                state: state.clone(),
+            })
+        }
+        (Some(_), Some(_)) => {
+            // state 不匹配 = 很可能别处来的杂散/伪造回调 → 忽略,继续等真回调(不终止登录)。
+            write_html_response(
+                stream,
+                "400 Bad Request",
+                "<h2>回调 state 不匹配,已忽略</h2>",
+            )
+            .await;
+            ConnOutcome::Ignore
+        }
+        _ => {
+            write_html_response(stream, "400 Bad Request", "<h2>回调缺少 code</h2>").await;
+            ConnOutcome::Ignore
+        }
+    }
+}
+
+/// 单连接读+回包整体上限(防不发数据的连接卡住 accept 循环、令 deadline/cancel 长时间不被 poll)。
+const CONN_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 等 xAI 重定向回 loopback,捕获匹配 `expected_state` 的 `code`。可被 cancel 唤醒、有总 `timeout`;
+/// 非 `/callback` / state 不匹配 / 畸形回调都忽略后继续等,不让噪声请求提前终止登录。每个连接的
+/// 读+回包有 [`CONN_HANDLE_TIMEOUT`] 上限,避免静默/半包连接把 accept 循环挂死(review)。
 async fn capture_callback(
     listener: TcpListener,
+    expected_state: &str,
     mut cancel_rx: watch::Receiver<bool>,
     timeout: Duration,
 ) -> Result<CallbackParams, CaptureError> {
@@ -291,50 +366,17 @@ async fn capture_callback(
                     Ok((s, _)) => s,
                     Err(_) => continue,
                 };
-                let Some(target) = read_request_target(&mut stream).await else {
-                    write_html_response(&mut stream, "400 Bad Request", "<h2>Bad Request</h2>").await;
-                    continue;
-                };
-                if !target.starts_with("/callback") {
-                    write_html_response(&mut stream, "404 Not Found", "").await;
-                    continue;
-                }
-                // target 是相对路径,配 dummy base 解析 query(tauri 已 re-export url crate)。
-                let pairs: std::collections::HashMap<String, String> =
-                    tauri::Url::parse(&format!("http://127.0.0.1{target}"))
-                        .map(|u| u.query_pairs().into_owned().collect())
-                        .unwrap_or_default();
-                if let Some(err) = pairs.get("error") {
-                    let desc = pairs
-                        .get("error_description")
-                        .cloned()
-                        .unwrap_or_else(|| err.clone());
-                    write_html_response(
-                        &mut stream,
-                        "200 OK",
-                        "<h2>授权未完成</h2><p>可关闭此页面返回应用。</p>",
-                    )
-                    .await;
-                    return Err(CaptureError::Denied(desc));
-                }
-                match (pairs.get("code"), pairs.get("state")) {
-                    (Some(code), Some(state)) if !code.is_empty() => {
-                        write_html_response(
-                            &mut stream,
-                            "200 OK",
-                            "<h2>✅ 登录成功</h2><p>可以关闭此页面返回应用。</p>",
-                        )
-                        .await;
-                        return Ok(CallbackParams {
-                            code: code.clone(),
-                            state: state.clone(),
-                        });
-                    }
-                    _ => {
-                        write_html_response(&mut stream, "400 Bad Request", "<h2>回调缺少 code</h2>")
-                            .await;
-                        continue;
-                    }
+                // 单连接整体设超时:静默/半包连接最多卡 CONN_HANDLE_TIMEOUT 就放弃、回到 select
+                // 重新 poll deadline/cancel(否则 300s 总超时与取消会失效)。
+                match tokio::time::timeout(
+                    CONN_HANDLE_TIMEOUT,
+                    handle_conn(&mut stream, expected_state),
+                )
+                .await
+                {
+                    Ok(ConnOutcome::Success(params)) => return Ok(params),
+                    Ok(ConnOutcome::Denied(desc)) => return Err(CaptureError::Denied(desc)),
+                    Ok(ConnOutcome::Ignore) | Err(_) => continue,
                 }
             }
         }
@@ -425,8 +467,8 @@ async fn login_handler() -> impl IntoResponse {
         });
     }
 
-    // 5. 等 loopback 捕获 code(cancel / 超时 / 授权被拒可中断)。
-    let capture = capture_callback(listener, cancel_rx, LOGIN_TIMEOUT).await;
+    // 5. 等 loopback 捕获 code(cancel / 超时 / 授权被拒可中断;state 在 capture 内就地校验)。
+    let capture = capture_callback(listener, &auth_req.state, cancel_rx, LOGIN_TIMEOUT).await;
     login_done.store(true, Ordering::Relaxed);
     web_session_quota::close_external_login_window(GROK_BUILD_LOGIN_WIN);
 
