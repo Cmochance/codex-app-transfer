@@ -203,17 +203,59 @@ pub(crate) fn grok_shim_request_context(body: &[u8]) -> GrokShimContext {
         return ctx;
     };
     if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+        // [review PjogD] dedup_grok_tools_by_name 按 name **保留首个**。若普通 function / namespace 内层
+        // function 与被 lower 的 custom/tool_search **同名且排在前面**,存活的是那个普通 function → shim
+        // 不能把 grok 回它的 function_call 误 repack 成 custom_tool_call/tool_search_call。故按 dedup 相同的
+        // 「首现即占名」顺序推导:名字被更早的非 lower 工具占了,就**不**标 lower(空 name 与 dedup 一致
+        // 不参与,全保留)。
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
         for t in tools {
-            match t.get("type").and_then(Value::as_str) {
-                Some("custom") => {
-                    if let Some(n) = t.get("name").and_then(Value::as_str) {
-                        ctx.custom_lowered.insert(
-                            n.to_owned(),
-                            crate::responses::converter::is_apply_patch_tool_name(n),
-                        );
+            match t.get("type").and_then(Value::as_str).unwrap_or("") {
+                // 普通 function 占名(不 lower)。
+                "function" => {
+                    if let Some(n) = t
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|n| !n.is_empty())
+                    {
+                        claimed.insert(n.to_owned());
                     }
                 }
-                Some("tool_search") => ctx.tool_search_lowered = true,
+                // namespace 展平后内层 function 各自占名(不 lower)。
+                "namespace" => {
+                    if let Some(inner) = t.get("tools").and_then(Value::as_array) {
+                        for it in inner {
+                            if let Some(n) = it
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .filter(|n| !n.is_empty())
+                            {
+                                claimed.insert(n.to_owned());
+                            }
+                        }
+                    }
+                }
+                // custom:仅当名字未被更早工具占用(它会赢 dedup)才标 lower。
+                "custom" => {
+                    if let Some(n) = t
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|n| !n.is_empty())
+                    {
+                        if claimed.insert(n.to_owned()) {
+                            ctx.custom_lowered.insert(
+                                n.to_owned(),
+                                crate::responses::converter::is_apply_patch_tool_name(n),
+                            );
+                        }
+                    }
+                }
+                // tool_search:lower 后 function name 恒为 "tool_search";同理仅当未被占用才标 lower。
+                "tool_search" => {
+                    if claimed.insert("tool_search".to_owned()) {
+                        ctx.tool_search_lowered = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -835,6 +877,64 @@ mod tests {
             empty.custom_lowered.is_empty() && !empty.tool_search_lowered,
             "适配后 body 全 function,提取应得空 —— 故必须从适配前 body 取(map_request stash)"
         );
+    }
+
+    #[test]
+    fn shim_context_honors_dedup_precedence_on_name_collision() {
+        // [review PjogD] 普通 function 与同名 custom/tool_search **同名且在前** → dedup 保留 function,
+        // shim 不该 repack → custom_lowered / tool_search_lowered 不能含该名。
+        let body = serde_json::to_vec(&json!({
+            "model":"grok-build","input":[],
+            "tools":[
+                {"type":"function","name":"apply_patch","parameters":{"type":"object"}},
+                {"type":"custom","name":"apply_patch","description":"x","format":{"type":"grammar","syntax":"lark","definition":"start: x"}},
+                {"type":"function","name":"tool_search","parameters":{"type":"object"}},
+                {"type":"tool_search","execution":{}}
+            ]
+        }))
+        .unwrap();
+        let ctx = grok_shim_request_context(&body);
+        assert!(
+            !ctx.custom_lowered.contains_key("apply_patch"),
+            "同名普通 function 在前 → apply_patch 不标 lower(存活的是 function)"
+        );
+        assert!(
+            !ctx.tool_search_lowered,
+            "同名普通 function 在前 → tool_search 不标 lower"
+        );
+
+        // 对照:custom 在前(赢 dedup)→ 正常标 lower。
+        let body2 = serde_json::to_vec(&json!({
+            "model":"grok-build","input":[],
+            "tools":[
+                {"type":"custom","name":"apply_patch","description":"x","format":{"type":"grammar","syntax":"lark","definition":"start: x"}},
+                {"type":"function","name":"apply_patch","parameters":{"type":"object"}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            grok_shim_request_context(&body2)
+                .custom_lowered
+                .get("apply_patch"),
+            Some(&true),
+            "custom 在前赢 dedup → 标 lower"
+        );
+    }
+
+    #[test]
+    fn discovered_tools_from_single_object_input() {
+        // [review Pjof7] input 是**单对象** tool_search_output 时,发现的工具也要收集(供 tools[] 注入)。
+        let single = json!({
+            "input": {"type":"tool_search_output","call_id":"c1","status":"completed",
+                      "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]}
+        });
+        let got = crate::responses::request::discovered_tools_from_tool_search_output(&single);
+        assert_eq!(
+            got.len(),
+            1,
+            "单对象 tool_search_output 应收集到 1 个发现工具"
+        );
+        assert_eq!(got[0]["name"], "read_file");
     }
 
     #[test]

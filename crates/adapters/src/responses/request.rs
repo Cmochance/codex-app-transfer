@@ -982,11 +982,17 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
 /// `pub(crate)`:gemini_native 请求侧复用同一发现逻辑(MOC-217),避免 gemini
 /// 重写一套 namespace 提取后漂移。参数是整个 body(内部取 `.input`)。
 pub(crate) fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
-    let Some(items) = input.get("input").and_then(|v| v.as_array()) else {
-        return Vec::new();
+    // [review Pjof7] Responses `input` 可是**数组**或**单对象**;两种形态都要扫,否则单对象
+    // tool_search_output(合法但少见)发现的工具收不到 → 注入不到 tools[] → grok 无 function 可调、
+    // 死循环调 tool_search。
+    let items: Vec<&Value> = match input.get("input") {
+        Some(Value::Array(arr)) => arr.iter().collect(),
+        Some(single @ Value::Object(_)) => vec![single],
+        _ => return Vec::new(),
     };
     let outputs: Vec<&Value> = items
         .iter()
+        .copied()
         .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_search_output"))
         .collect();
     let discovered: Vec<Value> = outputs
