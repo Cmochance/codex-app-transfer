@@ -297,6 +297,17 @@ async fn handle_conn(stream: &mut tokio::net::TcpStream, expected_state: &str) -
             .map(|u| u.query_pairs().into_owned().collect())
             .unwrap_or_default();
     if let Some(err) = pairs.get("error") {
+        // 同 success 路径:先校验 state(RFC 6749 §4.1.2.1 要求 error 回调也带 state)。别处/杂散的
+        // `?error=` 不该中止本次登录(review PlCEe:stale tab 重载 / 本地页面探测)。
+        if pairs.get("state").map(String::as_str) != Some(expected_state) {
+            write_html_response(
+                stream,
+                "400 Bad Request",
+                "<h2>回调 state 不匹配,已忽略</h2>",
+            )
+            .await;
+            return ConnOutcome::Ignore;
+        }
         let desc = pairs
             .get("error_description")
             .cloned()
