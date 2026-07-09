@@ -54,6 +54,10 @@ pub struct GrokBuildCredential {
     /// 登录使用的 OAuth client_id(refresh 时回填同一个;login-config 可能轮换,故随凭证存)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// 换取本凭证时 OIDC discovery 解析到的 token 端点(refresh 复用同一端点)。老凭证 / 无
+    /// discovery 时为 `None`,refresh 回落到 [`crate::grok_build::FALLBACK_TOKEN_URL`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
     /// 账号 email(best-effort,从 id_token / userinfo 取,仅 UI 展示)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -125,6 +129,7 @@ mod tests {
             expiry_date: unix_now_ms() + expiry_offset_secs * 1000,
             obtained_at_ms: unix_now_ms(),
             client_id: Some("b1a00492-073a-47ea-816f-4c329264a828".into()),
+            token_endpoint: None,
             email: Some("user@example.com".into()),
             user_id: Some("u-123".into()),
         }

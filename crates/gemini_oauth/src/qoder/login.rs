@@ -20,9 +20,7 @@
 
 use std::time::Duration;
 
-use base64::Engine;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -120,14 +118,10 @@ fn payload_to_cred(t: TokenPayload, machine_id: String) -> QoderCredential {
     }
 }
 
-/// 生成 PKCE 对:`verifier = base64url(48 随机字节)`,`challenge = base64url(sha256(verifier))`。
+/// 生成 PKCE 对(S256)—— 复用共享 [`crate::pkce`](与 grok_build / trae 同一实现,去重)。
 fn generate_pkce() -> Result<(String, String), QoderError> {
-    let mut vbytes = [0u8; 48];
-    getrandom::getrandom(&mut vbytes).map_err(|e| QoderError::Rng(e.to_string()))?;
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vbytes);
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(Sha256::digest(verifier.as_bytes()));
-    Ok((verifier, challenge))
+    let p = crate::pkce::generate().map_err(QoderError::Rng)?;
+    Ok((p.verifier, p.challenge))
 }
 
 /// 拼 device flow 的 authUrl(`qoder.com.cn/device/selectAccounts`,query 自动 URL 编码)。
@@ -404,6 +398,8 @@ async fn wait_or_cancel(dur: Duration, cancel: &mut Option<watch::Receiver<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn pkce_challenge_is_sha256_of_verifier() {

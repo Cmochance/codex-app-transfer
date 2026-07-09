@@ -17,7 +17,6 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// 密码学操作错误。
 #[derive(Debug, thiserror::Error)]
@@ -82,25 +81,12 @@ impl DeviceKeyPair {
     }
 }
 
-/// PKCE 一对(verifier 客户端本地存,challenge 进 authorize URL)。
-pub struct PkcePair {
-    /// 客户端本地保存,换 token 时作 `CodeVerifier` 上送。
-    pub verifier: String,
-    /// authorize URL 的 `code_challenge`(`base64url(sha256(verifier))`)。
-    pub challenge: String,
-}
+/// PKCE 一对 —— 复用共享 [`crate::pkce::PkcePair`](与 grok_build / qoder 同一实现,去重)。
+pub use crate::pkce::PkcePair;
 
-/// 生成 PKCE pair(`code_verifier = base64url(48 随机字节)`,S256 challenge)。
+/// 生成 PKCE pair(S256)—— 复用共享 [`crate::pkce`]。
 pub fn generate_pkce() -> Result<PkcePair, CryptoError> {
-    let mut verifier_bytes = [0u8; 48];
-    getrandom::getrandom(&mut verifier_bytes).map_err(|e| CryptoError::Rng(e.to_string()))?;
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let digest = Sha256::digest(verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    Ok(PkcePair {
-        verifier,
-        challenge,
-    })
+    crate::pkce::generate().map_err(CryptoError::Rng)
 }
 
 /// refresh 请求 body 里的 `DeviceProof`(对齐 Trae `{Signature, Timestamp, Nonce}`)。
@@ -178,6 +164,7 @@ pub fn build_device_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn keypair_generates_valid_pem() {

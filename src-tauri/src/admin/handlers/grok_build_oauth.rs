@@ -1,10 +1,12 @@
 //! `/api/grok-build-oauth/*` admin handlers — grok build(xAI grok CLI 编码后端)账号登录
-//! (OAuth2 device authorization grant,RFC 8628)登录 / 状态 / 注销 / 取消。
+//! (OAuth2 **authorization code + PKCE**,MOC-300)登录 / 状态 / 注销 / 取消。
 //!
 //! 跟 [`super::qoder_oauth`] 并行但**单账号**(非账号池,对齐 antigravity 单账号):
-//! 1. **device flow**:`run_grok_build_login` → `accounts.x.ai/oauth2/device/code` 拿
-//!    `user_code` + `verification_uri_complete` → 回调开内置 webview 加载授权页(用户授权)
-//!    → 轮询 `oauth2/token` 拿凭证。用户关窗 = 取消。
+//! 1. **auth-code + PKCE**:`prepare_grok_build_authorization`(OIDC discovery + PKCE)→ 起本地
+//!    loopback callback server(固定 `127.0.0.1:56121`)→ 内置 webview 导航打开 authorize URL,
+//!    用户在**真实 webview 里授权**(自然过 Cloudflare challenge —— device flow 的裸 POST 被 CF 拦,
+//!    见 MOC-300)→ xAI 重定向回 loopback,server 捕获 `code`(+ 校验 `state`)→
+//!    `complete_grok_build_login` 换 token 落盘。用户关窗 = 取消。
 //! 2. **单账号落盘**:凭证存 `~/.codex-app-transfer/grok-build-oauth.json`(覆盖式,一账号)。
 //! 3. **有 refresh**:access token 过期前 5min 自动 refresh(出站前 `ensure_valid_grok_build_token`)。
 //!
@@ -25,10 +27,16 @@ use axum::{
     Router,
 };
 use codex_app_transfer_gemini_oauth::{
-    grok_build_logout, run_grok_build_login, GrokBuildCredentialStore, GrokBuildError,
+    complete_grok_build_login, grok_build_logout, prepare_grok_build_authorization,
+    GrokBuildCredentialStore, GrokBuildError, LOOPBACK_PORT, REDIRECT_URI,
 };
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
+
+/// 登录总超时(用户在授权页停留上限;超时 loopback 停止等待)。
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 use super::super::state::AdminState;
 use super::common::err;
@@ -213,6 +221,126 @@ async fn logout_handler() -> impl IntoResponse {
     }
 }
 
+/// loopback 捕获成功结果。
+struct CallbackParams {
+    code: String,
+    state: String,
+}
+
+/// loopback 捕获失败原因(用户视角三类:取消 / 超时 / 授权被拒)。
+enum CaptureError {
+    Cancelled,
+    Timeout,
+    Denied(String),
+}
+
+/// 从 loopback 连接读 HTTP 请求行,取 target(`/callback?code=…&state=…`)。只读一个 buffer 足够
+/// (请求行必在首个包);读不到 / 非法返 `None`。
+async fn read_request_target(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut buf = [0u8; 8192];
+    let n = stream.read(&mut buf).await.ok()?;
+    if n == 0 {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&buf[..n]);
+    // "GET /callback?code=..&state=.. HTTP/1.1"
+    head.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// 给浏览器/webview 回极简 HTML(`Connection: close`,别挂住连接)。
+async fn write_html_response(
+    stream: &mut tokio::net::TcpStream,
+    status_line: &str,
+    body_html: &str,
+) {
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Grok 登录</title></head>\
+         <body style=\"font-family:system-ui;text-align:center;padding-top:15vh;color:#222\">{body_html}</body></html>"
+    );
+    let resp = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// 等 xAI 重定向回 loopback,捕获 `code`+`state`。可被 cancel 唤醒、有总超时;非 `/callback`(favicon
+/// 等)回 404 后继续等,缺 code 的畸形回调也继续等(不让噪声请求提前终止登录)。
+async fn capture_callback(
+    listener: TcpListener,
+    mut cancel_rx: watch::Receiver<bool>,
+    timeout: Duration,
+) -> Result<CallbackParams, CaptureError> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Err(CaptureError::Timeout),
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    return Err(CaptureError::Cancelled);
+                }
+            }
+            accept = listener.accept() => {
+                let mut stream = match accept {
+                    Ok((s, _)) => s,
+                    Err(_) => continue,
+                };
+                let Some(target) = read_request_target(&mut stream).await else {
+                    write_html_response(&mut stream, "400 Bad Request", "<h2>Bad Request</h2>").await;
+                    continue;
+                };
+                if !target.starts_with("/callback") {
+                    write_html_response(&mut stream, "404 Not Found", "").await;
+                    continue;
+                }
+                // target 是相对路径,配 dummy base 解析 query(tauri 已 re-export url crate)。
+                let pairs: std::collections::HashMap<String, String> =
+                    tauri::Url::parse(&format!("http://127.0.0.1{target}"))
+                        .map(|u| u.query_pairs().into_owned().collect())
+                        .unwrap_or_default();
+                if let Some(err) = pairs.get("error") {
+                    let desc = pairs
+                        .get("error_description")
+                        .cloned()
+                        .unwrap_or_else(|| err.clone());
+                    write_html_response(
+                        &mut stream,
+                        "200 OK",
+                        "<h2>授权未完成</h2><p>可关闭此页面返回应用。</p>",
+                    )
+                    .await;
+                    return Err(CaptureError::Denied(desc));
+                }
+                match (pairs.get("code"), pairs.get("state")) {
+                    (Some(code), Some(state)) if !code.is_empty() => {
+                        write_html_response(
+                            &mut stream,
+                            "200 OK",
+                            "<h2>✅ 登录成功</h2><p>可以关闭此页面返回应用。</p>",
+                        )
+                        .await;
+                        return Ok(CallbackParams {
+                            code: code.clone(),
+                            state: state.clone(),
+                        });
+                    }
+                    _ => {
+                        write_html_response(&mut stream, "400 Bad Request", "<h2>回调缺少 code</h2>")
+                            .await;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn login_handler() -> impl IntoResponse {
     let my_epoch = next_epoch();
     // [AI review P2] 任何返回路径(成功/失败/取消/panic)Drop 都广播本 epoch 完成,供 app 退出等待。
@@ -232,18 +360,35 @@ async fn login_handler() -> impl IntoResponse {
         }
     }
 
-    // on_device_auth:拿到 user_code + 授权 URL 后开内置 webview 加载授权页
-    // (verification_uri_complete 已内嵌 user_code,用户直接确认授权)。
-    let on_device_auth = |device: &codex_app_transfer_gemini_oauth::DeviceAuthResponse| {
-        let url = device
-            .verification_uri_complete
-            .clone()
-            .unwrap_or_else(|| device.verification_uri.clone());
-        tracing::info!(
-            user_code = %device.user_code,
-            verification_uri = %url,
-            "grok build device 授权已发起 — 内置 webview 打开授权页"
-        );
+    // 1. 发起授权(OIDC discovery + PKCE + authorize URL);不触网授权,CF 拦不到。
+    let auth_req = match prepare_grok_build_authorization(http, REDIRECT_URI).await {
+        Ok(r) => r,
+        Err(e) => {
+            cleanup_slot(my_epoch);
+            tracing::warn!(error = %e, "grok build 发起授权失败");
+            return Json(json!({ "loggedIn": false, "error": e.to_string() })).into_response();
+        }
+    };
+
+    // 2. 先 bind loopback(开浏览器**之前**,确保重定向回来时 server 已监听)。端口固定 56121 =
+    //    xAI client 注册的 redirect_uri,被占则无法完成登录(不能换随机端口),给明确错误。
+    let listener = match TcpListener::bind(("127.0.0.1", LOOPBACK_PORT)).await {
+        Ok(l) => l,
+        Err(e) => {
+            cleanup_slot(my_epoch);
+            tracing::warn!(error = %e, port = LOOPBACK_PORT, "grok build loopback 端口 bind 失败");
+            return Json(json!({
+                "loggedIn": false,
+                "error": format!("本地回调端口 {LOOPBACK_PORT} 被占用,请关闭占用它的程序后重试({e})"),
+            }))
+            .into_response();
+        }
+    };
+
+    // 3. 内置 webview 导航打开 authorize URL —— 真实 webview 过 CF challenge(弃 device flow 的原因)。
+    {
+        let url = auth_req.authorize_url.clone();
+        tracing::info!(authorize_url = %url, "grok build 授权已发起 — 内置 webview 打开 authorize 页");
         tauri::async_runtime::spawn(async move {
             if let Err(e) = web_session_quota::open_external_login_window(
                 GROK_BUILD_LOGIN_WIN,
@@ -256,9 +401,9 @@ async fn login_handler() -> impl IntoResponse {
                 tracing::warn!(error = %e, "[GrokBuild] 打开内置登录窗失败");
             }
         });
-    };
+    }
 
-    // 用户手动关登录窗 = 取消(否则轮询会傻等到 device_code 过期)。
+    // 4. 用户手动关登录窗 = 取消(否则会傻等到超时)。
     let login_done = Arc::new(AtomicBool::new(false));
     {
         let done = login_done.clone();
@@ -280,10 +425,22 @@ async fn login_handler() -> impl IntoResponse {
         });
     }
 
-    let result = run_grok_build_login(http, on_device_auth, Some(cancel_rx)).await;
+    // 5. 等 loopback 捕获 code(cancel / 超时 / 授权被拒可中断)。
+    let capture = capture_callback(listener, cancel_rx, LOGIN_TIMEOUT).await;
     login_done.store(true, Ordering::Relaxed);
-    cleanup_slot(my_epoch);
     web_session_quota::close_external_login_window(GROK_BUILD_LOGIN_WIN);
+
+    // 6. 换 token 落盘(complete 内校验 state + PKCE code_verifier)。
+    let result = match capture {
+        Ok(cb) => complete_grok_build_login(http, &auth_req, &cb.code, &cb.state).await,
+        Err(CaptureError::Cancelled) => Err(GrokBuildError::Cancelled),
+        Err(CaptureError::Timeout) => Err(GrokBuildError::DeviceCodeExpired),
+        Err(CaptureError::Denied(desc)) => Err(GrokBuildError::OAuth {
+            error: "access_denied".into(),
+            description: desc,
+        }),
+    };
+    cleanup_slot(my_epoch);
 
     match result {
         Ok(cred) => Json(json!({
