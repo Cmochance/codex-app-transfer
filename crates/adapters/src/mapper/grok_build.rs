@@ -78,11 +78,16 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
     let obj = v.as_object_mut()?;
     let mut changed = false;
 
-    // 1. 工具适配。
-    if let Some(Value::Array(tools)) = obj.get("tools") {
-        let tools = tools.clone();
-        let mut out: Vec<Value> = Vec::with_capacity(tools.len() + discovered.len());
-        for t in &tools {
+    // 1. 工具适配。[review SAV] 即使 body **没有顶层 tools[]**,只要 input 里有 tool_search 发现的
+    // 工具(discovered 非空)也要处理并注入 —— 否则 continuation body 只带 tool_search_output 时 grok
+    // 没有 function 定义可调,客户端会死循环调 tool_search。
+    let orig_tools: Vec<Value> = match obj.get("tools") {
+        Some(Value::Array(t)) => t.clone(),
+        _ => Vec::new(),
+    };
+    if !orig_tools.is_empty() || !discovered.is_empty() {
+        let mut out: Vec<Value> = Vec::with_capacity(orig_tools.len() + discovered.len());
+        for t in &orig_tools {
             push_grok_adapted_tool(t, provider, &mut out);
         }
         // [MOC-304 leg3] 把 tool_search 发现的工具同款转换后注入,去重(可能与 namespace 展平重叠)。
@@ -91,7 +96,8 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
         }
         dedup_grok_tools_by_name(&mut out);
         let out_empty = out.is_empty();
-        if out != tools {
+        // out != orig_tools 同时覆盖「原 tools 被改写」与「原本无 tools[]、现注入了发现工具」两种情况。
+        if out != orig_tools {
             obj.insert("tools".into(), Value::Array(out));
             changed = true;
         }
@@ -104,7 +110,7 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
         // grok 可能拒/忽略而不选该工具。在 out_empty 移除之前做(若 tools 全空则下方直接删 tool_choice)。
         if !out_empty {
             if let Some(tc) = obj.get("tool_choice") {
-                if let Some(new_tc) = normalize_grok_tool_choice(tc, &tools) {
+                if let Some(new_tc) = normalize_grok_tool_choice(tc, &orig_tools) {
                     obj.insert("tool_choice".into(), new_tc);
                     changed = true;
                 }
@@ -135,30 +141,24 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
     // encrypted_content 的解密(400 "Could not decode the compaction blob")。剥掉它们,**保留
     // encrypted_content / summary**(grok 需要)。`internal_chat_message_metadata_passthrough` 只从
     // reasoning item 剥(message item 上 grok 已容忍,不动以免影响别的路径)。
-    if let Some(Value::Array(input)) = obj.get_mut("input") {
-        for it in input.iter_mut() {
-            if it.get("type").and_then(Value::as_str) == Some("reasoning") {
-                if let Some(o) = it.as_object_mut() {
-                    // content 恒为 null/空(reasoning 文本在 summary 里),grok 结构无此字段。
-                    if o.remove("content").is_some() {
-                        changed = true;
-                    }
-                    if o.remove("internal_chat_message_metadata_passthrough")
-                        .is_some()
-                    {
-                        changed = true;
-                    }
+    // input 每 item:剥 reasoning 私有字段 + 反向改写 grok 不认的 tool-call 类型(见
+    // process_grok_input_item)。[review SAb] Responses `input` 也可是**单对象**(非数组),Codex 发
+    // 单对象 continuation(如 `{"type":"custom_tool_call"}`)时同样要规整,否则 grok 严格 InputItem
+    // parser 直接 422。
+    match obj.get_mut("input") {
+        Some(Value::Array(input)) => {
+            for it in input.iter_mut() {
+                if process_grok_input_item(it) {
+                    changed = true;
                 }
             }
-            // [MOC-301/304 leg3] grok 的 InputItem enum 严格(untagged,未知 variant 直接 422)。
-            // 请求侧把 custom(apply_patch)/ tool_search 转了 function、响应侧 shim 把 grok 的
-            // function_call 重打包回 custom_tool_call / tool_search_call 给 Codex;下一轮 Codex 把这些
-            // Codex 类型的 item 回放进 input,grok 不认 → 必须反向改写回 function_call / function_call_output
-            // (与请求侧 function 化对齐,模型不失忆)。见 rewrite_tool_call_history_item。
-            if rewrite_tool_call_history_item(it) {
+        }
+        Some(single @ Value::Object(_)) => {
+            if process_grok_input_item(single) {
                 changed = true;
             }
         }
+        _ => {}
     }
 
     // 4. [MOC-299] 指令块去重(keep-latest-at-front,兼顾 cache 与内容更新)。Codex 对 grok
@@ -297,6 +297,33 @@ fn dedup_grok_tools_by_name(out: &mut Vec<Value>) {
     });
 }
 
+/// 规整一个 input item(数组元素或单对象 input 都用):① reasoning item 剥 grok 不认的 `content` /
+/// Codex 私有 `internal_chat_message_metadata_passthrough`;② grok 不认的 tool-call 类型反向改写成
+/// `function_call` / `function_call_output`(见 [`rewrite_tool_call_history_item`])。返回是否改过。
+fn process_grok_input_item(it: &mut Value) -> bool {
+    let mut changed = false;
+    if it.get("type").and_then(Value::as_str) == Some("reasoning") {
+        if let Some(o) = it.as_object_mut() {
+            // content 恒为 null/空(reasoning 文本在 summary 里),grok 结构无此字段。
+            if o.remove("content").is_some() {
+                changed = true;
+            }
+            if o.remove("internal_chat_message_metadata_passthrough")
+                .is_some()
+            {
+                changed = true;
+            }
+        }
+    }
+    // [MOC-301/304 leg3] grok InputItem enum 严格(untagged,未知 variant 直接 422)。请求侧把 custom
+    // (apply_patch)/ tool_search 转了 function、响应侧 shim 把 grok 的 function_call 重打包回 Codex 类型;
+    // 下轮 Codex 把这些 Codex 类型 item 回放进 input,grok 不认 → 反向改写回 function_call/output。
+    if rewrite_tool_call_history_item(it) {
+        changed = true;
+    }
+    changed
+}
+
 /// [MOC-301/304 leg3] 把 Codex 回放进 input 的、grok 不认的 tool-call item **反向改写**成 grok 认的
 /// `function_call` / `function_call_output`。返回是否改过(非目标 item 原样,返回 false)。
 ///
@@ -346,8 +373,18 @@ fn rewrite_tool_call_history_item(it: &mut Value) -> bool {
             true
         }
         "custom_tool_call_output" => {
+            // [review SAP] grok 需 canonical `call_id` 把 output 配对 earlier function_call;若回放只带
+            // `tool_call_id` / `id` 别名(Responses 侧接受),补进 `call_id`,否则 grok 判 orphan/拒。
+            let call_id = it
+                .get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| it.get("tool_call_id").and_then(Value::as_str))
+                .or_else(|| it.get("id").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned();
             if let Some(o) = it.as_object_mut() {
                 o.insert("type".into(), Value::String("function_call_output".into()));
+                o.insert("call_id".into(), Value::String(call_id));
                 return true;
             }
             false
@@ -816,6 +853,53 @@ mod tests {
             "被 lower 的 custom tool_choice 应改成 function type"
         );
         assert_eq!(v["tool_choice"]["name"], "apply_patch", "name 保留");
+    }
+
+    #[test]
+    fn leg3_edge_alias_callid_and_absent_tools_injection() {
+        // [review SAP] custom_tool_call_output 只带 tool_call_id 别名 → function_call_output 补 call_id。
+        // [review SAV] 有 tool_search_output.tools 但**无顶层 tools[]** → 发现的工具仍注入 tools[]。
+        let body = serde_json::to_vec(&json!({
+            "model":"grok-build",
+            "input":[
+                {"type":"custom_tool_call_output","tool_call_id":"c9","output":"ok"},
+                {"type":"tool_search_output","call_id":"c2","status":"completed",
+                 "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]}
+            ]
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["input"][0]["type"], "function_call_output");
+        assert_eq!(
+            v["input"][0]["call_id"], "c9",
+            "call_id 应从 tool_call_id 别名补(SAP)"
+        );
+        let tools = v["tools"]
+            .as_array()
+            .expect("无顶层 tools[] 也应注入发现工具(SAV)");
+        assert!(
+            tools.iter().any(|t| t["name"] == "read_file"),
+            "发现的 read_file 应注入 tools[]"
+        );
+    }
+
+    #[test]
+    fn leg3_single_object_input_rewritten() {
+        // [review SAb] input 是**单对象**(非数组)时也要规整,否则 grok 严格 parser 拒。
+        let body = serde_json::to_vec(&json!({
+            "model":"grok-build",
+            "input":{"type":"custom_tool_call","name":"apply_patch","input":"P","call_id":"c1"}
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["input"]["type"], "function_call",
+            "单对象 input 的 custom_tool_call 应改写成 function_call"
+        );
     }
 
     #[test]
