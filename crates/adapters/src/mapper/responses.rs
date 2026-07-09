@@ -102,6 +102,15 @@ impl RequestMapper for ResponsesPassthroughMapper {
         // custom/namespace/tool_search/image_generation)且不支持 reasoning.effort。进 1:1 透传
         // 前把请求体适配成 grok 接受的形态(工具转换复用 chat 路径决策,见 mapper::grok_build)。
         // 非 grok-build provider 恒不改,透传语义与 MOC-234 完全一致。其余 provider 仍严格 1:1。
+        // [MOC-301/304 review P1] grok 响应侧 shim 的 context 必须从**适配前** body 提取 —— 此时
+        // tools 还带 custom/tool_search/namespace 类型;`adapt_grok_build_request_body` 之后它们全变
+        // function,`grok_shim_request_context` 就认不出了(会得空 context → shim 永不 repack)。
+        // 提取后 stash 进 adapter_metadata,response 侧从那读(而非从已适配的 request_plan.body 重推)。
+        let grok_shim_ctx = if crate::mapper::grok_build::is_grok_build_provider(provider) {
+            Some(crate::mapper::grok_build::grok_shim_request_context(&body))
+        } else {
+            None
+        };
         let body = if crate::mapper::grok_build::is_grok_build_provider(provider) {
             crate::mapper::grok_build::adapt_grok_build_request_body(&body, provider)
                 .unwrap_or(body)
@@ -112,7 +121,17 @@ impl RequestMapper for ResponsesPassthroughMapper {
         // [MOC-234] 只读观测整合(gate=breakdown_enabled,默认关零开销):旁路 parse 一份
         // 副本算 responses 原生 context_breakdown + 喂会话观测镜像。返回的 adapter_metadata
         // 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
-        let adapter_metadata = build_observe_metadata(client_path, &body);
+        let mut adapter_metadata = build_observe_metadata(client_path, &body);
+        if let Some(ctx) = grok_shim_ctx {
+            if let Ok(v) = serde_json::to_value(&ctx) {
+                match adapter_metadata.as_mut() {
+                    Some(Value::Object(m)) => {
+                        m.insert("grok_shim_ctx".into(), v);
+                    }
+                    _ => adapter_metadata = Some(serde_json::json!({ "grok_shim_ctx": v })),
+                }
+            }
+        }
 
         // 路径 normalize:剥 `/openai` legacy prefix + `/claude/v1/messages` alias +
         // 前导 `/v1`(provider.base_url 已带 `/v1`)+ 保 query。**不能**只剥 `/v1`,
@@ -213,7 +232,15 @@ impl ResponseMapper for ResponsesPassthroughMapper {
             let cwd = parsed
                 .as_ref()
                 .and_then(|v| crate::responses::apply_patch_preflight::extract_cwd(Some(v)));
-            let ctx = crate::mapper::grok_build::grok_shim_request_context(&request_plan.body);
+            // [review P1] 从 map_request stash 的适配前元数据读(而非从已适配 body 重推,那会得空 ctx)。
+            let ctx = request_plan
+                .adapter_metadata
+                .as_ref()
+                .and_then(|m| m.get("grok_shim_ctx").cloned())
+                .and_then(|v| {
+                    serde_json::from_value::<crate::mapper::grok_build::GrokShimContext>(v).ok()
+                })
+                .unwrap_or_default();
             // [review thread2] stream:false 的 grok 成功响应是单 JSON(非 SSE),SSE shim 不改写它 →
             // 走 JSON 改写路径;流式(Codex Desktop 常态)走 SSE shim + ObserveTee。
             if !request_is_streaming(request_plan) {

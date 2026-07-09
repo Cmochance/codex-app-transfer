@@ -99,6 +99,17 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
         // 非空 tools 陪。适配后 tools 全被 drop(如 compact 摘要 body 带 tool_choice:none、原 tools
         // 又恰全是 tool_search/image_generation)而 tool_choice 仍在 → 移除它,避免 grok 400
         // "tool_choice set but no tools"。通用安全(普通轮同理受护),不止 compact。
+        // [review nH] 强制 tool_choice 指向被 lower 的 custom/tool_search 工具 → 同步改成 function 形态,
+        // 否则 tool_choice 的 type(custom/tool_search)与 tools[] 里已 lower 成 function 的工具不一致,
+        // grok 可能拒/忽略而不选该工具。在 out_empty 移除之前做(若 tools 全空则下方直接删 tool_choice)。
+        if !out_empty {
+            if let Some(tc) = obj.get("tool_choice") {
+                if let Some(new_tc) = normalize_grok_tool_choice(tc, &tools) {
+                    obj.insert("tool_choice".into(), new_tc);
+                    changed = true;
+                }
+            }
+        }
         if out_empty && obj.remove("tool_choice").is_some() {
             changed = true;
         }
@@ -173,7 +184,7 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
 /// [MOC-301/304 review] grok 响应侧 shim 所需的**请求侧元数据**。名字判定不够(thread0:恰好叫
 /// apply_patch/tool_search 的普通 function 会被误 repack;thread1:grok 调发现的 MCP 工具时透传的
 /// function_call 缺 `namespace` 字段,Codex 无法 dispatch)。从**请求体**推导,喂给 shim。
-#[derive(Default, Debug)]
+#[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GrokShimContext {
     /// 从 `custom` lower 成 function 的工具名 → 是否 apply_patch(apply_patch 走 V4A preflight,
     /// 其余 custom 只取裸 input)。只有在此集合里的 function_call 才重打包成 custom_tool_call。
@@ -213,6 +224,36 @@ pub(crate) fn grok_shim_request_context(body: &[u8]) -> GrokShimContext {
         collect_namespace_map(&t, &mut ctx.namespace_map);
     }
     ctx
+}
+
+/// [review nH] 若 `tool_choice` 强制指向被 lower 的 custom/tool_search 工具,返回改成 function 形态的
+/// 新 tool_choice(`type: custom→function` 保留 name;`tool_search → {function, name:tool_search}`)。
+/// 无需改(auto/none/required 字符串、指向普通 function、指向不存在的工具)→ None。
+fn normalize_grok_tool_choice(tc: &Value, orig_tools: &[Value]) -> Option<Value> {
+    let obj = tc.as_object()?;
+    match obj.get("type").and_then(Value::as_str)? {
+        "custom" => {
+            let name = obj.get("name").and_then(Value::as_str)?;
+            // 仅当该名确实是被 lower 的 custom 工具才改(普通 function 同名不动)。
+            let lowered = orig_tools.iter().any(|t| {
+                t.get("type").and_then(Value::as_str) == Some("custom")
+                    && t.get("name").and_then(Value::as_str) == Some(name)
+            });
+            if !lowered {
+                return None;
+            }
+            let mut m = obj.clone();
+            m.insert("type".into(), Value::String("function".into()));
+            Some(Value::Object(m))
+        }
+        "tool_search" => {
+            let present = orig_tools
+                .iter()
+                .any(|t| t.get("type").and_then(Value::as_str) == Some("tool_search"));
+            present.then(|| json!({ "type": "function", "name": "tool_search" }))
+        }
+        _ => None,
+    }
 }
 
 /// 把一个 namespace 包的内层 function name → namespace 名收进 `map`。
@@ -733,6 +774,66 @@ mod tests {
                 .any(|t| t["name"] == "notion_create_pages" && t["type"] == "function"),
             "发现的 notion_create_pages 应注入 tools[]"
         );
+    }
+
+    #[test]
+    fn grok_shim_context_extracted_from_pre_adapt_body() {
+        // [review P1] context 必须从**适配前** body 提取(custom/tool_search/namespace 还在);适配后
+        // 全变 function 就认不出。这里直接喂原始 body 验提取。
+        let body = serde_json::to_vec(&json!({
+            "model":"grok-build",
+            "tools":[
+                {"type":"custom","name":"apply_patch","description":"x","format":{"type":"grammar","syntax":"lark","definition":"start: x"}},
+                {"type":"custom","name":"other_freeform","description":"y","format":{"type":"grammar","syntax":"lark","definition":"start: y"}},
+                {"type":"tool_search","execution":{}},
+                {"type":"namespace","name":"mcp__notion__","tools":[{"type":"function","name":"notion_create_pages","parameters":{"type":"object"}}]}
+            ],
+            "input":[]
+        })).unwrap();
+        let ctx = grok_shim_request_context(&body);
+        assert_eq!(
+            ctx.custom_lowered.get("apply_patch"),
+            Some(&true),
+            "apply_patch custom → apply_patch=true"
+        );
+        assert_eq!(
+            ctx.custom_lowered.get("other_freeform"),
+            Some(&false),
+            "非 apply_patch custom → apply_patch=false"
+        );
+        assert!(ctx.tool_search_lowered, "tool_search 应标记 lowered");
+        assert_eq!(
+            ctx.namespace_map
+                .get("notion_create_pages")
+                .map(String::as_str),
+            Some("mcp__notion__")
+        );
+        // 适配后的 body(全 function)应提取到空 context —— 证明 P1 根因(不能从适配后 body 取)。
+        let adapted =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let empty = grok_shim_request_context(&adapted);
+        assert!(
+            empty.custom_lowered.is_empty() && !empty.tool_search_lowered,
+            "适配后 body 全 function,提取应得空 —— 故必须从适配前 body 取(map_request stash)"
+        );
+    }
+
+    #[test]
+    fn forced_tool_choice_lowered_to_function() {
+        // [review nH] tool_choice 强制指向被 lower 的 custom(apply_patch)→ 同步改成 function 形态。
+        let body = serde_json::to_vec(&json!({
+            "model":"grok-build","input":[],
+            "tool_choice":{"type":"custom","name":"apply_patch"},
+            "tools":[{"type":"custom","name":"apply_patch","description":"x","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}]
+        })).unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["tool_choice"]["type"], "function",
+            "被 lower 的 custom tool_choice 应改成 function type"
+        );
+        assert_eq!(v["tool_choice"]["name"], "apply_patch", "name 保留");
     }
 
     #[test]

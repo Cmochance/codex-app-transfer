@@ -320,8 +320,10 @@ impl GrokToolCallShim {
                 let (input, incomplete) = if apply_patch {
                     finalize_apply_patch(&p.args_acc, self.cwd.as_deref(), interrupted)
                 } else {
-                    // 非 apply_patch custom:裸 input(args.input),不跑 V4A preflight/校验。
-                    (extract_apply_patch_input(&p.args_acc), interrupted)
+                    // [review nL] 非 apply_patch custom:裸 input(args.input),**不**跑
+                    // extract_apply_patch_input(它带 V4A 信封修复 / patch-key 别名,会污染任意自由文本
+                    // 输入,如恰好含 *** Begin Patch)。用通用提取器。
+                    (generic_custom_input(&p.args_acc), interrupted)
                 };
                 if incomplete {
                     let item = json!({
@@ -426,7 +428,7 @@ impl GrokToolCallShim {
             let (input, incomplete) = if apply_patch {
                 finalize_apply_patch(&args, self.cwd.as_deref(), false)
             } else {
-                (extract_apply_patch_input(&args), false)
+                (generic_custom_input(&args), false)
             };
             *item = json!({
                 "type": "custom_tool_call", "id": id, "call_id": call_id, "name": name,
@@ -463,6 +465,16 @@ fn finalize_apply_patch(args_acc: &str, cwd: Option<&str>, interrupted: bool) ->
     };
     let incomplete = interrupted || is_trunc || v4a_invalid;
     (input, incomplete)
+}
+
+/// [review nL] 非 apply_patch custom 工具的 input 提取:只取 args JSON 的 `input` 字段(与请求侧
+/// `{input:string}` lowering 对齐),**不做** V4A 信封修复 / patch-key 别名(那是 apply_patch 专用,
+/// 会污染任意自由文本)。parse 失败 / 无 input 字段 → 原样返回 args(不吞、可观测)。
+fn generic_custom_input(args_acc: &str) -> String {
+    serde_json::from_str::<Value>(args_acc)
+        .ok()
+        .and_then(|v| v.get("input").and_then(|i| i.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| args_acc.to_owned())
 }
 
 /// tool_search args 字符串 → Codex `ToolSearchCall.arguments` 期望的 JSON object(parse 失败 fallback
