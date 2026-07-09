@@ -5,8 +5,9 @@
 //! 1. **auth-code + PKCE**:`prepare_grok_build_authorization`(OIDC discovery + PKCE)→ 起本地
 //!    loopback callback server(固定 `127.0.0.1:56121`)→ 内置 webview 导航打开 authorize URL,
 //!    用户在**真实 webview 里授权**(自然过 Cloudflare challenge —— device flow 的裸 POST 被 CF 拦,
-//!    见 MOC-300)→ xAI 重定向回 loopback,server 捕获 `code`(+ 校验 `state`)→
-//!    `complete_grok_build_login` 换 token 落盘。用户关窗 = 取消。
+//!    见 MOC-300)→ **实证(2026-07-09 真机)**:xAI 显示 code 让用户复制、前端粘回经
+//!    `submit-code` 送来(loopback 兜底自动捕获)→ `complete_grok_build_login` 换 token 落盘。
+//!    login 用 select 等 loopback 或手动粘 code 先到者胜;用户关窗 = 取消。
 //! 2. **单账号落盘**:凭证存 `~/.codex-app-transfer/grok-build-oauth.json`(覆盖式,一账号)。
 //! 3. **有 refresh**:access token 过期前 5min 自动 refresh(出站前 `ensure_valid_grok_build_token`)。
 //!

@@ -12,8 +12,10 @@
 //!    webview 里导航打开**(关键:授权页导航由真实 webview 发起,自然过 Cloudflare challenge —— 这
 //!    正是弃用 device flow 的原因:device flow 的 `POST /oauth2/device/code` 是**无浏览器的裸
 //!    HTTP**,被 CF WAF 拦返 block page,见 MOC-300)。
-//! 3. 用户授权后重定向到固定 loopback `http://127.0.0.1:56121/callback?code=…&state=…`,本地
-//!    loopback server 捕获 `code`(+ 校验 `state`)。redirect_uri **必须与 client 注册值精确一致**。
+//! 3. 用户授权后 —— **实证(2026-07-09 真机)**:xAI 对本 client **不重定向到 loopback**,而是显示
+//!    一个 code 让用户复制粘回 app 完成(与官方 grok CLI / pi-xai-oauth 手动兜底一致);loopback
+//!    `http://127.0.0.1:56121/callback?code=…&state=…` server 保留作兜底自动捕获。redirect_uri
+//!    (换 token 用)**必须与 authorize 请求里的值一致**。code 交给 [`complete_grok_build_login`]。
 //! 4. `POST {token_endpoint}`(form:`grant_type=authorization_code` + `code` + `redirect_uri`
 //!    + `client_id` + `code_verifier`)换 `{access_token, refresh_token, token_type, expires_in,
 //!    id_token}`。此 POST 是纯 API(非 HTML 授权页),CF 不拦(pi-xai-oauth 实证 Node 侧可换)。
