@@ -32,13 +32,15 @@ use crate::types::ByteStream;
 use super::apply_patch_preflight;
 use super::converter::{
     detect_json_truncation, detect_v4a_truncation, emit_event, extract_apply_patch_input,
-    is_apply_patch_tool_name, is_tool_search_tool_name, normalize_tool_search_arguments,
-    validate_v4a_syntax,
+    is_tool_search_tool_name, normalize_tool_search_arguments, validate_v4a_syntax,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
-    ApplyPatch,
+    /// 从 `custom` lower 的工具:`apply_patch`(走 V4A preflight)或其他 custom(只取裸 input)。
+    Custom {
+        apply_patch: bool,
+    },
     ToolSearch,
 }
 
@@ -65,16 +67,59 @@ pub(crate) struct GrokToolCallShim {
     id_to_index: HashMap<String, u64>,
     /// apply_patch preflight 的 cwd(路径相关修复用;无则跳过 cwd-dependent 修复,仍可用)。
     cwd: Option<String>,
+    /// [review thread0] 只 repack **真被 lower** 的 custom 工具(名 → 是否 apply_patch),避免误 repack
+    /// 恰好叫 apply_patch 的普通 function/MCP 工具。
+    custom_lowered: HashMap<String, bool>,
+    /// [review thread0] tool_search 是否被 lower(gate `tool_search` 名的 repack)。
+    tool_search_lowered: bool,
+    /// [review thread1] 内层 function name → namespace:grok 调发现的 MCP 工具回的普通 function_call
+    /// 需补 `namespace` 字段,Codex 才能 dispatch(对齐 chat converter 的 lookup_namespace_for)。
+    namespace_map: HashMap<String, String>,
 }
 
 impl GrokToolCallShim {
-    pub(crate) fn new(cwd: Option<String>) -> Self {
+    pub(crate) fn new(
+        cwd: Option<String>,
+        ctx: crate::mapper::grok_build::GrokShimContext,
+    ) -> Self {
         Self {
             buffer: Vec::new(),
             seq: 0,
             items: HashMap::new(),
             id_to_index: HashMap::new(),
             cwd,
+            custom_lowered: ctx.custom_lowered,
+            tool_search_lowered: ctx.tool_search_lowered,
+            namespace_map: ctx.namespace_map,
+        }
+    }
+
+    /// [review thread2] 非流式(stream:false)grok 成功响应是单 JSON `{output:[...]}`(非 SSE),
+    /// SSE shim 的 `push`/`finish` 不经它。直接改写顶层 `output[]` 里的 apply_patch/tool_search/
+    /// namespace function_call(与 SSE envelope 同一套 `rewrite_envelope_item`)。
+    pub(crate) fn rewrite_json_response(&self, body: &mut Value) {
+        if let Some(output) = body.get_mut("output").and_then(|o| o.as_array_mut()) {
+            for item in output.iter_mut() {
+                self.rewrite_envelope_item(item);
+            }
+        }
+    }
+
+    /// [review thread1] 透传的 function_call item 若是 namespace/发现工具,补 `namespace` 字段。
+    fn add_namespace_if_mapped(&self, data: &mut Value) {
+        let Some(item) = data.get_mut("item") else {
+            return;
+        };
+        if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+            return;
+        }
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if let Some(ns) = self.namespace_map.get(name).cloned() {
+            if let Some(o) = item.as_object_mut() {
+                o.insert("namespace".into(), Value::String(ns));
+            }
         }
     }
 
@@ -138,14 +183,21 @@ impl GrokToolCallShim {
         let item = data.get("item").cloned().unwrap_or(Value::Null);
         let is_fc = item.get("type").and_then(|v| v.as_str()) == Some("function_call");
         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let kind = if is_fc && is_apply_patch_tool_name(name) {
-            Some(ToolKind::ApplyPatch)
-        } else if is_fc && is_tool_search_tool_name(name) {
+        // [review thread0] 只 repack **真被 lower** 的工具(名在 custom_lowered / tool_search_lowered),
+        // 不再纯按名字 —— 避免误 repack 恰好叫 apply_patch/tool_search 的普通 function/MCP 工具。
+        let kind = if !is_fc {
+            None
+        } else if let Some(&apply_patch) = self.custom_lowered.get(name) {
+            Some(ToolKind::Custom { apply_patch })
+        } else if self.tool_search_lowered && is_tool_search_tool_name(name) {
             Some(ToolKind::ToolSearch)
         } else {
             None
         };
         let Some(kind) = kind else {
+            // 透传 function_call:若是 namespace/发现工具,补 `namespace`(Codex dispatch MCP 需要)。
+            let mut data = data;
+            self.add_namespace_if_mapped(&mut data);
             emit_event(out, &mut self.seq, "response.output_item.added", data);
             return;
         };
@@ -165,7 +217,7 @@ impl GrokToolCallShim {
             .unwrap_or("")
             .to_owned();
         let new_item = match kind {
-            ToolKind::ApplyPatch => json!({
+            ToolKind::Custom { .. } => json!({
                 "type": "custom_tool_call", "id": item_id, "call_id": call_id,
                 "name": name, "input": "", "status": "in_progress",
             }),
@@ -247,6 +299,9 @@ impl GrokToolCallShim {
             self.id_to_index.remove(&p.item_id);
             self.emit_tool_call_done(output_index, &p, false, out);
         } else {
+            // 透传 function_call:补 namespace(同 added)。
+            let mut data = data;
+            self.add_namespace_if_mapped(&mut data);
             emit_event(out, &mut self.seq, "response.output_item.done", data);
         }
     }
@@ -261,9 +316,13 @@ impl GrokToolCallShim {
         out: &mut Vec<u8>,
     ) {
         match p.kind {
-            ToolKind::ApplyPatch => {
-                let (input, incomplete) =
-                    finalize_apply_patch(&p.args_acc, self.cwd.as_deref(), interrupted);
+            ToolKind::Custom { apply_patch } => {
+                let (input, incomplete) = if apply_patch {
+                    finalize_apply_patch(&p.args_acc, self.cwd.as_deref(), interrupted)
+                } else {
+                    // 非 apply_patch custom:裸 input(args.input),不跑 V4A preflight/校验。
+                    (extract_apply_patch_input(&p.args_acc), interrupted)
+                };
                 if incomplete {
                     let item = json!({
                         "type": "custom_tool_call", "id": p.item_id, "call_id": p.call_id,
@@ -337,12 +396,54 @@ impl GrokToolCallShim {
             .and_then(|r| r.get_mut("output"))
             .and_then(|o| o.as_array_mut())
         {
-            let cwd = self.cwd.clone();
             for item in output.iter_mut() {
-                rewrite_envelope_item(item, cwd.as_deref());
+                self.rewrite_envelope_item(item);
             }
         }
         emit_event(out, &mut self.seq, event_name, data);
+    }
+
+    /// envelope `output[]` 的单个 item:真被 lower 的 apply_patch/tool_search function_call →
+    /// custom_tool_call/tool_search_call(input 从 arguments 重新 finalize,与流式 done 一致);其余
+    /// namespace 工具 function_call 补 `namespace`(与透传 item 一致)。
+    fn rewrite_envelope_item(&self, item: &mut Value) {
+        if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+            return;
+        }
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let call_id = item.get("call_id").cloned().unwrap_or(Value::Null);
+        let id = item.get("id").cloned().unwrap_or(Value::Null);
+        let args = item
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if let Some(&apply_patch) = self.custom_lowered.get(&name) {
+            let (input, incomplete) = if apply_patch {
+                finalize_apply_patch(&args, self.cwd.as_deref(), false)
+            } else {
+                (extract_apply_patch_input(&args), false)
+            };
+            *item = json!({
+                "type": "custom_tool_call", "id": id, "call_id": call_id, "name": name,
+                "input": input, "status": if incomplete { "incomplete" } else { "completed" },
+            });
+        } else if self.tool_search_lowered && is_tool_search_tool_name(&name) {
+            let arguments = parse_tool_search_arguments(&args);
+            *item = json!({
+                "type": "tool_search_call", "id": id, "call_id": call_id,
+                "execution": "client", "arguments": arguments, "status": "completed",
+            });
+        } else if let Some(ns) = self.namespace_map.get(&name).cloned() {
+            // 透传的 namespace/发现工具:补 namespace(Codex dispatch MCP 需要)。
+            if let Some(o) = item.as_object_mut() {
+                o.insert("namespace".into(), Value::String(ns));
+            }
+        }
     }
 }
 
@@ -372,39 +473,6 @@ fn parse_tool_search_arguments(args_acc: &str) -> Value {
     normalize_tool_search_arguments(v)
 }
 
-/// envelope `output[]` 里的单个 item:apply_patch / tool_search function_call → custom_tool_call /
-/// tool_search_call(input 从 arguments 重新 finalize,与流式 done 确定一致)。
-fn rewrite_envelope_item(item: &mut Value, cwd: Option<&str>) {
-    if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
-        return;
-    }
-    let name = item
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    let call_id = item.get("call_id").cloned().unwrap_or(Value::Null);
-    let id = item.get("id").cloned().unwrap_or(Value::Null);
-    let args = item
-        .get("arguments")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    if is_apply_patch_tool_name(&name) {
-        let (input, incomplete) = finalize_apply_patch(&args, cwd, false);
-        *item = json!({
-            "type": "custom_tool_call", "id": id, "call_id": call_id, "name": name,
-            "input": input, "status": if incomplete { "incomplete" } else { "completed" },
-        });
-    } else if is_tool_search_tool_name(&name) {
-        let arguments = parse_tool_search_arguments(&args);
-        *item = json!({
-            "type": "tool_search_call", "id": id, "call_id": call_id,
-            "execution": "client", "arguments": arguments, "status": "completed",
-        });
-    }
-}
-
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
 }
@@ -431,10 +499,14 @@ pub(crate) struct GrokShimStream {
 }
 
 impl GrokShimStream {
-    pub(crate) fn new(inner: ByteStream, cwd: Option<String>) -> Self {
+    pub(crate) fn new(
+        inner: ByteStream,
+        cwd: Option<String>,
+        ctx: crate::mapper::grok_build::GrokShimContext,
+    ) -> Self {
         Self {
             inner,
-            shim: GrokToolCallShim::new(cwd),
+            shim: GrokToolCallShim::new(cwd, ctx),
             finished: false,
         }
     }
@@ -506,11 +578,34 @@ mod tests {
         format!("event: {event}\ndata: {data}\n\n")
     }
 
-    fn run(input: &str) -> Vec<(String, Value)> {
-        let mut shim = GrokToolCallShim::new(None);
+    fn ctx(
+        custom: &[(&str, bool)],
+        tool_search: bool,
+        ns: &[(&str, &str)],
+    ) -> crate::mapper::grok_build::GrokShimContext {
+        crate::mapper::grok_build::GrokShimContext {
+            custom_lowered: custom.iter().map(|(n, ap)| (n.to_string(), *ap)).collect(),
+            tool_search_lowered: tool_search,
+            namespace_map: ns
+                .iter()
+                .map(|(n, s)| (n.to_string(), s.to_string()))
+                .collect(),
+        }
+    }
+
+    fn run_ctx(
+        input: &str,
+        ctx: crate::mapper::grok_build::GrokShimContext,
+    ) -> Vec<(String, Value)> {
+        let mut shim = GrokToolCallShim::new(None, ctx);
         let mut out = shim.push(input.as_bytes());
         out.extend(shim.finish());
         parse_frames(&out)
+    }
+
+    /// 默认 context:apply_patch(custom)+ tool_search 都被 lower(覆盖多数测试)。
+    fn run(input: &str) -> Vec<(String, Value)> {
+        run_ctx(input, ctx(&[("apply_patch", true)], true, &[]))
     }
 
     fn events(frames: &[(String, Value)]) -> Vec<&str> {
@@ -674,5 +769,75 @@ mod tests {
             vec!["response.created", "response.output_text.delta"]
         );
         assert_eq!(seqs(&frames), vec![0, 1]);
+    }
+
+    #[test]
+    fn function_named_apply_patch_but_not_lowered_passes_through() {
+        // [review thread0] apply_patch 不在 custom_lowered(是普通 function/MCP 工具)→ 不 repack。
+        let input = frame(
+            "response.output_item.added",
+            json!({"type":"response.output_item.added","sequence_number":0,"output_index":0,
+                "item":{"type":"function_call","id":"fc_x","call_id":"c_x","name":"apply_patch","arguments":""}}),
+        );
+        let frames = run_ctx(&input, ctx(&[], false, &[]));
+        assert_eq!(
+            frames[0].1["item"]["type"], "function_call",
+            "未 lower 的 apply_patch 应原样透传,不 repack 成 custom_tool_call"
+        );
+    }
+
+    #[test]
+    fn namespaced_discovered_tool_gets_namespace_field() {
+        // [review thread1] grok 调发现的 MCP 工具(namespace 内层)→ 透传 function_call 补 namespace。
+        let input = [
+            frame(
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","sequence_number":0,"output_index":0,
+                    "item":{"type":"function_call","id":"fc_n","call_id":"c_n","name":"notion_create_pages","arguments":""}}),
+            ),
+            frame(
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,
+                    "item":{"type":"function_call","id":"fc_n","call_id":"c_n","name":"notion_create_pages","arguments":"{}"}}),
+            ),
+        ]
+        .concat();
+        let frames = run_ctx(
+            &input,
+            ctx(&[], false, &[("notion_create_pages", "mcp__notion__")]),
+        );
+        assert_eq!(frames[0].1["item"]["type"], "function_call");
+        assert_eq!(
+            frames[0].1["item"]["namespace"], "mcp__notion__",
+            "added 的 namespace 工具应补 namespace"
+        );
+        assert_eq!(
+            frames[1].1["item"]["namespace"], "mcp__notion__",
+            "done 的 namespace 工具应补 namespace"
+        );
+    }
+
+    #[test]
+    fn json_response_rewrites_output_array() {
+        // [review thread2] stream:false 的 grok 成功响应是单 JSON,直接改写顶层 output[]。
+        let args = serde_json::to_string(
+            &json!({"input":"*** Begin Patch\n*** Add File: f.txt\n+x\n*** End Patch\n"}),
+        )
+        .unwrap();
+        let mut body = json!({"output":[
+            {"type":"function_call","id":"fc1","call_id":"c1","name":"apply_patch","arguments":args},
+            {"type":"message","role":"assistant","content":[]}
+        ]});
+        let shim = GrokToolCallShim::new(None, ctx(&[("apply_patch", true)], true, &[]));
+        shim.rewrite_json_response(&mut body);
+        assert_eq!(
+            body["output"][0]["type"], "custom_tool_call",
+            "JSON output[] 的 apply_patch function_call 应重写成 custom_tool_call"
+        );
+        assert!(body["output"][0]["input"]
+            .as_str()
+            .unwrap()
+            .contains("*** Begin Patch"));
+        assert_eq!(body["output"][1]["type"], "message", "非工具 item 不动");
     }
 }

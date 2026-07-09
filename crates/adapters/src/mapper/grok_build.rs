@@ -170,6 +170,69 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
         .flatten()
 }
 
+/// [MOC-301/304 review] grok 响应侧 shim 所需的**请求侧元数据**。名字判定不够(thread0:恰好叫
+/// apply_patch/tool_search 的普通 function 会被误 repack;thread1:grok 调发现的 MCP 工具时透传的
+/// function_call 缺 `namespace` 字段,Codex 无法 dispatch)。从**请求体**推导,喂给 shim。
+#[derive(Default, Debug)]
+pub(crate) struct GrokShimContext {
+    /// 从 `custom` lower 成 function 的工具名 → 是否 apply_patch(apply_patch 走 V4A preflight,
+    /// 其余 custom 只取裸 input)。只有在此集合里的 function_call 才重打包成 custom_tool_call。
+    pub custom_lowered: std::collections::HashMap<String, bool>,
+    /// tool_search 是否被 lower(名恒为 `tool_search`)。gate `tool_search` 的 repack。
+    pub tool_search_lowered: bool,
+    /// namespace / 发现工具的**内层 function name → namespace 名**。grok 调这些工具回的普通
+    /// function_call 需补 `namespace` 字段,Codex 才能 dispatch(对齐 converter 的 lookup_namespace_for)。
+    pub namespace_map: std::collections::HashMap<String, String>,
+}
+
+/// 从(适配前的)请求体推导 [`GrokShimContext`]。
+pub(crate) fn grok_shim_request_context(body: &[u8]) -> GrokShimContext {
+    let mut ctx = GrokShimContext::default();
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return ctx;
+    };
+    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+        for t in tools {
+            match t.get("type").and_then(Value::as_str) {
+                Some("custom") => {
+                    if let Some(n) = t.get("name").and_then(Value::as_str) {
+                        ctx.custom_lowered.insert(
+                            n.to_owned(),
+                            crate::responses::converter::is_apply_patch_tool_name(n),
+                        );
+                    }
+                }
+                Some("tool_search") => ctx.tool_search_lowered = true,
+                Some("namespace") => collect_namespace_map(t, &mut ctx.namespace_map),
+                _ => {}
+            }
+        }
+    }
+    // 发现的工具(tool_search_output.tools)也可能是 namespace 包 → 同样收 name→namespace。
+    for t in crate::responses::request::discovered_tools_from_tool_search_output(&v) {
+        collect_namespace_map(&t, &mut ctx.namespace_map);
+    }
+    ctx
+}
+
+/// 把一个 namespace 包的内层 function name → namespace 名收进 `map`。
+fn collect_namespace_map(t: &Value, map: &mut std::collections::HashMap<String, String>) {
+    if t.get("type").and_then(Value::as_str) != Some("namespace") {
+        return;
+    }
+    let (Some(ns), Some(inner)) = (
+        t.get("name").and_then(Value::as_str),
+        t.get("tools").and_then(Value::as_array),
+    ) else {
+        return;
+    };
+    for f in inner {
+        if let Some(n) = f.get("name").and_then(Value::as_str) {
+            map.insert(n.to_owned(), ns.to_owned());
+        }
+    }
+}
+
 /// 把一个 Responses 工具 `t` 适配成 grok 认的形态 push 进 `out`(原 body.tools[] 与 tool_search
 /// 发现的工具共用)。`function` 原样;`web_search` 剥 bare;`namespace` 摊平→function→flat;
 /// `custom`(apply_patch)/ `tool_search` 转 function(convert + reshape);`image_generation`/未知 drop。
