@@ -12,6 +12,7 @@ mod codex_stash_injector;
 mod codex_theme_injector;
 mod deepseek_quota;
 mod glm_quota;
+mod grok_build_quota;
 mod kimi_code_quota;
 mod kimi_session;
 mod macos_dock;

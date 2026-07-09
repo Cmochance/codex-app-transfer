@@ -1493,6 +1493,84 @@ async fn fetch_trae_quota(
     }
 }
 
+/// 活动 provider 若是 grok build(authScheme `grok_build_oauth`)→ 其 baseUrl(拼 billing 端点);
+/// 否则 `None`(自清缓存,不残留上个 provider 额度)。
+fn active_grok_build_provider() -> Option<String> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let auth = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(auth, "grok_build_oauth" | "grok_build") {
+        p.get("baseUrl").and_then(|v| v.as_str()).map(String::from)
+    } else {
+        None
+    }
+}
+
+/// [MOC-306] 取 grok build 周额度(authScheme gate + user_id 指纹 + 45s 缓存)。token 走
+/// `ensure_valid_grok_build_token`(临期自动续期 + 落盘);`GET {base}/billing?format=credits` 取
+/// `creditUsagePercent` → 归一成每周窗口。非 grok / 未登录 / refresh 失效 → 清缓存 + None;
+/// 鉴权失败清缓存,瞬时失败留旧缓存重试(对齐 Trae/DeepSeek 语义)。
+async fn fetch_grok_build_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::grok_build_quota::{fetch_grok_credits, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some(base_url) = active_grok_build_provider() else {
+        *cache = None;
+        return None;
+    };
+    let http = http.as_ref()?;
+    let cred = match codex_app_transfer_gemini_oauth::ensure_valid_grok_build_token(http).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "[Quota] grok build 无有效 token(未登录/refresh 失效)→ 清额度缓存");
+            *cache = None;
+            return None;
+        }
+    };
+    // 指纹按 user_id(单账号;切账号即失效)。不按 token —— 每次续期都变,按 token 会让续期后紧跟的
+    // 瞬时失败误清缓存(对齐 Trae review [7])。
+    let user_id = cred.user_id.clone().unwrap_or_default();
+    let fp = quota_fingerprint(&[&user_id]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    match fetch_grok_credits(http, &base_url, &cred.access_token, &user_id).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] grok billing 鉴权失败(token 服务端失效)→ 清额度缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] grok billing 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// 取 WorkBuddy 积分额度(基础包 + 额外包)。非 WorkBuddy → 清缓存 + None。
 /// token:API-key 直用粘贴 key;账号登录走 `ensure_valid_workbuddy_token`(含 refresh + 落盘),
 /// 未登录/refresh 失效 → 清缓存。45s 缓存,指纹按 (provider id, uid=JWT sub) —— 不按 token
@@ -2109,6 +2187,7 @@ pub async fn run_quota_daemon() {
     let mut trae_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut workbuddy_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut qoder_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut grok_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -2149,6 +2228,7 @@ pub async fn run_quota_daemon() {
         let trae = fetch_trae_quota(&quota_http, &mut trae_cache).await;
         let workbuddy = fetch_workbuddy_quota(&quota_http, &mut workbuddy_cache).await;
         let qoder = fetch_qoder_quota(&quota_http, &mut qoder_cache).await;
+        let grok = fetch_grok_build_quota(&quota_http, &mut grok_cache).await;
         // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
         let quota = antigravity
             .or(glm)
@@ -2161,6 +2241,7 @@ pub async fn run_quota_daemon() {
             .or(trae)
             .or(workbuddy)
             .or(qoder)
+            .or(grok)
             .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
