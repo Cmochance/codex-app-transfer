@@ -56,10 +56,24 @@ pub const REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
 pub const LOOPBACK_PORT: u16 = 56121;
 /// authorization_code grant_type。
 pub const AUTH_CODE_GRANT_TYPE: &str = "authorization_code";
+/// grok build 官方上游 base(**钉死**)。account token scoped 给 cli-chat-proxy.grok.com;查 billing/
+/// models 等带 Bearer 的请求**必须**用此常量,**不能**用 provider.baseUrl(用户可改/漂移 → token 外泄
+/// 到非官方 host)。与 resolver 对 GrokBuildOauth 的 upstream pin 一致(MOC-319 review GYF/GYJ)。
+pub const PINNED_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 /// 抓包实证的 OAuth client_id(登录账号 JWT 的 aud);login-config 动态取未接入前的兜底。
 pub const DEFAULT_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 /// 登录 scope(JWT scope claim 实证)。
 pub const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
+
+/// authScheme 字符串归一(trim / 小写 / `-`→`_`)后是否 grok build。覆盖 resolver 的**全部 alias**
+/// (`grok_build_oauth` / `grok_build` / `grokbuild`,见 proxy resolver `AuthScheme::parse`)。src-tauri
+/// 的模型动态拉取 / 额度 gate 复用,避免别名 provider 漏判(MOC-319 review GYN)。
+pub fn is_grok_build_auth_scheme(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "grok_build_oauth" | "grok_build" | "grokbuild"
+    )
+}
 
 /// grok CLI 客户端指纹(2026-07-06 抓包实证:真实 `grok -p` 对 `/v1/responses` 的头)。
 /// 对齐官方客户端身份避免服务端风控判定为非官方客户端。版本随 grok CLI 升级会漂移,
@@ -536,6 +550,24 @@ fn is_transient_refresh_error(e: &GrokBuildError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_scheme_matches_all_aliases_normalized() {
+        // [MOC-319 GYN] 覆盖 resolver 全部 alias + 归一(大小写 / `-`→`_` / trim)。
+        for ok in [
+            "grok_build_oauth",
+            "grok_build",
+            "grokbuild",
+            "grok-build",
+            " Grok_Build ",
+            "GROK-BUILD-OAUTH",
+        ] {
+            assert!(is_grok_build_auth_scheme(ok), "{ok} 应判为 grok build");
+        }
+        for no in ["bearer", "grok_web", "grok_cookie", "workbuddy_oauth", ""] {
+            assert!(!is_grok_build_auth_scheme(no), "{no} 不该判为 grok build");
+        }
+    }
 
     #[test]
     fn transient_refresh_error_classification() {

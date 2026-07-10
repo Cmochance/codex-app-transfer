@@ -85,7 +85,8 @@ pub use trae::{
 // grok build(xAI grok CLI 编码后端账号登录)provider re-exports(parallel module,
 // 标准 OAuth2 device flow(RFC 8628)+ bearer token 单账号 store + 自动 refresh)
 pub use grok_build::{
-    complete_grok_build_login, ensure_valid_grok_build_token, logout as grok_build_logout,
-    prepare_grok_build_authorization, resolve_client_id, AuthorizationRequest, GrokBuildCredential,
-    GrokBuildCredentialStore, GrokBuildError, LOOPBACK_PORT, REDIRECT_URI,
+    complete_grok_build_login, ensure_valid_grok_build_token, is_grok_build_auth_scheme,
+    logout as grok_build_logout, prepare_grok_build_authorization, resolve_client_id,
+    AuthorizationRequest, GrokBuildCredential, GrokBuildCredentialStore, GrokBuildError,
+    LOOPBACK_PORT, PINNED_BASE_URL, REDIRECT_URI,
 };

@@ -2,7 +2,8 @@
 
 use codex_app_transfer_registry::{
     config_file, heal_builtin_provider_fields, heal_legacy_update_url, load_raw_config,
-    migrate_legacy_preset_names, save_raw_config, RawConfig, DEFAULT_UPDATE_URL,
+    migrate_grok_build_model_to_grok_4_5, migrate_legacy_preset_names, save_raw_config, RawConfig,
+    DEFAULT_UPDATE_URL,
 };
 use serde_json::{json, Value};
 
@@ -45,6 +46,10 @@ pub fn load() -> Result<RawConfig, String> {
     }
     // 迁移旧 preset 显示名（月之暗面→MoonShot / 智谱 GLM Coding→GLM Coding / 阿里云百炼→Aliyuncs）。
     if migrate_legacy_preset_names(&mut cfg) {
+        healed = true;
+    }
+    // [MOC-319] 已登录用户的 grok provider 从下线的 grok-build 迁到 grok-4.5。
+    if migrate_grok_build_model_to_grok_4_5(&mut cfg) {
         healed = true;
     }
     if healed {

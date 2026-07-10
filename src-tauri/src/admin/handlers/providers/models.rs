@@ -477,14 +477,26 @@ async fn fetch_zai_glm_models_impl(zp: codex_app_transfer_gemini_oauth::ZaiProvi
 /// grok build(grok CLI 编码后端)真实模型列表:grok OAuth token 打 `{base}/models`(标准 OpenAI
 /// models 格式,实证 grok 返 grok-4.5 + grok-composer-2.5-fast);未登录/失败退静态种子。
 /// [MOC-307 followup] grok 会改模型名(grok-build → grok-4.5,2026-07 实证),动态拉取免每次改 preset。
-async fn fetch_grok_build_models_impl(provider: &Value) -> Value {
+/// 建议映射,但把 `default` 钉到 grok-4.5(若在列表里)——[review GYR] 通用 suggester 遇 /models 把
+/// grok-composer 列在前会误把默认槽建议成 composer;grok 编码主力是 grok-4.5,default 必须优先它。
+fn grok_suggested_mappings(ids: &[String]) -> Value {
+    let mut suggested = suggest_model_mappings(ids);
+    if let Some(pref) = ids.iter().find(|m| m.starts_with("grok-4")) {
+        if let Some(obj) = suggested.as_object_mut() {
+            obj.insert("default".to_owned(), json!(pref));
+        }
+    }
+    suggested
+}
+
+async fn fetch_grok_build_models_impl() -> Value {
     let static_fallback = || {
         let ids = vec!["grok-4.5".to_owned(), "grok-composer-2.5-fast".to_owned()];
         json!({
             "success": true,
             "endpoint": "(static: grok models fallback)",
             "models": ids.clone(),
-            "suggested": suggest_model_mappings(&ids),
+            "suggested": grok_suggested_mappings(&ids),
         })
     };
     let http = match reqwest::Client::builder()
@@ -500,12 +512,12 @@ async fn fetch_grok_build_models_impl(provider: &Value) -> Value {
         Ok(c) => c,
         Err(_) => return static_fallback(),
     };
-    let base = provider
-        .get("baseUrl")
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://cli-chat-proxy.grok.com/v1")
-        .trim_end_matches('/');
-    let url = format!("{base}/models");
+    // [review GYF] base **钉死** grok 官方上游(不读 provider.baseUrl —— 用户可改会把 OAuth token
+    // 外泄到非官方 host,与 resolver 对 GrokBuildOauth 的 upstream pin 一致)。
+    let url = format!(
+        "{}/models",
+        codex_app_transfer_gemini_oauth::PINNED_BASE_URL
+    );
     // 最小 grok-shell 指纹(同 billing 查询,实证 /models 请求头集)。
     let mut req = http
         .get(&url)
@@ -539,7 +551,7 @@ async fn fetch_grok_build_models_impl(provider: &Value) -> Value {
         "success": true,
         "endpoint": url,
         "models": ids.clone(),
-        "suggested": suggest_model_mappings(&ids),
+        "suggested": grok_suggested_mappings(&ids),
     })
 }
 
@@ -636,14 +648,16 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         return fetch_zai_glm_models_impl(zp).await;
     }
 
-    // **grok build**(authScheme=grok_build_oauth,MOC-307 followup):OAuth token 在
-    // `grok-build-oauth.json`(不在 provider.apiKey),用它打 `{base}/models` 拿真实列表 ——
-    // grok 会改模型名(grok-build→grok-4.5),动态拉取免每次改 preset;未登录/失败退静态种子。
-    if matches!(
-        provider.get("authScheme").and_then(|v| v.as_str()),
-        Some("grok_build_oauth") | Some("grok_build")
-    ) {
-        return fetch_grok_build_models_impl(provider).await;
+    // **grok build**(authScheme=grok_build_oauth,MOC-319):OAuth token 在 `grok-build-oauth.json`
+    // (不在 provider.apiKey),用它打**钉死**的官方 `/models` 拿真实列表 —— grok 会改模型名
+    // (grok-build→grok-4.5),动态拉取免每次改 preset;未登录/失败退静态种子。authScheme 归一后覆盖
+    // resolver 全部 alias(grok_build_oauth/grok_build/grokbuild),避免别名 provider 漏判(review GYN)。
+    if provider
+        .get("authScheme")
+        .and_then(|v| v.as_str())
+        .is_some_and(codex_app_transfer_gemini_oauth::is_grok_build_auth_scheme)
+    {
+        return fetch_grok_build_models_impl().await;
     }
 
     // **QoderWork CN**(authScheme=qoder_oauth):模型列表走 Cosy 签名 gRPC(SDK 内),无干净

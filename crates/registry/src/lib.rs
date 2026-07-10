@@ -36,6 +36,7 @@ pub use compact_thinking_policy::{
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
 pub use healing::heal_legacy_update_url;
+pub use healing::migrate_grok_build_model_to_grok_4_5;
 pub use healing::migrate_legacy_preset_names;
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,

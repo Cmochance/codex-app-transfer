@@ -1493,24 +1493,27 @@ async fn fetch_trae_quota(
     }
 }
 
-/// 活动 provider 若是 grok build(authScheme `grok_build_oauth`)→ 其 baseUrl(拼 billing 端点);
-/// 否则 `None`(自清缓存,不残留上个 provider 额度)。
-fn active_grok_build_provider() -> Option<String> {
-    let cfg = crate::admin::registry_io::load().ok()?;
+/// 活动 provider 的 authScheme 是否 grok build(billing 端点 base 一律用钉死的 `PINNED_BASE_URL`,
+/// **不读 provider.baseUrl** —— 用户可改会把 token 外泄到非官方 host,review GYJ)。否则 `false`
+/// (caller 自清缓存)。authScheme 归一后比对 resolver 全部 alias(`grok_build_oauth`/`grok_build`/
+/// `grokbuild`),避免别名 provider 漏判(review GYN)。
+fn active_provider_is_grok_build() -> bool {
+    let Ok(cfg) = crate::admin::registry_io::load() else {
+        return false;
+    };
     let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
-    let providers = cfg.get("providers")?.as_array()?;
+    let Some(providers) = cfg.get("providers").and_then(|v| v.as_array()) else {
+        return false;
+    };
     let p = match active_id {
         Some(id) => providers
             .iter()
-            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
-        None => providers.first()?,
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id)),
+        None => providers.first(),
     };
-    let auth = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
-    if matches!(auth, "grok_build_oauth" | "grok_build") {
-        p.get("baseUrl").and_then(|v| v.as_str()).map(String::from)
-    } else {
-        None
-    }
+    p.and_then(|p| p.get("authScheme"))
+        .and_then(|v| v.as_str())
+        .is_some_and(codex_app_transfer_gemini_oauth::is_grok_build_auth_scheme)
 }
 
 /// [MOC-306] 取 grok build 周额度(authScheme gate + user_id 指纹 + 45s 缓存)。token 走
@@ -1523,10 +1526,10 @@ async fn fetch_grok_build_quota(
 ) -> Option<ProviderQuota> {
     use crate::grok_build_quota::{fetch_grok_credits, QuotaError};
     const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
-    let Some(base_url) = active_grok_build_provider() else {
+    if !active_provider_is_grok_build() {
         *cache = None;
         return None;
-    };
+    }
     let http = http.as_ref()?;
     let cred = match codex_app_transfer_gemini_oauth::ensure_valid_grok_build_token(http).await {
         Ok(c) => c,
@@ -1545,7 +1548,7 @@ async fn fetch_grok_build_quota(
             return Some(q.clone());
         }
     }
-    match fetch_grok_credits(http, &base_url, &cred.access_token, &user_id).await {
+    match fetch_grok_credits(http, &cred.access_token, &user_id).await {
         Ok(q) => {
             *cache = Some((fp, q.clone(), std::time::Instant::now()));
             Some(q)

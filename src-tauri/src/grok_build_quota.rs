@@ -56,16 +56,18 @@ pub fn parse_grok_credits(json: &Value) -> Option<ProviderQuota> {
     })
 }
 
-/// 调 `{base_url}/billing?format=credits` 取周额度。`base_url` = provider.baseUrl
-/// (`https://cli-chat-proxy.grok.com/v1`);`access_token` 为有效 Bearer;`user_id` = 账号 uid
-/// (JWT sub,填 `x-userid`;空则不带该头)。
+/// 调 `{PINNED_BASE_URL}/billing?format=credits` 取周额度。**base 钉死** grok 官方上游(不用
+/// provider.baseUrl —— 用户可改/漂移会把 Bearer token 外泄到非官方 host,review GYJ)。`access_token`
+/// 为有效 Bearer;`user_id` = 账号 uid(JWT sub,填 `x-userid`;空则不带该头)。
 pub async fn fetch_grok_credits(
     http: &reqwest::Client,
-    base_url: &str,
     access_token: &str,
     user_id: &str,
 ) -> Result<ProviderQuota, QuotaError> {
-    let url = format!("{}/billing?format=credits", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/billing?format=credits",
+        codex_app_transfer_gemini_oauth::PINNED_BASE_URL
+    );
     let mut req = http
         .get(&url)
         // 最小 grok-shell 指纹(实证 billing 请求头集,比 /responses 精简,无会话/请求标识)。
