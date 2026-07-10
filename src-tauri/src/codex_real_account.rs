@@ -523,14 +523,22 @@ static AUTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // codex login 是交互式(开浏览器等回调),会阻塞到完成/超时,所以**不能**在 HTTP
 // handler 里同步 await —— spawn 到后台线程 reap,前端轮询 [`login_status`]。
 
-/// 解析官方 codex CLI 二进制路径。macOS 优先 Codex.app 内置 `Contents/Resources/
+/// 解析官方 codex CLI 二进制路径。macOS 优先桌面 app 内置 `Contents/Resources/
 /// codex`(可靠,不受用户 shell 里 `codex` 函数/别名干扰),回退 PATH 扫描。
+///
+/// [改名适配] Codex 桌面 app 自 26.707 起从 `Codex.app` 改名 `ChatGPT.app`(内置
+/// `Contents/Resources/codex` 路径不变),优先找 ChatGPT.app,Codex.app 兜底旧安装。
 fn resolve_codex_cli() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let mut apps = vec![PathBuf::from("/Applications/Codex.app")];
+        let mut apps = vec![
+            PathBuf::from("/Applications/ChatGPT.app"),
+            PathBuf::from("/Applications/Codex.app"),
+        ];
         if let Some(home) = std::env::var_os("HOME") {
-            apps.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+            let user_apps = PathBuf::from(home).join("Applications");
+            apps.push(user_apps.join("ChatGPT.app"));
+            apps.push(user_apps.join("Codex.app"));
         }
         for app in apps {
             let cli = app.join("Contents").join("Resources").join("codex");

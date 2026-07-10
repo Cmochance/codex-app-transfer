@@ -10,14 +10,21 @@ use std::time::Duration;
 /// 重新拉起 → DB 在 Codex 运行时被写 = 整个设计要防的数据损坏。
 static CODEX_MAINTENANCE_LOCK: Mutex<()> = Mutex::new(());
 
+/// `open -a` fallback 名(resolve_macos_app_path 全落空时用)。
 const MACOS_APP_NAME: &str = "Codex";
-// [MOC-100 B] macOS 进程树匹配 token:`pkill -x Codex` / `pgrep -x Codex` 只认主进程名,
-// Electron helper(`Codex Helper (Renderer/GPU)`)+ Frameworks/bare-modifier-monitor 子进程
-// 在主进程被 KILL 后会被孤儿化存活 → 存活检查误判"已死"放行 → `open -n` 又拉新的 → 实例
-// 堆积(实测 3 次重启累积 27 个进程 → 启动挂死)。改用 `-f` 匹配整个 .app bundle 路径,
-// 覆盖主进程 + 全部 helper(任何安装位置的 `Codex.app/Contents/` 都命中,不误伤
-// `Codex App Transfer.app`——其路径不含 `Codex.app/Contents/`)。
-const MACOS_APP_PROCESS_MATCH: &str = "Codex.app/Contents/";
+// [Codex→ChatGPT 改名适配] Codex 桌面 app 自 26.707 起把 bundle 从 `Codex.app`(进程名/
+// 可执行 `Codex`)改名成 `ChatGPT.app`(进程名/可执行 `ChatGPT`),bundle id
+// `com.openai.codex` 与 user-data-dir `Codex` 不变。进程匹配不能再用 `-x <名>`:
+// (1) `-x Codex` 匹配不到新进程名 `ChatGPT`;(2) 直接换 `-x ChatGPT` 会误杀同可执行名
+// 的消费者 app `ChatGPT Classic.app`(bundle `com.openai.chat`)。改用 `-f` 按 .app
+// bundle 路径正则匹配,同时覆盖新旧两种安装:
+// - MAIN:只命中主进程(cmdline 含 `<App>.app/Contents/MacOS/`),供运行检测 + TERM 优雅退出
+//   (让 Electron 自己 reap helper),保留原「只看主进程」的速度优化。
+// - APP(全树):命中主进程 + 全部 helper(cmdline 含 `<App>.app/Contents/`),供 KILL 兜底 reap。
+// 两者都**不误伤** `Codex App Transfer.app`(其路径是 `Codex App Transfer.app`,`Codex`
+// 后接空格非 `.app`,正则 `Codex\.app` 不命中)与 `ChatGPT Classic.app`(同理 `ChatGPT` 后接空格)。
+const MACOS_MAIN_PROCESS_MATCH: &str = r"(Codex|ChatGPT)\.app/Contents/MacOS/";
+const MACOS_APP_PROCESS_MATCH: &str = r"(Codex|ChatGPT)\.app/Contents/";
 const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
 /// OpenAI 官方 Windows Store 包 ID,与 codex-account-switch 保持一致;
 /// 用户若装的是非 Store 版本,resolve 失败时 explorer.exe 会报错,前端会
@@ -41,7 +48,9 @@ fn running_check_command(platform: &str) -> Vec<String> {
         // 等主进程死即可(LaunchServices 按主进程判 app 是否在跑,主进程 reaped 后
         // `open -a` 就会启新实例,不撞 activate-已有 的 race)。KILL 阶段仍用 `-f`
         // 强杀整树兜底(见 quit_command)。实测把"点击→重启弹窗"从 4-8s 降到 ~1-2s。
-        "macos" => vec!["pgrep".into(), "-x".into(), MACOS_APP_NAME.into()],
+        // [改名适配] 从 `-x Codex` 改 `-f MACOS_MAIN_PROCESS_MATCH`:覆盖 Codex.app/ChatGPT.app
+        // 两种主进程,且不误杀同 exe 名的 ChatGPT Classic(详见常量注释)。仍只命中主进程。
+        "macos" => vec!["pgrep".into(), "-f".into(), MACOS_MAIN_PROCESS_MATCH.into()],
         "windows" => vec![
             "tasklist".into(),
             "/FI".into(),
@@ -57,15 +66,17 @@ fn running_check_command(platform: &str) -> Vec<String> {
 /// 退出命令(`force=false` 普通退出, `force=true` 强杀).
 fn quit_command(platform: &str, force: bool) -> Vec<String> {
     match (platform, force) {
+        // [改名适配] TERM 阶段从 `-x Codex` 改 `-f MACOS_MAIN_PROCESS_MATCH`:优雅杀主进程
+        // (让 Electron 自己 reap helper),覆盖 Codex.app/ChatGPT.app,不误杀 ChatGPT Classic。
         ("macos", false) => vec![
             "pkill".into(),
             "-TERM".into(),
-            "-x".into(),
-            MACOS_APP_NAME.into(),
+            "-f".into(),
+            MACOS_MAIN_PROCESS_MATCH.into(),
         ],
         // [MOC-100 B] KILL 阶段杀整个 .app 进程树(主进程 + 孤儿 helper),
-        // 否则 helper 残留 + `open -n` → 实例堆积。TERM 阶段(上面)保持 `-x Codex`
-        // 优雅杀主进程,让 Electron 自己 reap helper;只有 graceful 没清干净才升级到这条 KILL-all。
+        // 否则 helper 残留 + `open -n` → 实例堆积。TERM 阶段(上面)只优雅杀主进程,
+        // 让 Electron 自己 reap helper;只有 graceful 没清干净才升级到这条 KILL-all。
         ("macos", true) => vec![
             "pkill".into(),
             "-KILL".into(),
@@ -166,9 +177,15 @@ fn open_command(
 }
 
 fn resolve_macos_app_path() -> Option<String> {
-    let mut candidates = vec![PathBuf::from("/Applications/Codex.app")];
+    // [改名适配] 26.707+ 是 `ChatGPT.app`(优先);`Codex.app` 保留兜底覆盖未更新的旧安装。
+    let mut candidates = vec![
+        PathBuf::from("/Applications/ChatGPT.app"),
+        PathBuf::from("/Applications/Codex.app"),
+    ];
     if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+        let apps = PathBuf::from(home).join("Applications");
+        candidates.push(apps.join("ChatGPT.app"));
+        candidates.push(apps.join("Codex.app"));
     }
     candidates
         .into_iter()
@@ -1012,7 +1029,11 @@ mod tests {
     #[test]
     fn running_check_command_is_platform_specific() {
         // [MOC-100 B→优化] 退出判定只看主进程(快);KILL 阶段才用 -f 强杀整树
-        assert_eq!(running_check_command("macos"), vec!["pgrep", "-x", "Codex"]);
+        // [改名适配] 主进程用 -f 正则匹配 Codex.app/ChatGPT.app 的 /Contents/MacOS/ 路径
+        assert_eq!(
+            running_check_command("macos"),
+            vec!["pgrep", "-f", r"(Codex|ChatGPT)\.app/Contents/MacOS/"]
+        );
         let windows = running_check_command("windows");
         assert_eq!(windows[0], "tasklist");
         assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
@@ -1045,14 +1066,20 @@ mod tests {
 
     #[test]
     fn quit_command_uses_term_then_kill() {
+        // [改名适配] TERM 优雅杀主进程(-f 正则覆盖 Codex.app/ChatGPT.app)
         assert_eq!(
             quit_command("macos", false),
-            vec!["pkill", "-TERM", "-x", "Codex"]
+            vec![
+                "pkill",
+                "-TERM",
+                "-f",
+                r"(Codex|ChatGPT)\.app/Contents/MacOS/"
+            ]
         );
-        // [MOC-100 B] KILL 阶段改杀整个 .app 进程树(reap helper)
+        // [MOC-100 B] KILL 阶段杀整个 .app 进程树(reap helper);[改名适配] -f 正则覆盖两种 .app
         assert_eq!(
             quit_command("macos", true),
-            vec!["pkill", "-KILL", "-f", "Codex.app/Contents/"]
+            vec!["pkill", "-KILL", "-f", r"(Codex|ChatGPT)\.app/Contents/"]
         );
 
         let win_graceful = quit_command("windows", false);
