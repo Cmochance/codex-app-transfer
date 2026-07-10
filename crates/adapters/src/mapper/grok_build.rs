@@ -15,11 +15,13 @@
 //!   `{type:web_search}`;`custom`(apply_patch)/ `tool_search` **同款转 function**(convert + reshape),
 //!   响应侧由 grok tool-call shim 重打包回 Codex 类型(见下「响应侧」);`image_generation` / 未知类型
 //!   **直接 drop 不 advertise**(grok 支持度探索见 MOC-305)。
-//! - `reasoning` 归一为 `{"summary": "concise"}`(对齐真实 grok CLI 抓包)。grok 不支持
-//!   `effort`,且靠 `summary` 指令生成 + 跨轮解密**加密 reasoning**(`encrypted_content`);
-//!   Codex 发 `{"effort":...}` 无 summary,若只剥成 `{}`,grok 下一轮回灌 encrypted_content 时
-//!   **解不开**(400 "Could not decode the compaction blob")。encrypted_content **保留原样透传**
-//!   —— grok 原生支持加密 reasoning,是它的能力,不能像 chat 路径那样丢(chat 丢是因上游不支持)。
+//! - `reasoning` 按目标模型归一(抓包实证 2026-07-09,MOC-307):**grok-4.5**(supports_reasoning_effort,
+//!   三档 high/medium/low)发 `{"effort": <映射>, "summary": "concise"}`(effort + summary 共存);
+//!   **旧 grok-build / grok-composer**(不支持 effort)只发 `{"summary": "concise"}`(发 effort 会 400)。
+//!   `summary` 必留(grok 靠它生成 + 跨轮解密**加密 reasoning** `encrypted_content`;缺则下轮回灌
+//!   400 "Could not decode the compaction blob")。encrypted_content **保留原样透传** —— grok 原生
+//!   支持加密 reasoning 连续性(与真实 CLI 一致;通用代理 pi/cliproxy 移除是省 replay 的通用性取舍,
+//!   本项目已适配、不倒退)。
 //!
 //! 真机实证(2026-07-07):适配后 grok `/responses` 返 200 并正常推理 + 调 function 工具。
 //! model 映射(gpt-5.x → grok-build)由 resolver 负责,不在此。
@@ -53,6 +55,27 @@ pub(crate) fn is_grok_build_provider(provider: &Provider) -> bool {
 /// 命中 grok_build;未来同类第三方在此登记。真 OpenAI/ChatGPT backend 有 compaction,不进此列。
 pub(crate) fn responses_upstream_lacks_compaction(provider: &Provider) -> bool {
     is_grok_build_provider(provider)
+}
+
+/// grok 模型是否支持 `reasoning.effort`(实证 grok-4.5 `/v1/models` `supports_reasoning_effort=true`,
+/// 三档 high/medium/low)。**排除法**:已知不支持的是下线的 `grok-build` 与 Cursor 编码模型
+/// `grok-composer`(无 reasoning);其余(grok-4.5 及后续 reasoning 模型)默认支持 —— 对新模型更 robust。
+/// [MOC-307] 发不支持的模型 effort 会 400 "does not support parameter reasoningEffort"。
+fn grok_model_supports_reasoning_effort(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    !m.starts_with("grok-build") && !m.contains("composer")
+}
+
+/// Codex 的 reasoning effort → grok 三档(`high`/`medium`/`low`,实证 grok 仅此三档)。Codex 可能发
+/// minimal/low/medium/high/xhigh/max/none;就近映射,`none`→最低 low(grok-4.5 无「关」档),未知→
+/// grok 默认 high。
+fn map_effort_to_grok(effort: Option<&str>) -> &'static str {
+    match effort.unwrap_or("high") {
+        "minimal" | "low" | "none" => "low",
+        "medium" => "medium",
+        "high" | "xhigh" | "max" => "high",
+        _ => "high",
+    }
 }
 
 /// 把 Codex 的 Responses 请求体适配成 grok-build `/responses` 接受的形态。
@@ -120,17 +143,41 @@ pub(crate) fn adapt_grok_build_request_body(body: &Bytes, provider: &Provider) -
             changed = true;
         }
     }
+    // [MOC-307] 兜底:请求**压根没 tools 字段**(orig 空 + discovered 空 → 上面 block 未进)却带
+    // `tool_choice`(某些 compact / 无工具轮)→ 残留会让 grok 400 "tool_choice set but no tools"
+    // (真机实证 composer 请求)。block 内只护「有 tools 但适配后全空」;此处统一兜「无 tools / 空 tools
+    // + 有 tool_choice」→ 删 tool_choice。
+    let has_tools = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty());
+    if !has_tools && obj.remove("tool_choice").is_some() {
+        changed = true;
+    }
 
-    // 2. reasoning 归一成 grok 认的形态。抓包实证(2026-07-07):真实 grok CLI 全程发
-    // `reasoning: {"summary": "concise"}`(**不发 effort**,grok-build supports_reasoning_effort=false)。
-    // grok 靠 `reasoning.summary` 指令生成 + **加密 reasoning(encrypted_content)** 并跨轮解密;
-    // Codex 发的是 `{"effort": "medium"}`(无 summary),若只剥 effort 留 `{}`,grok 缺 summary 指令
-    // → 生成的 encrypted_content 在下一轮回灌时**解不开**(400 "Could not decode the compaction
-    // blob")。故直接对齐真实 CLI:reasoning = {"summary": "concise"}。**保留** input 里的
-    // encrypted_content(grok 原生支持加密 reasoning,是它的能力,不能丢 —— 与 chat 路径「上游
-    // 不支持才丢」不同)。
+    // 2. reasoning 归一成 grok 认的形态。抓包实证(2026-07-09,MOC-307):
+    //    - **grok-4.5**(supports_reasoning_effort=true,三档 high/medium/low)真实 CLI 发
+    //      `{"effort": <high|medium|low>, "summary": "concise"}` —— effort + summary **共存**,
+    //      且 `include:[reasoning.encrypted_content]` **保留**(跨轮加密推理连续性)。
+    //    - **旧 grok-build / grok-composer**(不支持 effort)只发 `{"summary": "concise"}`;发 effort
+    //      会 400 "does not support parameter reasoningEffort"。
+    //    此处 `body.model` 已被 resolver rewrite 成目标 grok 模型(forward.rs 在 adapter 前 rewrite),
+    //    故按模型 gate:支持 effort 的透传 Codex 的 effort(映射到 grok 三档),否则只留 summary。
+    //    `summary` 必留(grok 靠它生成 + 跨轮解密 encrypted_content,缺则下轮回灌 400 "Could not decode
+    //    the compaction blob");**保留** input 的 encrypted_content(见 step 3,与真实 CLI 一致 —— 通用
+    //    代理 pi/cliproxy 移除是为省 replay 复杂度的通用性取舍,本项目已适配连续性,不倒退)。
     if obj.contains_key("reasoning") {
-        obj.insert("reasoning".into(), json!({ "summary": "concise" }));
+        let model = obj.get("model").and_then(Value::as_str).unwrap_or("");
+        let reasoning = if grok_model_supports_reasoning_effort(model) {
+            let codex_effort = obj
+                .get("reasoning")
+                .and_then(|r| r.get("effort"))
+                .and_then(Value::as_str);
+            json!({ "effort": map_effort_to_grok(codex_effort), "summary": "concise" })
+        } else {
+            json!({ "summary": "concise" })
+        };
+        obj.insert("reasoning".into(), reasoning);
         changed = true;
     }
 
@@ -1000,6 +1047,95 @@ mod tests {
             v["input"]["type"], "function_call",
             "单对象 input 的 custom_tool_call 应改写成 function_call"
         );
+    }
+
+    #[test]
+    fn grok_4_5_passes_reasoning_effort() {
+        // [MOC-307] grok-4.5 支持 effort → 归一为 {effort:<映射>, summary:concise}(effort+summary 共存,
+        // encrypted 保留),对齐真实 CLI 抓包(2026-07-09 `{"effort":"high","summary":"concise"}`)。
+        let body = serde_json::to_vec(&json!({
+            "model": "grok-4.5",
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": { "effort": "medium", "summary": null },
+            "input": []
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["reasoning"],
+            json!({ "effort": "medium", "summary": "concise" }),
+            "grok-4.5 透传 effort(映射)+ 保留 summary"
+        );
+        assert_eq!(
+            v["include"],
+            json!(["reasoning.encrypted_content"]),
+            "encrypted include 保留(连续性不倒退)"
+        );
+    }
+
+    #[test]
+    fn grok_composer_keeps_summary_only_no_effort() {
+        // grok-composer 不支持 effort → 只 {summary:concise}(发 effort 会 400)。
+        let body = serde_json::to_vec(&json!({
+            "model": "grok-composer-2.5-fast",
+            "reasoning": { "effort": "high" }, "input": []
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            v["reasoning"],
+            json!({ "summary": "concise" }),
+            "composer 不加 effort"
+        );
+    }
+
+    #[test]
+    fn strips_tool_choice_when_no_tools_field() {
+        // [MOC-307] 请求带 tool_choice 但压根没 tools 字段(orig 空 + discovered 空)→ 删 tool_choice,
+        // 否则 grok 400 "tool_choice set but no tools"(真机实证 composer 请求)。
+        let body = serde_json::to_vec(&json!({
+            "model": "grok-composer-2.5-fast",
+            "tool_choice": "auto",
+            "input": []
+        }))
+        .unwrap();
+        let out =
+            adapt_grok_build_request_body(&Bytes::from(body), &grok_provider()).expect("改过");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v.get("tool_choice").is_none(),
+            "无 tools 时 tool_choice 应被删(防 grok 400)"
+        );
+    }
+
+    #[test]
+    fn effort_maps_to_grok_three_levels_and_model_gate() {
+        assert_eq!(map_effort_to_grok(Some("minimal")), "low");
+        assert_eq!(map_effort_to_grok(Some("low")), "low");
+        assert_eq!(map_effort_to_grok(Some("medium")), "medium");
+        assert_eq!(map_effort_to_grok(Some("high")), "high");
+        assert_eq!(map_effort_to_grok(Some("xhigh")), "high");
+        assert_eq!(
+            map_effort_to_grok(Some("none")),
+            "low",
+            "grok 无关档 → 最低 low"
+        );
+        assert_eq!(map_effort_to_grok(None), "high", "缺省 grok 默认 high");
+        assert_eq!(
+            map_effort_to_grok(Some("weird")),
+            "high",
+            "未知 → 默认 high"
+        );
+        // 模型 gate:排除下线 grok-build + composer,其余(grok-4.5)默认支持。
+        assert!(grok_model_supports_reasoning_effort("grok-4.5"));
+        assert!(!grok_model_supports_reasoning_effort("grok-build"));
+        assert!(!grok_model_supports_reasoning_effort(
+            "grok-composer-2.5-fast"
+        ));
     }
 
     #[test]

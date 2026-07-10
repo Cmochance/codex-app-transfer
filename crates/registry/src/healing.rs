@@ -303,6 +303,53 @@ pub fn migrate_legacy_preset_names(cfg: &mut Value) -> bool {
     changed
 }
 
+/// [MOC-319] grok 把编码主模型 `grok-build` **下线**、换成 `grok-4.5`。healing 保留用户可调的
+/// `models` / `modelCapabilities`(`heal_builtin_provider_fields` 不覆盖),故已登录用户的 grok
+/// provider 仍指着已下线的 `grok-build` → resolver 把 Codex 槽映射成 grok-build,上游 400/不识别。
+/// 此处一次性迁移:grok provider(authScheme grok_build_oauth 系)的 `models` 值 + `modelCapabilities`
+/// key 里的 `grok-build` → `grok-4.5`(grok-build 已不可用,非用户偏好 → 安全迁移;registry crate 不能
+/// 依赖 gemini_oauth,故内联 authScheme alias 判定)。
+pub fn migrate_grok_build_model_to_grok_4_5(cfg: &mut Value) -> bool {
+    let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for provider in providers.iter_mut() {
+        let is_grok = provider
+            .get("authScheme")
+            .and_then(|v| v.as_str())
+            .map(|a| a.trim().to_ascii_lowercase().replace('-', "_"))
+            .is_some_and(|a| matches!(a.as_str(), "grok_build_oauth" | "grok_build" | "grokbuild"));
+        if !is_grok {
+            continue;
+        }
+        let Some(obj) = provider.as_object_mut() else {
+            continue;
+        };
+        // models 里所有值 == "grok-build"(default + 槽映射)→ "grok-4.5"。
+        if let Some(models) = obj.get_mut("models").and_then(|v| v.as_object_mut()) {
+            for v in models.values_mut() {
+                if v.as_str() == Some("grok-build") {
+                    *v = Value::String("grok-4.5".to_owned());
+                    changed = true;
+                }
+            }
+        }
+        // modelCapabilities:key "grok-build" → "grok-4.5"(500k;已有 grok-4.5 则不覆盖)。
+        if let Some(caps) = obj
+            .get_mut("modelCapabilities")
+            .and_then(|v| v.as_object_mut())
+        {
+            if caps.remove("grok-build").is_some() {
+                caps.entry("grok-4.5".to_owned())
+                    .or_insert_with(|| serde_json::json!({ "context_window": 500000 }));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// provider 是否有合法的 `grokWeb.cookies.sso` JWT(非空 string)。
 ///
 /// 用于 [`heal_builtin_provider_fields`] 检测 grok-web preset 半残不变量:
@@ -1071,5 +1118,43 @@ mod tests {
         assert_eq!(p["authScheme"], "custom-auth");
         assert_eq!(p["extraHeaders"]["User-Agent"], "Custom-UA");
         assert!(p["extraHeaders"].get("X-Default").is_none());
+    }
+
+    #[test]
+    fn migrates_grok_build_model_to_grok_4_5() {
+        // [MOC-319] 已登录用户的 grok provider 从下线的 grok-build 迁到 grok-4.5(default + 槽 + caps key)。
+        let mut cfg = json!({"providers":[
+            {"id":"x","authScheme":"grok_build_oauth","models":{"default":"grok-build","gpt_5_4":"grok-composer-2.5-fast"},
+             "modelCapabilities":{"grok-build":{"context_window":512000}}},
+            // alias 形式(grokbuild)也要迁。
+            {"id":"y","authScheme":"grokbuild","models":{"default":"grok-build"}},
+            // 非 grok provider 不动。
+            {"id":"z","authScheme":"bearer","models":{"default":"grok-build"}}
+        ]});
+        assert!(migrate_grok_build_model_to_grok_4_5(&mut cfg));
+        let ps = cfg["providers"].as_array().unwrap();
+        assert_eq!(ps[0]["models"]["default"], "grok-4.5", "default 迁移");
+        assert_eq!(
+            ps[0]["models"]["gpt_5_4"], "grok-composer-2.5-fast",
+            "非 grok-build 槽不动"
+        );
+        assert!(
+            ps[0]["modelCapabilities"].get("grok-build").is_none(),
+            "caps 旧 key 删"
+        );
+        assert_eq!(
+            ps[0]["modelCapabilities"]["grok-4.5"]["context_window"],
+            500000
+        );
+        assert_eq!(
+            ps[1]["models"]["default"], "grok-4.5",
+            "grokbuild alias 也迁"
+        );
+        assert_eq!(
+            ps[2]["models"]["default"], "grok-build",
+            "非 grok provider 不动"
+        );
+        // 幂等:再跑无改动。
+        assert!(!migrate_grok_build_model_to_grok_4_5(&mut cfg));
     }
 }
