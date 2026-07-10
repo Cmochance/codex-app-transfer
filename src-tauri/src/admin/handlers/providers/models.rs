@@ -474,6 +474,75 @@ async fn fetch_zai_glm_models_impl(zp: codex_app_transfer_gemini_oauth::ZaiProvi
     })
 }
 
+/// grok build(grok CLI 编码后端)真实模型列表:grok OAuth token 打 `{base}/models`(标准 OpenAI
+/// models 格式,实证 grok 返 grok-4.5 + grok-composer-2.5-fast);未登录/失败退静态种子。
+/// [MOC-307 followup] grok 会改模型名(grok-build → grok-4.5,2026-07 实证),动态拉取免每次改 preset。
+async fn fetch_grok_build_models_impl(provider: &Value) -> Value {
+    let static_fallback = || {
+        let ids = vec!["grok-4.5".to_owned(), "grok-composer-2.5-fast".to_owned()];
+        json!({
+            "success": true,
+            "endpoint": "(static: grok models fallback)",
+            "models": ids.clone(),
+            "suggested": suggest_model_mappings(&ids),
+        })
+    };
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(6))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return static_fallback(),
+    };
+    // 未登录 / refresh 失效 → 静态种子(UI 仍给 model 选项,跟 zai/antigravity 一致)。
+    let cred = match codex_app_transfer_gemini_oauth::ensure_valid_grok_build_token(&http).await {
+        Ok(c) => c,
+        Err(_) => return static_fallback(),
+    };
+    let base = provider
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://cli-chat-proxy.grok.com/v1")
+        .trim_end_matches('/');
+    let url = format!("{base}/models");
+    // 最小 grok-shell 指纹(同 billing 查询,实证 /models 请求头集)。
+    let mut req = http
+        .get(&url)
+        .bearer_auth(&cred.access_token)
+        .header("x-xai-token-auth", "xai-grok-cli")
+        .header("x-grok-client-version", "0.2.93")
+        .header("accept", "application/json")
+        .header("user-agent", "grok-shell/0.2.93 (macos; aarch64)");
+    if let Some(uid) = cred.user_id.as_deref().filter(|s| !s.is_empty()) {
+        req = req.header("x-userid", uid);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error_id = "GROK_MODELS_FETCH_HTTP", error = %e, "grok 模型列表请求失败,退静态");
+            return static_fallback();
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(error_id = "GROK_MODELS_FETCH_STATUS", status = %resp.status(), "grok 模型列表非 2xx,退静态");
+        return static_fallback();
+    }
+    let Ok(payload) = resp.json::<Value>().await else {
+        return static_fallback();
+    };
+    let ids = extract_model_ids(&payload);
+    if ids.is_empty() {
+        return static_fallback();
+    }
+    json!({
+        "success": true,
+        "endpoint": url,
+        "models": ids.clone(),
+        "suggested": suggest_model_mappings(&ids),
+    })
+}
+
 /// QoderWork CN 模型目录(静态种子)。
 ///
 /// QoderWork 的模型列表走 Cosy 签名的 gRPC `get_models`(在 `@qoder-ai/qoder-agent-sdk`
@@ -565,6 +634,16 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         _ => None,
     } {
         return fetch_zai_glm_models_impl(zp).await;
+    }
+
+    // **grok build**(authScheme=grok_build_oauth,MOC-307 followup):OAuth token 在
+    // `grok-build-oauth.json`(不在 provider.apiKey),用它打 `{base}/models` 拿真实列表 ——
+    // grok 会改模型名(grok-build→grok-4.5),动态拉取免每次改 preset;未登录/失败退静态种子。
+    if matches!(
+        provider.get("authScheme").and_then(|v| v.as_str()),
+        Some("grok_build_oauth") | Some("grok_build")
+    ) {
+        return fetch_grok_build_models_impl(provider).await;
     }
 
     // **QoderWork CN**(authScheme=qoder_oauth):模型列表走 Cosy 签名 gRPC(SDK 内),无干净
