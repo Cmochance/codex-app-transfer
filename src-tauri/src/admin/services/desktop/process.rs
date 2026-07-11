@@ -211,16 +211,29 @@ fn chat_launch_env(platform: &str) -> Vec<(String, String)> {
     if !enabled {
         return Vec::new();
     }
+    // [code-review H1] 无可解析 proxy 目标(全新安装 / activeProvider null / provider 不走
+    // proxy)时**不注入** base_url。否则 Quick Chat 被 CODEX_API_BASE_URL 导向死的本地
+    // `/backend-api`,连真 ChatGPT 都用不了 —— 新装用户直接丢失 Chat。此时回落真 ChatGPT。
+    if !crate::admin::services::desktop::snapshot::active_provider_supports_relay() {
+        return Vec::new();
+    }
     let port = cfg
         .as_ref()
         .map(crate::admin::handlers::proxy::read_proxy_port)
         .unwrap_or(18080);
     let Some(home) = std::env::var_os("HOME") else {
+        tracing::warn!("[Chat] HOME 未设置,Chat 自定义模型本次启动不生效");
         return Vec::new();
     };
     let dir = PathBuf::from(home).join(".codex-app-transfer");
     let patch_path = dir.join("chat_guard_patch.js");
-    if fs::create_dir_all(&dir).is_err() || fs::write(&patch_path, CHAT_GUARD_PATCH_JS).is_err() {
+    // [code-review H4] I/O 失败不能静默吞成空 env(开关显示开、实际走真 ChatGPT);记 warn 便于诊断。
+    if let Err(e) = fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, dir = %dir.display(), "[Chat] 建目录失败,Chat 自定义模型本次不生效");
+        return Vec::new();
+    }
+    if let Err(e) = fs::write(&patch_path, CHAT_GUARD_PATCH_JS) {
+        tracing::warn!(error = %e, path = %patch_path.display(), "[Chat] 写守卫补丁失败,Chat 自定义模型本次不生效");
         return Vec::new();
     }
     let host = format!("localhost:{port}");
@@ -758,7 +771,24 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("codexStashEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled && !stash_enabled {
+    // [MOC-323 / code-review C1] Chat 模型 relabel daemon 也走 CDP。chatCustomModelEnabled
+    // 默认开、其它 CDP 功能默认关 → 不含它则「只开 chat」时 CDP_PORT=0、daemon 静默跳过、
+    // picker 永远 GPT 名。只在**确有 proxy 路由的活动 provider**(全新安装/无 provider → false,
+    // 与 chat_launch_env 的 H1 守卫一致,避免无谓开端口)时才为 chat 要端口。
+    let chat_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("chatCustomModelEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let chat_needs_port =
+        chat_enabled && crate::admin::services::desktop::snapshot::active_provider_supports_relay();
+    if !plugin_unlock_needs_port
+        && !theme_enabled
+        && !quota_enabled
+        && !stash_enabled
+        && !chat_needs_port
+    {
         return vec![];
     }
 

@@ -649,7 +649,10 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupCodexIntegration')">
+      <!-- [code-review M3] Chat 自定义模型仅 macOS 实现(chat_launch_env 只对 macos 注入
+           NODE_OPTIONS/CODEX_API_BASE_URL);非 macOS 开了也空转 → gate 到 macOS,避免误导。 -->
       <SettingsRow
+        v-if="isMac"
         :title="t('settings.chatCustomModelEnabled')"
         :description="t('settings.chatCustomModelEnabledHint')"
       >
