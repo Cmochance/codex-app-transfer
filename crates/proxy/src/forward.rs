@@ -918,7 +918,7 @@ fn is_chatgpt_backend_path(path: &str) -> bool {
 /// buffer 以便 log body(getAccount/plugins 都是小 JSON、非 SSE,buffer 无碍)。
 /// header name/value 用字符串 + from_bytes 复制,避开 reqwest 与 axum 的 http 类型
 /// 是否同源的耦合。
-pub(crate) async fn passthrough_chatgpt_backend(
+async fn passthrough_chatgpt_backend(
     state: &ProxyState,
     method: &Method,
     headers: &HeaderMap,

@@ -21,17 +21,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::{Body, Bytes};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use codex_app_transfer_registry::model_alias::{normalize_model_mappings, openai_model_slot};
-use codex_app_transfer_registry::Provider;
 
-use crate::forward::{forward_handler, passthrough_chatgpt_backend, ProxyState};
+use crate::forward::{forward_handler, ProxyState};
 
 /// 单对话保留的最近消息条数(user+assistant),超出截最新。
 const MAX_TURNS_PER_CONV: usize = 40;
@@ -95,125 +92,7 @@ pub async fn try_handle(
     if method == Method::POST && is_conversation_stream_path(path) {
         return Some(handle_conversation(state, headers, body).await);
     }
-    // [模型显示] GET /backend-api/models:透传真 chatgpt.com 拿真实 picker schema,再把条目
-    // relabel 成 active provider 的实际模型名(复用与 coding 同一套 registry slot 映射)。
-    if method == Method::GET && is_models_path(path) {
-        return Some(handle_models(state, method, headers, path, body).await);
-    }
     None
-}
-
-/// 精确命中 `…/models`(不含 `/models/config`、`/models/slugs` 等子路径)。
-fn is_models_path(path: &str) -> bool {
-    path.split('?').next().unwrap_or(path).ends_with("/models")
-}
-
-/// 透传真实 /models,把每个 picker 条目按 active provider 的 slot 映射 relabel 成实际模型名。
-/// relabel 不成立(无 active provider / 无映射 / parse 失败)→ 原样返回,零副作用。
-async fn handle_models(
-    state: &ProxyState,
-    method: &Method,
-    headers: &HeaderMap,
-    path: &str,
-    body: &[u8],
-) -> Response {
-    let raw = match passthrough_chatgpt_backend(
-        state,
-        method,
-        headers,
-        path,
-        Bytes::copy_from_slice(body),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let status = raw.status();
-    let content_type = raw
-        .headers()
-        .get(CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/json"));
-    let bytes = match axum::body::to_bytes(raw.into_body(), usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            return (StatusCode::BAD_GATEWAY, format!("read models failed: {e}")).into_response()
-        }
-    };
-    let out = relabel_models(&bytes, state, headers).unwrap_or_else(|| bytes.to_vec());
-    (status, [(CONTENT_TYPE, content_type)], out).into_response()
-}
-
-/// 用 active provider 的 slot 映射把 /models 的 `models[]` 与 `categories[]` 里的显示名
-/// relabel 成实际模型(如 gpt-5.5→grok-4.5)。`None` = 不改(无 provider/映射/非 JSON)。
-fn relabel_models(bytes: &[u8], state: &ProxyState, headers: &HeaderMap) -> Option<Vec<u8>> {
-    let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let provider = resolve_active_provider(state, headers)?;
-    let mappings_value = serde_json::to_value(&provider.models).ok();
-    let mappings = normalize_model_mappings(mappings_value.as_ref());
-    // slug → 实际模型名(经 registry slot 映射,与 coding 共用)。
-    let mapped_for = |slug: &str| -> Option<String> {
-        let slot = openai_model_slot(slug)?;
-        let m = mappings.get(slot).map(|s| s.trim()).unwrap_or("");
-        (!m.is_empty()).then(|| m.to_owned())
-    };
-    let changed = relabel_models_value(&mut v, mapped_for);
-    changed.then(|| serde_json::to_vec(&v).unwrap_or_default())
-}
-
-/// 纯函数(可测):就地 relabel,返回是否改动。picker `models[].slug` 与 `categories[]
-/// .default_model` 都是模型 slug;`mapped_for(slug)` 给出该 slug 对应的实际模型名(`None`
-/// =无映射不动),relabel 命中条目的 `title` / `human_category_name`。
-fn relabel_models_value(
-    v: &mut serde_json::Value,
-    mapped_for: impl Fn(&str) -> Option<String>,
-) -> bool {
-    let mut changed = false;
-    if let Some(arr) = v.get_mut("models").and_then(|m| m.as_array_mut()) {
-        for m in arr {
-            let slug = m.get("slug").and_then(|s| s.as_str()).map(str::to_owned);
-            if let Some(name) = slug.and_then(|s| mapped_for(&s)) {
-                if let Some(t) = m.get_mut("title") {
-                    *t = serde_json::Value::String(name);
-                    changed = true;
-                }
-            }
-        }
-    }
-    if let Some(arr) = v.get_mut("categories").and_then(|c| c.as_array_mut()) {
-        for c in arr {
-            let dm = c
-                .get("default_model")
-                .and_then(|s| s.as_str())
-                .map(str::to_owned);
-            if let Some(name) = dm.and_then(|s| mapped_for(&s)) {
-                for key in ["title", "human_category_name", "human_category_short_name"] {
-                    if let Some(field) = c.get_mut(key) {
-                        *field = serde_json::Value::String(name.clone());
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-    changed
-}
-
-/// 拿 active/default provider:合成 `POST /responses {model:gpt-5.5}` 喂 resolver(复用 HTTP
-/// 路径同一套路由;`gpt-5.5` 无匹配也 fallback 到 default provider)。带上 /models 请求的
-/// Authorization 过 gateway 校验。
-fn resolve_active_provider(state: &ProxyState, headers: &HeaderMap) -> Option<Arc<Provider>> {
-    let mut builder = Request::builder().method(Method::POST).uri("/responses");
-    if let Some(auth) = headers.get(AUTHORIZATION) {
-        builder = builder.header(AUTHORIZATION, auth);
-    }
-    let (parts, _) = builder.body(()).ok()?.into_parts();
-    state
-        .resolver
-        .resolve(&parts, br#"{"model":"gpt-5.5"}"#)
-        .ok()
-        .map(|r| r.provider)
 }
 
 async fn handle_conversation(state: &ProxyState, headers: &HeaderMap, body: &[u8]) -> Response {
@@ -524,43 +403,6 @@ mod tests {
     fn extract_text_falls_back_to_done_full() {
         let sse = "data: {\"type\":\"response.output_text.done\",\"text\":\"full text\"}\n\n";
         assert_eq!(extract_assistant_text(sse.as_bytes()), "full text");
-    }
-
-    #[test]
-    fn is_models_path_precise() {
-        assert!(is_models_path("/backend-api/models"));
-        assert!(is_models_path("/backend-api/models?iim=false"));
-        assert!(!is_models_path("/backend-api/models/config"));
-        assert!(!is_models_path("/backend-api/f/conversation"));
-    }
-
-    #[test]
-    fn relabel_models_uses_provider_slot_mapping() {
-        // gpt_5_5 槽 → grok-4.5:picker 里 slug 命中该槽的条目 relabel,其它不动
-        let mapped = |slug: &str| -> Option<String> {
-            (openai_model_slot(slug) == Some("gpt_5_5")).then(|| "grok-4.5".to_string())
-        };
-        let mut v = serde_json::json!({
-            "models": [
-                {"slug": "gpt-5.5", "title": "GPT-5.5"},
-                {"slug": "gpt-4o", "title": "GPT-4o"}
-            ],
-            "categories": [
-                {"default_model": "gpt-5.5", "title": "GPT-5.5", "human_category_name": "GPT-5.5"}
-            ]
-        });
-        assert!(relabel_models_value(&mut v, mapped));
-        assert_eq!(v["models"][0]["title"], "grok-4.5"); // 映射的槽 relabel
-        assert_eq!(v["models"][1]["title"], "GPT-4o"); // 无映射的槽不动
-        assert_eq!(v["categories"][0]["title"], "grok-4.5");
-        assert_eq!(v["categories"][0]["human_category_name"], "grok-4.5");
-    }
-
-    #[test]
-    fn relabel_models_noop_without_mapping() {
-        let mut v = serde_json::json!({"models": [{"slug": "gpt-5.5", "title": "GPT-5.5"}]});
-        assert!(!relabel_models_value(&mut v, |_| None));
-        assert_eq!(v["models"][0]["title"], "GPT-5.5"); // 零副作用
     }
 
     #[test]
