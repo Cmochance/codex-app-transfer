@@ -586,6 +586,8 @@ export default {
     "Logged in, but saving the account failed (check ~/.codex-app-transfer permissions and retry); not switching to real account",
   "settings.autoUnlockCodexPlugins": "Auto-unlock Codex plugins",
   "settings.autoUnlockCodexPluginsHint": "Unlocks Codex plugins. Requires launching Codex from this app.",
+  "settings.chatCustomModelEnabled": "Custom models in Chat",
+  "settings.chatCustomModelEnabledHint": "Lets Codex's Chat (classic conversation) use your configured custom-provider models. Only when Codex is launched from this app; relaunch Codex after toggling.",
   "settings.codexQuotaEnabled": "Show usage in Codex",
   "settings.codexQuotaEnabledHint": "Shows a usage panel in Codex (context, token rate/total, quota). Only when Codex is launched from this app.",
   "settings.workbuddyQuotaGuardThreshold": "WorkBuddy account-switch threshold",
