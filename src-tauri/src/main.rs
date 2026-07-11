@@ -5,6 +5,7 @@
 
 mod admin;
 mod anyrouter_quota;
+mod codex_chat_model_injector;
 mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;
@@ -224,6 +225,11 @@ fn main() {
             // + proxy rate limit 快照,经 CDP 推进 Codex Environment 卡片。
             // 开关关 / CDP 不可达时 tick 内静默跳过,常驻无负担。
             tauri::async_runtime::spawn(codex_quota_injector::run_quota_daemon());
+
+            // [MOC-323] Quick Chat 模型名注入 daemon:每 tick 读 settings.chatCustomModelEnabled
+            // + 活动 provider,经 CDP 把硬编码的 GPT-5.x picker 标签 relabel 成实际调用的自定义
+            // 模型(provider.models.default)。开关关 → 推 remove 还原;CDP 不可达时静默跳过。
+            tauri::async_runtime::spawn(codex_chat_model_injector::run_chat_model_daemon());
 
             // 草稿暂存(Stash)注入 daemon:每 tick 读 settings.codexStashEnabled,经 CDP 推
             // 幂等注入(composer 工具栏 push/pop 按钮 + Usage 下方 Stash 面板)。独立于额度开关;
