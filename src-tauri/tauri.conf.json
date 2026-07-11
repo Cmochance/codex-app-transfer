@@ -5,7 +5,10 @@
   "identifier": "store.alyse.codex-app-transfer",
   "build": {
     "frontendDist": "../frontend/dist",
-    "beforeDevCommand": "npm --prefix frontend install && npm --prefix frontend run dev",
+    "beforeDevCommand": {
+      "script": "npm install && npm run dev",
+      "cwd": "../frontend"
+    },
     "devUrl": "http://localhost:1420"
   },
   "app": {
