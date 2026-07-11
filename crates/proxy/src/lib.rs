@@ -11,6 +11,7 @@
 //! 未实现(下阶段):provider 协议转换(`crates/adapters`,Stage 3)、
 //! OS 集成(`crates/codex_integration`,Stage 2.5)、WebSocket 透传。
 
+pub mod chat_conversation;
 pub mod diagnostics;
 pub mod fake_account;
 pub mod fixture;

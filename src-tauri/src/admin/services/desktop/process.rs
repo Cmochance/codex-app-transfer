@@ -189,10 +189,59 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
 /// `extra_args`: 附加给 Codex Desktop 本身的参数(如 `--remote-debugging-port=9222`)。
 /// macOS 通过 `open` 的 `--args` 传递;Linux 直接追加到命令;Windows Store
 /// 应用暂不支持命令行参数(忽略)。
+/// [MOC-323] Chat 接入自定义模型:守卫补丁脚本(经 `NODE_OPTIONS=--require` 注入 app 主进程,
+/// hook `isDesktopAuthAllowedUrl` 白名单;详见 `resources/chat_guard_patch.js`)。
+const CHAT_GUARD_PATCH_JS: &str = include_str!("../../../../resources/chat_guard_patch.js");
+
+/// [MOC-323] 启动 Codex app 时为「Chat 接入自定义模型」注入的环境变量(仅 macOS)。
+/// 设置项 `chatCustomModelEnabled` **默认开**;把守卫补丁写到 `~/.codex-app-transfer/`,令
+/// app 的 Chat 对话经 `CODEX_API_BASE_URL` 流进本地 proxy。**host 必须用 `localhost`**:守卫
+/// 判 `new URL(base).host`,补丁加的是 `localhost:<port>`,base 用 `127.0.0.1` 则 host 不匹配。
+fn chat_launch_env(platform: &str) -> Vec<(String, String)> {
+    if platform != "macos" {
+        return Vec::new();
+    }
+    let cfg = crate::admin::registry_io::load().ok();
+    let enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("chatCustomModelEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true); // 默认开
+    if !enabled {
+        return Vec::new();
+    }
+    let port = cfg
+        .as_ref()
+        .map(crate::admin::handlers::proxy::read_proxy_port)
+        .unwrap_or(18080);
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let dir = PathBuf::from(home).join(".codex-app-transfer");
+    let patch_path = dir.join("chat_guard_patch.js");
+    if fs::create_dir_all(&dir).is_err() || fs::write(&patch_path, CHAT_GUARD_PATCH_JS).is_err() {
+        return Vec::new();
+    }
+    let host = format!("localhost:{port}");
+    vec![
+        (
+            "NODE_OPTIONS".into(),
+            format!("--require {}", patch_path.to_string_lossy()),
+        ),
+        (
+            "CODEX_API_BASE_URL".into(),
+            format!("http://{host}/backend-api"),
+        ),
+        ("CAS_CHAT_GUARD_HOST".into(), host),
+    ]
+}
+
 fn open_command(
     platform: &str,
     resolved_macos_app: Option<&str>,
     extra_args: &[String],
+    extra_env: &[(String, String)],
 ) -> Vec<String> {
     match platform {
         // [MOC-100 E] 去掉 `-n`(原来强制开新实例以绕过「刚杀完进程、launchd 还没
@@ -203,6 +252,12 @@ fn open_command(
         // 走到这里 + POST_QUIT_LAUNCHD_GRACE,那条 race 已不存在 → 用 `open -a` 启**单**实例。
         "macos" => {
             let mut cmd = vec!["open".into()];
+            // [MOC-323] `open --env K=V` 把 env 传给被启动的 GUI app(NODE_OPTIONS 守卫补丁 +
+            // CODEX_API_BASE_URL 路由 Chat 进本地 proxy)。必须在 `-a`/`--args` 之前。
+            for (k, v) in extra_env {
+                cmd.push("--env".into());
+                cmd.push(format!("{k}={v}"));
+            }
             match resolved_macos_app {
                 Some(path) => {
                     cmd.push("-a".into());
@@ -899,7 +954,8 @@ fn open_codex_app(platform: &str) -> Result<(), String> {
         None
     };
     let extra_args = should_attach_debug_port();
-    let cmd = open_command(platform, resolved.as_deref(), &extra_args);
+    let chat_env = chat_launch_env(platform);
+    let cmd = open_command(platform, resolved.as_deref(), &extra_args, &chat_env);
     let Some((program, args)) = cmd.split_first() else {
         return Err("open command is empty".to_owned());
     };
@@ -1266,17 +1322,17 @@ mod tests {
     fn open_command_uses_resolved_path_when_available() {
         // [MOC-100 E] 去掉 `-n`,改单实例 `open -a`
         assert_eq!(
-            open_command("macos", Some("/Applications/Codex.app"), &[]),
+            open_command("macos", Some("/Applications/Codex.app"), &[], &[]),
             vec!["open", "-a", "/Applications/Codex.app"]
         );
         // [改名适配] 路径落空按 bundle id 兜底(新旧两代同 id;`-a Codex` 在
         // 26.707-only 安装上启不动,`-a ChatGPT` 可能解析到消费级客户端)
         assert_eq!(
-            open_command("macos", None, &[]),
+            open_command("macos", None, &[], &[]),
             vec!["open", "-b", "com.openai.codex"]
         );
         assert_eq!(
-            open_command("macos", None, &["--remote-debugging-port=9222".into()]),
+            open_command("macos", None, &["--remote-debugging-port=9222".into()], &[]),
             vec![
                 "open",
                 "-b",
@@ -1285,13 +1341,45 @@ mod tests {
                 "--remote-debugging-port=9222"
             ]
         );
-        let windows = open_command("windows", None, &[]);
+        let windows = open_command("windows", None, &[], &[]);
         assert_eq!(windows[0], "explorer.exe");
         assert!(windows[1].starts_with("shell:AppsFolder\\"));
         assert!(windows[1].contains("OpenAI.Codex"));
-        let linux = open_command("linux", None, &[]);
+        let linux = open_command("linux", None, &[], &[]);
         assert_eq!(linux[0], "sh");
         assert_eq!(linux[1], "-c");
         assert!(linux[2].contains("codex"));
+    }
+
+    // [MOC-323] Chat env 经 `open --env` 注入,排在 `-a`/`--args` 之前
+    #[test]
+    fn open_command_injects_chat_env_before_app() {
+        let env = vec![
+            ("NODE_OPTIONS".to_string(), "--require /x/p.js".to_string()),
+            (
+                "CODEX_API_BASE_URL".to_string(),
+                "http://localhost:18080/backend-api".to_string(),
+            ),
+        ];
+        let cmd = open_command(
+            "macos",
+            Some("/Applications/ChatGPT.app"),
+            &["--remote-debugging-port=0".into()],
+            &env,
+        );
+        assert_eq!(
+            cmd,
+            vec![
+                "open",
+                "--env",
+                "NODE_OPTIONS=--require /x/p.js",
+                "--env",
+                "CODEX_API_BASE_URL=http://localhost:18080/backend-api",
+                "-a",
+                "/Applications/ChatGPT.app",
+                "--args",
+                "--remote-debugging-port=0",
+            ]
+        );
     }
 }
