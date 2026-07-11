@@ -781,8 +781,11 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("chatCustomModelEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let chat_needs_port =
-        chat_enabled && crate::admin::services::desktop::snapshot::active_provider_supports_relay();
+    // 仅 macOS 实现 Chat(chat_launch_env 只对 macos 注入);非 macos 开了也不工作,
+    // 故不为它带 CDP 端口(否则白暴露 --remote-debugging-port/--remote-allow-origins=* — code-review [3])。
+    let chat_needs_port = chat_enabled
+        && cfg!(target_os = "macos")
+        && crate::admin::services::desktop::snapshot::active_provider_supports_relay();
     if !plugin_unlock_needs_port
         && !theme_enabled
         && !quota_enabled

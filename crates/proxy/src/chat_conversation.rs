@@ -6,15 +6,17 @@
 //! `CODEX_API_BASE_URL` 决定(不读 config.toml),transfer 把它指向本 proxy 后,整个
 //! `/backend-api/*` 流进 [`crate::forward::forward_handler`](fallback)。
 //!
-//! 本模块**只接管 1 条**(`POST …/f/conversation`)+ 就地回 CORS 预检;其余(`/prepare`、
-//! `/models`、账号/会话列表/plugins…)返回 `None`,仍走既有 `passthrough_chatgpt_backend`
-//! (透传真 chatgpt.com):
+//! 本模块**只接管 1 条**(`POST …/f/conversation`);其余(`/prepare`、`/models`、账号/会话
+//! 列表/plugins…)返回 `None`,仍走既有 `passthrough_chatgpt_backend`(透传真 chatgpt.com):
 //! - `POST …/f/conversation` → 把 ChatGPT 封套转成 `/responses` body,**内部重派**给
 //!   `forward_handler`(复用全套 provider resolve / adapter / 鉴权改写),收集 Responses SSE
 //!   的文本,再回一条 ChatGPT 整条-message SSE(客户端 `decodeNonDeltaEvent` 对不带
 //!   `event: delta_encoding` 的事件直接渲染 `e.data`,故免写 delta 增量协议)。
-//! - `OPTIONS …/f/conversation` → 就地回 CORS 头(renderer 跨源 POST 带 Authorization 会先
-//!   发预检,落 passthrough 拿不到 `Allow-*` 会阻塞真请求)。
+//!
+//! **不做本地 CORS**:Chat 端到端实测本就跑通(Electron renderer 到 localhost 不触发/不因
+//! CORS 阻塞);曾加 `*` 预检处理反而**开了安全洞**(任意网页能预检打本地 proxy 烧额度)+ 不
+//! 完整(POST 响应缺 ACAO)。故移除,OPTIONS 落回 passthrough —— 攻击者的跨源预检拿不到
+//! localhost 的 ACAO,被浏览器挡在请求前(比 `*` 更安全)。code-review。
 //!
 //! **多轮上下文**:实测 Chat 每轮只发新消息(`messages.len=1`,classic ChatGPT 靠
 //! conversation_id 服务端存历史),transfer 拦截后无状态,故本模块按 conv_id 自持历史
@@ -160,35 +162,10 @@ pub async fn try_handle(
     if !chat_custom_model_enabled() {
         return None;
     }
-    if !is_conversation_stream_path(path) {
-        return None;
-    }
-    // 跨源 POST(带 Authorization + JSON)的 CORS 预检:就地回 Allow-*,避免落 passthrough 阻塞。
-    if method == Method::OPTIONS {
-        return Some(cors_preflight_reply());
-    }
-    if method == Method::POST {
+    if method == Method::POST && is_conversation_stream_path(path) {
         return Some(handle_conversation(state, headers, body).await);
     }
     None
-}
-
-/// CORS 预检响应:204 + `Access-Control-Allow-*`(无 cookie 的 Authorization 请求,`*` 合法)。
-fn cors_preflight_reply() -> Response {
-    use axum::http::header::{
-        ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-        ACCESS_CONTROL_MAX_AGE,
-    };
-    (
-        StatusCode::NO_CONTENT,
-        [
-            (ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-            (ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"),
-            (ACCESS_CONTROL_ALLOW_HEADERS, "authorization, content-type"),
-            (ACCESS_CONTROL_MAX_AGE, "600"),
-        ],
-    )
-        .into_response()
 }
 
 async fn handle_conversation(state: &ProxyState, headers: &HeaderMap, body: &[u8]) -> Response {

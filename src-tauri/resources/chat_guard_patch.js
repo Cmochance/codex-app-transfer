@@ -39,6 +39,10 @@ try {
   if (!/^localhost:\d{2,5}$/.test(extraHost)) {
     writeStatus({ applied: false, reason: 'no-guard-host-env' });
   } else {
+    // **先写初始 pending 失败态**(code-review [4]):若未来 Codex 更新把守卫函数改名/移走,
+    // 下面的 hook 永远进不了替换块、不会写新 status,旧 `applied:true` 会残留、骗过 daemon 判「健康」。
+    // 先落 pending,hook 真触发(命中/未命中)再覆盖;永不触发则保持失败态 → 可被发现。
+    writeStatus({ applied: false, reason: 'pending-guard-module-not-compiled' });
     // 容忍 minified 变量名漂移:捕获 `<var>===`localhost:8000`` 的变量名,不写死 `n`。
     const GUARD_RE = /([A-Za-z_$][\w$]*)===`localhost:8000`/g;
     const origCompile = Module.prototype._compile;
