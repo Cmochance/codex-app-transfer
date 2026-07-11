@@ -14,10 +14,14 @@
 //!   `event: delta_encoding` 的事件直接渲染 `e.data`,故免写 delta 增量协议)。
 //! - `…/f/conversation/prepare`、`/models` 等 → 返回 `None`,交回调用方 passthrough。
 //!
-//! P1(本次)= 单轮、收集后一次性回;流式增量 / 自定义 `/models` 列表 / 多轮上下文拼接
-//! 留 P2(先真机实测 Chat 怎么发上下文再定,见 MOC-323)。
+//! **多轮上下文**:实测 Chat 每轮只发新消息(`messages.len=1`,classic ChatGPT 靠
+//! conversation_id 服务端存历史),transfer 拦截后无状态,故本模块按 conv_id 自持历史
+//! ([`ConvStore`]),每轮发全历史给 provider,并回填同一 conv_id 供 app 下轮续接。
+//! 收集后一次性回(非流式增量,留后续)。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -25,6 +29,40 @@ use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::forward::{forward_handler, ProxyState};
+
+/// 单对话保留的最近消息条数(user+assistant),超出截最新。
+const MAX_TURNS_PER_CONV: usize = 40;
+/// 内存里保留的对话数上限,超出淘汰最久未用(纯本地个人用,防无界增长)。
+const MAX_CONVS: usize = 64;
+
+/// [MOC-323 对话连续] Chat 每轮**只发新消息**(实测 messages.len=1;classic ChatGPT 靠
+/// conversation_id 服务端存历史),transfer 拦截后无状态,故自持每 conv_id 的历史,支持多轮。
+/// app 会把上一轮响应里的 conversation_id 原样回传,据此续接。
+static CONV_STORE: LazyLock<Mutex<ConvStore>> = LazyLock::new(|| Mutex::new(ConvStore::default()));
+
+#[derive(Default)]
+struct ConvStore {
+    map: HashMap<String, Vec<(String, String)>>, // conv_id → [(role, text)]
+    order: Vec<String>,                          // LRU:末尾最近用
+}
+
+impl ConvStore {
+    fn get(&self, id: &str) -> Vec<(String, String)> {
+        self.map.get(id).cloned().unwrap_or_default()
+    }
+    fn put(&mut self, id: String, mut history: Vec<(String, String)>) {
+        if history.len() > MAX_TURNS_PER_CONV {
+            history.drain(0..history.len() - MAX_TURNS_PER_CONV);
+        }
+        self.order.retain(|x| x != &id);
+        self.order.push(id.clone());
+        self.map.insert(id, history);
+        while self.order.len() > MAX_CONVS {
+            let oldest = self.order.remove(0);
+            self.map.remove(&oldest);
+        }
+    }
+}
 
 /// gate:默认开。src-tauri 按前端开关设 `CAS_CHAT_CUSTOM_MODEL`(未设=开;显式 `0`/`false`=关)。
 pub fn chat_custom_model_enabled() -> bool {
@@ -60,12 +98,31 @@ pub async fn try_handle(
 async fn handle_conversation(state: &ProxyState, headers: &HeaderMap, body: &[u8]) -> Response {
     let chat: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return sse_reply(&format!("（transfer）无法解析 chat 请求: {e}"), true),
+        Err(e) => return sse_reply("", &format!("（transfer）无法解析 chat 请求: {e}"), true),
     };
-    let responses_body = match build_responses_body(&chat) {
-        Some(b) => b,
-        None => return sse_reply("（transfer）本轮无用户消息，已忽略。", true),
+    // conv_id:复用 app 回传的(上一轮我们发的),缺省新建。据此续接多轮历史。
+    let conv_id = chat
+        .get("conversation_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| gen_id("conv"));
+
+    // 本轮新用户消息(app 每轮只发新消息)。
+    let user_text = match latest_user_text(&chat) {
+        Some(t) => t,
+        None => return sse_reply(&conv_id, "（transfer）本轮无用户消息，已忽略。", true),
     };
+
+    // 载历史 + append 新用户消息 → 发**全历史**给 provider(多轮上下文)。
+    let mut history = CONV_STORE.lock().unwrap().get(&conv_id);
+    history.push(("user".to_owned(), user_text));
+    let model = chat
+        .get("model")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty() && *m != "auto")
+        .unwrap_or("gpt-5.5");
+    let responses_body = build_responses_from_history(&history, model);
 
     let req = build_responses_request(headers, &responses_body);
     // Box::pin 打破 forward_handler → try_handle → forward_handler 的 async 递归(否则
@@ -73,13 +130,19 @@ async fn handle_conversation(state: &ProxyState, headers: &HeaderMap, body: &[u8
     // 不会再次进本拦截分支,递归深度恒为 1。
     let upstream = match Box::pin(forward_handler(axum::extract::State(state.clone()), req)).await {
         Ok(resp) => resp,
-        Err(e) => return sse_reply(&format!("（transfer）上游调用失败: {e}"), true),
+        Err(e) => return sse_reply(&conv_id, &format!("（transfer）上游调用失败: {e}"), true),
     };
 
     let status = upstream.status();
     let bytes = match axum::body::to_bytes(upstream.into_body(), usize::MAX).await {
         Ok(b) => b,
-        Err(e) => return sse_reply(&format!("（transfer）读取上游响应失败: {e}"), true),
+        Err(e) => {
+            return sse_reply(
+                &conv_id,
+                &format!("（transfer）读取上游响应失败: {e}"),
+                true,
+            )
+        }
     };
     let text = extract_assistant_text(&bytes);
     if text.is_empty() {
@@ -88,15 +151,18 @@ async fn handle_conversation(state: &ProxyState, headers: &HeaderMap, body: &[u8
         } else {
             format!("（transfer）上游返回 {status}。")
         };
-        return sse_reply(&hint, true);
+        return sse_reply(&conv_id, &hint, true); // 失败不落历史,避免污染后续轮
     }
-    sse_reply(&text, false)
+    // 成功:assistant 回复入历史,存回(同一 conv_id,app 下轮回传即续接)。
+    history.push(("assistant".to_owned(), text.clone()));
+    CONV_STORE.lock().unwrap().put(conv_id.clone(), history);
+    sse_reply(&conv_id, &text, false)
 }
 
-/// ChatGPT 封套 → `/responses` body。取历史里最后一条 user 消息的文本(P1 单轮)。
-fn build_responses_body(chat: &serde_json::Value) -> Option<serde_json::Value> {
-    let messages = chat.get("messages")?.as_array()?;
-    let user_text = messages
+/// 本轮 ChatGPT 封套里最后一条 user 消息文本(app 每轮只发新消息)。
+fn latest_user_text(chat: &serde_json::Value) -> Option<String> {
+    chat.get("messages")?
+        .as_array()?
         .iter()
         .rev()
         .find(|m| {
@@ -106,23 +172,28 @@ fn build_responses_body(chat: &serde_json::Value) -> Option<serde_json::Value> {
                 == Some("user")
         })
         .map(message_text)
-        .filter(|t| !t.trim().is_empty())?;
+        .filter(|t| !t.trim().is_empty())
+}
 
-    let model = chat
-        .get("model")
-        .and_then(|m| m.as_str())
-        .filter(|m| !m.is_empty() && *m != "auto")
-        .unwrap_or("gpt-5.5");
-
-    Some(serde_json::json!({
-        "model": model,
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": user_text }],
-        }],
-        "stream": true,
-    }))
+/// 全历史 → `/responses` body。user 用 `input_text`、assistant 用 `output_text`(Responses
+/// input item 惯例);交 forward_handler 复用全套 provider 转换。
+fn build_responses_from_history(history: &[(String, String)], model: &str) -> serde_json::Value {
+    let input: Vec<serde_json::Value> = history
+        .iter()
+        .map(|(role, text)| {
+            let content_type = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            serde_json::json!({
+                "type": "message",
+                "role": role,
+                "content": [{ "type": content_type, "text": text }],
+            })
+        })
+        .collect();
+    serde_json::json!({ "model": model, "input": input, "stream": true })
 }
 
 /// 从一条 ChatGPT message 提取纯文本(`content.parts[]` 字符串拼接;兼容 `content` 直接是串)。
@@ -194,8 +265,13 @@ fn extract_assistant_text(bytes: &[u8]) -> String {
 }
 
 /// 回一条 ChatGPT 整条-message SSE(非 delta):in_progress → finished + `[DONE]`。
-fn sse_reply(text: &str, is_error: bool) -> Response {
-    let conv_id = gen_id("conv");
+/// `conv_id` 由调用方传入并回填响应,app 下轮会原样回传以续接历史(空串=解析失败前的兜底)。
+fn sse_reply(conv_id: &str, text: &str, is_error: bool) -> Response {
+    let conv_id = if conv_id.is_empty() {
+        gen_id("conv")
+    } else {
+        conv_id.to_owned()
+    };
     let msg_id = gen_id("msg");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -267,24 +343,51 @@ mod tests {
     }
 
     #[test]
-    fn build_responses_body_takes_last_user_text() {
+    fn latest_user_text_takes_last_user() {
         let chat = serde_json::json!({
-            "model": "auto",
             "messages": [
                 {"author": {"role": "assistant"}, "content": {"parts": ["hi"]}},
                 {"author": {"role": "user"}, "content": {"content_type": "text", "parts": ["你好", "世界"]}},
             ],
         });
-        let body = build_responses_body(&chat).unwrap();
-        assert_eq!(body["model"], "gpt-5.5"); // auto → 默认槽,交 resolver 映射
-        assert_eq!(body["input"][0]["content"][0]["text"], "你好世界");
+        assert_eq!(latest_user_text(&chat).as_deref(), Some("你好世界"));
+    }
+
+    #[test]
+    fn latest_user_text_none_without_user() {
+        let chat = serde_json::json!({"messages": [{"author": {"role": "assistant"}, "content": {"parts": ["hi"]}}]});
+        assert!(latest_user_text(&chat).is_none());
+    }
+
+    #[test]
+    fn build_from_history_maps_roles_to_content_types() {
+        let history = vec![
+            ("user".to_owned(), "记住42".to_owned()),
+            ("assistant".to_owned(), "好的".to_owned()),
+            ("user".to_owned(), "多少?".to_owned()),
+        ];
+        let body = build_responses_from_history(&history, "gpt-5.5");
+        assert_eq!(body["input"].as_array().unwrap().len(), 3); // 全历史,非单轮
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text"); // assistant
+        assert_eq!(body["input"][2]["content"][0]["text"], "多少?");
         assert_eq!(body["stream"], true);
     }
 
     #[test]
-    fn build_responses_body_none_without_user() {
-        let chat = serde_json::json!({"messages": [{"author": {"role": "assistant"}, "content": {"parts": ["hi"]}}]});
-        assert!(build_responses_body(&chat).is_none());
+    fn conv_store_appends_and_caps() {
+        let mut s = ConvStore::default();
+        s.put("c1".into(), vec![("user".into(), "a".into())]);
+        let mut h = s.get("c1");
+        assert_eq!(h.len(), 1);
+        h.push(("assistant".into(), "b".into()));
+        s.put("c1".into(), h);
+        assert_eq!(s.get("c1").len(), 2); // 续接,非覆盖丢失
+                                          // 超 MAX_CONVS 淘汰最旧
+        for i in 0..(MAX_CONVS + 5) {
+            s.put(format!("k{i}"), vec![("user".into(), "x".into())]);
+        }
+        assert!(s.map.len() <= MAX_CONVS);
     }
 
     #[test]
