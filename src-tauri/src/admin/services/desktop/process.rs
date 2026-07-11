@@ -10,14 +10,19 @@ use std::time::Duration;
 /// 重新拉起 → DB 在 Codex 运行时被写 = 整个设计要防的数据损坏。
 static CODEX_MAINTENANCE_LOCK: Mutex<()> = Mutex::new(());
 
-/// `open -a` fallback 名(resolve_macos_app_path 全落空时用)。
-const MACOS_APP_NAME: &str = "Codex";
+/// Codex 桌面 app 的 bundle id:新旧两代(`Codex.app` / 26.707+ `ChatGPT.app`)共用,
+/// 是唯一跨改名稳定的身份标识。用途:① `open -b` 兜底(resolve_macos_app_path 全落空
+/// 时按 id 启动,不会解析到消费级 ChatGPT 客户端 `com.openai.chat`);② PID 归属校验
+/// (见 [`macos_pid_classes`]),防止按路径正则误杀同名消费级 app。
+const MACOS_BUNDLE_ID: &str = "com.openai.codex";
 // [Codex→ChatGPT 改名适配] Codex 桌面 app 自 26.707 起把 bundle 从 `Codex.app`(进程名/
 // 可执行 `Codex`)改名成 `ChatGPT.app`(进程名/可执行 `ChatGPT`),bundle id
 // `com.openai.codex` 与 user-data-dir `Codex` 不变。进程匹配不能再用 `-x <名>`:
 // (1) `-x Codex` 匹配不到新进程名 `ChatGPT`;(2) 直接换 `-x ChatGPT` 会误杀同可执行名
 // 的消费者 app `ChatGPT Classic.app`(bundle `com.openai.chat`)。改用 `-f` 按 .app
-// bundle 路径正则匹配,同时覆盖新旧两种安装:
+// bundle 路径正则**枚举候选**,再逐 PID 按 bundle id 归属校验(见 macos_pid_classes;
+// 用户若装有仍叫 `ChatGPT.app` 的消费级客户端,路径正则无法区分,必须验 Info.plist),
+// 同时覆盖新旧两种安装:
 // - MAIN:只命中主进程(cmdline 含 `<App>.app/Contents/MacOS/`),供运行检测 + TERM 优雅退出
 //   (让 Electron 自己 reap helper),保留原「只看主进程」的速度优化。
 // - APP(全树):命中主进程 + 全部 helper(cmdline 含 `<App>.app/Contents/`),供 KILL 兜底 reap。
@@ -39,18 +44,86 @@ const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// `open -a` 仍可能误命中"已在运行"缓存。
 const POST_QUIT_LAUNCHD_GRACE: Duration = Duration::from_millis(400);
 
+/// macOS 进程归属分类。路径正则(MACOS_*_PROCESS_MATCH)只能筛**候选**,不能定身份:
+/// 消费级 ChatGPT 客户端未更名的旧安装同样叫 `ChatGPT.app`,路径字符串无法区分。
+/// 借鉴 codex-account-switch PR #51 的 pid-class 方案:逐 PID 读 bundle 的
+/// CFBundleIdentifier 定归属,只对 [`MacosPidClass::Ours`] 发信号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosPidClass {
+    /// CFBundleIdentifier == `com.openai.codex`(唯一可发信号的类)
+    Ours,
+    /// 明确属于别的 bundle(如消费级 ChatGPT 客户端 `com.openai.chat`)
+    Other,
+    /// 归属无法确认(cmdline 无 .app 路径 / Info.plist 读取失败)。**计入"在跑"但
+    /// 绝不发信号**:宁可让重启流程报"请手动关闭"交人工处理,不冒险杀身份不明进程。
+    Unknown,
+}
+
+/// 从进程 cmdline 提取最外层 `.app` bundle 根路径(纯函数,可测)。取**第一个**
+/// `.app/Contents/`:helper 进程路径形如 `ChatGPT.app/Contents/Frameworks/<X> Helper
+/// (Renderer).app/Contents/MacOS/...`,第一个命中即外层宿主 bundle,归属以宿主为准。
+fn extract_macos_bundle_root(cmdline: &str) -> Option<&str> {
+    let idx = cmdline.find(".app/Contents/")?;
+    Some(&cmdline[..idx + ".app".len()])
+}
+
+fn classify_macos_bundle_id(bundle_id: Option<&str>) -> MacosPidClass {
+    match bundle_id {
+        Some(id) if id == MACOS_BUNDLE_ID => MacosPidClass::Ours,
+        Some(id) if !id.is_empty() => MacosPidClass::Other,
+        _ => MacosPidClass::Unknown,
+    }
+}
+
+/// `defaults read <bundle>/Contents/Info CFBundleIdentifier`(与 codex-account-switch
+/// 同法,defaults 同时兼容 XML / binary plist)。失败(非 bundle / plist 损坏)返 None。
+fn read_macos_bundle_id(bundle_root: &str) -> Option<String> {
+    let out = Command::new("defaults")
+        .arg("read")
+        .arg(format!("{bundle_root}/Contents/Info"))
+        .arg("CFBundleIdentifier")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// 枚举 + 归属:`pgrep -fl <pattern>`(输出每行 `PID cmdline`)拿候选,逐 PID 验
+/// bundle id。pgrep 无匹配时 exit 1 + 空输出 → 空 Vec。
+fn macos_pid_classes(pattern: &str) -> Vec<(u32, MacosPidClass)> {
+    let Ok(out) = Command::new("pgrep")
+        .arg("-fl")
+        .arg(pattern)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, cmdline) = line.split_once(' ')?;
+            let pid: u32 = pid.trim().parse().ok()?;
+            let class = match extract_macos_bundle_root(cmdline) {
+                Some(root) => classify_macos_bundle_id(read_macos_bundle_id(root).as_deref()),
+                None => MacosPidClass::Unknown,
+            };
+            Some((pid, class))
+        })
+        .collect()
+}
+
 /// 平台检测命令(可纯函数测试).返回 (program, args).第一个元素总是命令名。
 fn running_check_command(platform: &str) -> Vec<String> {
     match platform {
-        // [MOC-100 B→优化] 退出判定只看**主进程**(快 ~1-2s)。B 当初改 `-f` 等整个
-        // 进程树(含 helper)reap 是为防 `open -n` 堆积;现在 E 去掉了 `-n`(单实例
-        // `open -a`),helper 残留也不会堆出第二实例(自己会死)→ 不必再等全 helper,
-        // 等主进程死即可(LaunchServices 按主进程判 app 是否在跑,主进程 reaped 后
-        // `open -a` 就会启新实例,不撞 activate-已有 的 race)。KILL 阶段仍用 `-f`
-        // 强杀整树兜底(见 quit_command)。实测把"点击→重启弹窗"从 4-8s 降到 ~1-2s。
-        // [改名适配] 从 `-x Codex` 改 `-f MACOS_MAIN_PROCESS_MATCH`:覆盖 Codex.app/ChatGPT.app
-        // 两种主进程,且不误杀同 exe 名的 ChatGPT Classic(详见常量注释)。仍只命中主进程。
-        "macos" => vec!["pgrep".into(), "-f".into(), MACOS_MAIN_PROCESS_MATCH.into()],
+        // [改名适配] macOS 不再有单条静态命令:候选枚举 + bundle id 归属校验见
+        // [`macos_pid_classes`],调用方 [`is_codex_app_running`] 在进入本函数前分流。
+        // 返回空 Vec = 调用方安全 no-op(防误用)。
+        "macos" => Vec::new(),
         "windows" => vec![
             "tasklist".into(),
             "/FI".into(),
@@ -66,23 +139,10 @@ fn running_check_command(platform: &str) -> Vec<String> {
 /// 退出命令(`force=false` 普通退出, `force=true` 强杀).
 fn quit_command(platform: &str, force: bool) -> Vec<String> {
     match (platform, force) {
-        // [改名适配] TERM 阶段从 `-x Codex` 改 `-f MACOS_MAIN_PROCESS_MATCH`:优雅杀主进程
-        // (让 Electron 自己 reap helper),覆盖 Codex.app/ChatGPT.app,不误杀 ChatGPT Classic。
-        ("macos", false) => vec![
-            "pkill".into(),
-            "-TERM".into(),
-            "-f".into(),
-            MACOS_MAIN_PROCESS_MATCH.into(),
-        ],
-        // [MOC-100 B] KILL 阶段杀整个 .app 进程树(主进程 + 孤儿 helper),
-        // 否则 helper 残留 + `open -n` → 实例堆积。TERM 阶段(上面)只优雅杀主进程,
-        // 让 Electron 自己 reap helper;只有 graceful 没清干净才升级到这条 KILL-all。
-        ("macos", true) => vec![
-            "pkill".into(),
-            "-KILL".into(),
-            "-f".into(),
-            MACOS_APP_PROCESS_MATCH.into(),
-        ],
+        // [改名适配] macOS 不再返回静态 pkill(按路径正则盲杀会误伤未更名的消费级
+        // ChatGPT.app):必须逐 PID 归属校验后 kill,见 [`run_quit_command`] 的 macos
+        // 分支。返回空 Vec = 调用方安全 no-op(防误用)。
+        ("macos", _) => Vec::new(),
         // follow-up #33 P2-b:从 `taskkill /IM` 切到 PowerShell CIM 路径。
         //
         // taskkill 在 Codex Desktop 这种 MSIX packaged Store app 上经常报
@@ -142,11 +202,20 @@ fn open_command(
         // 已用 `pgrep -f Codex.app/Contents`(MOC-100 B)verify 旧实例含 helper 彻底死才
         // 走到这里 + POST_QUIT_LAUNCHD_GRACE,那条 race 已不存在 → 用 `open -a` 启**单**实例。
         "macos" => {
-            let mut cmd = vec![
-                "open".into(),
-                "-a".into(),
-                resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
-            ];
+            let mut cmd = vec!["open".into()];
+            match resolved_macos_app {
+                Some(path) => {
+                    cmd.push("-a".into());
+                    cmd.push(path.into());
+                }
+                // [改名适配] 路径解析落空(自定义安装位置)时按 bundle id 兜底:新旧
+                // 两代 app 同 id,26.707-only 安装上旧名 `open -a Codex` 启不动;且
+                // 按 id 永不解析到消费级 ChatGPT 客户端(`open -a ChatGPT` 按名则可能)。
+                None => {
+                    cmd.push("-b".into());
+                    cmd.push(MACOS_BUNDLE_ID.into());
+                }
+            }
             if !extra_args.is_empty() {
                 cmd.push("--args".into());
                 cmd.extend(extra_args.iter().cloned());
@@ -189,7 +258,11 @@ fn resolve_macos_app_path() -> Option<String> {
     }
     candidates
         .into_iter()
-        .find(|p| p.is_dir())
+        // [改名适配·防误选] 只认**内嵌 codex CLI** 的 bundle:光看目录存在,用户装有
+        // 未更名的消费级 ChatGPT 客户端(`com.openai.chat`,亦名 ChatGPT.app)时会把
+        // 它当 Codex 宿主打开。`Contents/Resources/codex` 是宿主的稳定特征(26.707
+        // 真机实测仍在);全部不合格则走 open_command 的 `-b` bundle id 兜底。
+        .find(|p| p.join("Contents").join("Resources").join("codex").is_file())
         .map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -219,6 +292,16 @@ pub fn is_codex_app_running(platform: &str) -> bool {
         if let Some(running) = crate::windows_msix::is_codex_running() {
             return running;
         }
+    }
+    // [MOC-100 B→优化][改名适配] macOS 运行判定只看**主进程**(MAIN 模式,快 ~1-2s:
+    // LaunchServices 按主进程判 app 是否在跑,主进程 reaped 后 `open` 就会启新实例;
+    // KILL 阶段才动全树,见 run_quit_command)。路径正则枚举候选后逐 PID 验 bundle id:
+    // Ours 与 Unknown(身份不明,宁可误报"在跑"让流程报错交人工)都算在跑;Other
+    // (如消费级 ChatGPT 客户端)不算——它在跑不该阻塞 Codex 重启,更不该被杀。
+    if platform == "macos" {
+        return macos_pid_classes(MACOS_MAIN_PROCESS_MATCH)
+            .iter()
+            .any(|(_, class)| *class != MacosPidClass::Other);
     }
     let cmd = running_check_command(platform);
     let Some((program, args)) = cmd.split_first() else {
@@ -256,6 +339,33 @@ fn run_quit_command(platform: &str, force: bool) {
     // MSIX 上 access-denied,见 quit_command 注释)。
     #[cfg(target_os = "windows")]
     if platform == "windows" && !force && crate::windows_msix::graceful_close_codex() > 0 {
+        return;
+    }
+    // [改名适配] macOS:候选逐 PID 归属校验,**只对 Ours 发信号**(Unknown 绝不杀)。
+    // TERM(优雅)只杀主进程让 Electron 自己 reap helper;KILL 兜底杀整树残留
+    // (主进程 + 孤儿 helper,防实例堆积,语义与原 pkill -f MAIN/APP 两档一致)。
+    if platform == "macos" {
+        let pattern = if force {
+            MACOS_APP_PROCESS_MATCH
+        } else {
+            MACOS_MAIN_PROCESS_MATCH
+        };
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let pids: Vec<String> = macos_pid_classes(pattern)
+            .into_iter()
+            .filter(|(_, class)| *class == MacosPidClass::Ours)
+            .map(|(pid, _)| pid.to_string())
+            .collect();
+        if pids.is_empty() {
+            return;
+        }
+        let _ = Command::new("kill")
+            .arg(signal)
+            .args(&pids)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         return;
     }
     let cmd = quit_command(platform, force);
@@ -1028,16 +1138,71 @@ mod tests {
 
     #[test]
     fn running_check_command_is_platform_specific() {
-        // [MOC-100 B→优化] 退出判定只看主进程(快);KILL 阶段才用 -f 强杀整树
-        // [改名适配] 主进程用 -f 正则匹配 Codex.app/ChatGPT.app 的 /Contents/MacOS/ 路径
-        assert_eq!(
-            running_check_command("macos"),
-            vec!["pgrep", "-f", r"(Codex|ChatGPT)\.app/Contents/MacOS/"]
-        );
+        // [改名适配] macOS 改走 macos_pid_classes(bundle id 归属校验),静态命令返回空
+        assert!(running_check_command("macos").is_empty());
         let windows = running_check_command("windows");
         assert_eq!(windows[0], "tasklist");
         assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
         assert_eq!(running_check_command("linux"), vec!["pgrep", "-x", "codex"]);
+    }
+
+    #[test]
+    fn macos_process_match_patterns_cover_both_bundles() {
+        // [MOC-100 B→优化] 运行判定只看主进程(MAIN,快);KILL 阶段才用全树(APP)
+        // [改名适配] 正则同时覆盖 Codex.app / ChatGPT.app 的候选枚举
+        assert_eq!(
+            MACOS_MAIN_PROCESS_MATCH,
+            r"(Codex|ChatGPT)\.app/Contents/MacOS/"
+        );
+        assert_eq!(MACOS_APP_PROCESS_MATCH, r"(Codex|ChatGPT)\.app/Contents/");
+    }
+
+    #[test]
+    fn extract_macos_bundle_root_takes_outermost_bundle() {
+        // 主进程
+        assert_eq!(
+            extract_macos_bundle_root(
+                "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=0"
+            ),
+            Some("/Applications/ChatGPT.app")
+        );
+        // helper:嵌套 .app 取**外层**宿主 bundle
+        assert_eq!(
+            extract_macos_bundle_root(
+                "/Applications/ChatGPT.app/Contents/Frameworks/ChatGPT Helper (Renderer).app/Contents/MacOS/ChatGPT Helper (Renderer) --type=renderer"
+            ),
+            Some("/Applications/ChatGPT.app")
+        );
+        // 旧安装
+        assert_eq!(
+            extract_macos_bundle_root("/Users/u/Applications/Codex.app/Contents/MacOS/Codex"),
+            Some("/Users/u/Applications/Codex.app")
+        );
+        // 非 bundle 进程无法定位 → None(调用方按 Unknown 处理)
+        assert_eq!(
+            extract_macos_bundle_root("/usr/local/bin/codex serve"),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_macos_bundle_id_only_trusts_codex_id() {
+        assert_eq!(
+            classify_macos_bundle_id(Some("com.openai.codex")),
+            MacosPidClass::Ours
+        );
+        // 消费级 ChatGPT 客户端(可执行名同为 ChatGPT)必须判 Other,绝不发信号
+        assert_eq!(
+            classify_macos_bundle_id(Some("com.openai.chat")),
+            MacosPidClass::Other
+        );
+        assert_eq!(
+            classify_macos_bundle_id(Some("store.alyse.codex-app-transfer")),
+            MacosPidClass::Other
+        );
+        // 读不到 / 空 → Unknown(计入在跑但不杀)
+        assert_eq!(classify_macos_bundle_id(None), MacosPidClass::Unknown);
+        assert_eq!(classify_macos_bundle_id(Some("")), MacosPidClass::Unknown);
     }
 
     #[test]
@@ -1066,21 +1231,9 @@ mod tests {
 
     #[test]
     fn quit_command_uses_term_then_kill() {
-        // [改名适配] TERM 优雅杀主进程(-f 正则覆盖 Codex.app/ChatGPT.app)
-        assert_eq!(
-            quit_command("macos", false),
-            vec![
-                "pkill",
-                "-TERM",
-                "-f",
-                r"(Codex|ChatGPT)\.app/Contents/MacOS/"
-            ]
-        );
-        // [MOC-100 B] KILL 阶段杀整个 .app 进程树(reap helper);[改名适配] -f 正则覆盖两种 .app
-        assert_eq!(
-            quit_command("macos", true),
-            vec!["pkill", "-KILL", "-f", r"(Codex|ChatGPT)\.app/Contents/"]
-        );
+        // [改名适配] macOS 改走 run_quit_command 的 PID 归属校验路径,静态命令返回空
+        assert!(quit_command("macos", false).is_empty());
+        assert!(quit_command("macos", true).is_empty());
 
         let win_graceful = quit_command("windows", false);
         assert_eq!(win_graceful[0], "powershell");
@@ -1116,16 +1269,18 @@ mod tests {
             open_command("macos", Some("/Applications/Codex.app"), &[]),
             vec!["open", "-a", "/Applications/Codex.app"]
         );
+        // [改名适配] 路径落空按 bundle id 兜底(新旧两代同 id;`-a Codex` 在
+        // 26.707-only 安装上启不动,`-a ChatGPT` 可能解析到消费级客户端)
         assert_eq!(
             open_command("macos", None, &[]),
-            vec!["open", "-a", "Codex"]
+            vec!["open", "-b", "com.openai.codex"]
         );
         assert_eq!(
             open_command("macos", None, &["--remote-debugging-port=9222".into()]),
             vec![
                 "open",
-                "-a",
-                "Codex",
+                "-b",
+                "com.openai.codex",
                 "--args",
                 "--remote-debugging-port=9222"
             ]
