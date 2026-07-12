@@ -488,6 +488,20 @@ pub async fn forward_handler(
     // 复用 state.http(reqwest 默认读系统代理设置 /`scutil --proxy`,跟随系统、非写死端口;
     // chatgpt.com 必须经代理才可达,故绝不能 no_proxy)。
     if is_chatgpt_backend_path(&client_path) {
+        // [MOC-323] Chat(经典 ChatGPT 对话)接入自定义模型:只拦 `…/f/conversation`(转
+        // /responses 内部重派 provider,回 ChatGPT 整条-message SSE),其余(prepare/account/
+        // 会话列表/plugins)交回下面 passthrough 走真 chatgpt.com。gate 默认开,见模块注释。
+        if let Some(resp) = crate::chat_conversation::try_handle(
+            &state,
+            &parts.method,
+            &parts.headers,
+            &client_path,
+            &body_bytes,
+        )
+        .await
+        {
+            return Ok(resp);
+        }
         // [MOC-257] 模拟(伪造)账号模式:活动 auth.json 是合成伪造账号 → **截断**这些
         // 账号/插件请求、逐条下发伪造 200,而非透传真 chatgpt.com(伪造 token 会被上游 401)。
         // 关 / 真实账号 relay 时走原透传。

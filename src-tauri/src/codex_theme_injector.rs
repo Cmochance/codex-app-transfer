@@ -1141,6 +1141,42 @@ pub(crate) async fn locate_main_window_ws(
         .ok_or_else(|| "webSocketDebuggerUrl missing".into())
 }
 
+/// **所有**需注入的 Codex page target 的 CDP webSocketDebuggerUrl:`type=page` + url 含
+/// `index.html`(含 Quick Chat 的 `?initialRoute=/chatgpt/quick-chat`)+ 不含 `avatar-overlay`
+/// (宠物悬浮窗)。CDP_PORT=0(未就绪)/ 请求失败 → Err。跟 [`locate_main_window_ws`] 同 predicate,
+/// 只是 `.find`(单主窗)→ 返回全部(chat 注入器要同时覆盖 Quick Chat 独立窗口)。code-review DRY。
+pub(crate) async fn page_target_ws_urls(
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::codex_plugin_unlocker::CDP_PORT;
+    if CDP_PORT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return Err(
+            "CDP 端口尚未就绪 — Codex Desktop 可能还在启动中,稍候重试 / 或确认 Codex.app 正在运行"
+                .into(),
+        );
+    }
+    let url = current_cdp_url();
+    let resp = reqwest::get(&url).await?;
+    if !resp.status().is_success() {
+        return Err(format!("CDP /json/list returned {}", resp.status()).into());
+    }
+    let pages: Vec<Value> = resp.json().await?;
+    Ok(pages
+        .iter()
+        .filter(|p| {
+            p.get("type").and_then(Value::as_str) == Some("page")
+                && p.get("url")
+                    .and_then(Value::as_str)
+                    .map(|u| u.contains("index.html") && !u.contains("avatar-overlay"))
+                    .unwrap_or(false)
+        })
+        .filter_map(|p| {
+            p.get("webSocketDebuggerUrl")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
 pub(crate) fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
     let body = json!({ "id": id, "method": method, "params": params }).to_string();
     (body, id)

@@ -668,6 +668,9 @@ export default {
   "settings.realAccountLoginFailed": "登录失败",
   "settings.realAccountPinFailed":
     "登录成功,但账号持久化失败(请检查 ~/.codex-app-transfer 目录权限后重试),暂不切换真实账号",
+  "settings.chatCustomModelEnabled": "Chat 使用自定义模型",
+  "settings.chatCustomModelEnabledHint":
+    "让 Codex 的 Chat(经典对话)也用已配置的自定义供应商模型。仅通过本应用启动 Codex 时生效，翻动后需重启 Codex。",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",

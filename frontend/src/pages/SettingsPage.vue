@@ -247,6 +247,9 @@ const restoreCodexOnExit = toggle('restoreCodexOnExit', true)
 const autoWakeCodexPet = toggle('autoWakeCodexPet', true)
 const codexQuotaEnabled = toggle('codexQuotaEnabled', false)
 const codexStashEnabled = toggle('codexStashEnabled', false)
+// [MOC-323] Chat(经典 ChatGPT 对话)接入自定义模型:默认开。翻动需重启 Codex 生效
+// (启动时经 open --env 注入守卫补丁 + CODEX_API_BASE_URL,把 Chat 对话路由进本地 proxy)。
+const chatCustomModelEnabled = toggle('chatCustomModelEnabled', true)
 const codexNetworkAccess = toggle('codexNetworkAccess', false)
 const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
@@ -646,6 +649,15 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupCodexIntegration')">
+      <!-- [code-review M3] Chat 自定义模型仅 macOS 实现(chat_launch_env 只对 macos 注入
+           NODE_OPTIONS/CODEX_API_BASE_URL);非 macOS 开了也空转 → gate 到 macOS,避免误导。 -->
+      <SettingsRow
+        v-if="isMac"
+        :title="t('settings.chatCustomModelEnabled')"
+        :description="t('settings.chatCustomModelEnabledHint')"
+      >
+        <AppSwitch v-model="chatCustomModelEnabled" />
+      </SettingsRow>
       <SettingsRow :title="t('settings.codexQuotaEnabled')" :description="t('settings.codexQuotaEnabledHint')">
         <AppSwitch v-model="codexQuotaEnabled" />
       </SettingsRow>
