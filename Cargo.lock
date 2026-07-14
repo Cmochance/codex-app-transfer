@@ -8038,12 +8038,15 @@ dependencies = [
 
 [[package]]
 name = "wreq-util"
-version = "3.0.0-rc.11"
+version = "3.0.0-rc.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b51558351cf26c9a5daeabf5df5bfab13f1666fa783ad7ddb9a573e04d7fae0a"
+checksum = "1d8d73c75be86fbde675988dbe5cb15f02567025c13f6ffab910361ad1ba6c89"
 dependencies = [
+ "brotli",
+ "flate2",
  "typed-builder",
  "wreq",
+ "zstd",
 ]
 
 [[package]]
