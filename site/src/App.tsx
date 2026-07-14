@@ -4,7 +4,7 @@ const BASE = import.meta.env.BASE_URL;
 const P = `${BASE}project/`;
 const REPO = "https://github.com/Cmochance/codex-app-transfer";
 const RELEASES = "https://github.com/Cmochance/codex-app-transfer/releases";
-const VERSION = "v2.4.4";
+const VERSION = "v2.4.5";
 
 const capabilities = [
   {
