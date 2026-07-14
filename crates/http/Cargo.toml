@@ -25,7 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 # 指纹, 服务器据此返回压缩正文; 不开解压则 client 原样吐压缩字节 → 乱码 (antigravity.google 实测)。
 # 解压在 response 层 (tower-http), 不动 ClientHello / Accept-Encoding 指纹 —— 但改 wreq 仍跑 cf-canary 复核。
 wreq = { version = "=6.0.0-rc.23", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy", "gzip", "brotli", "deflate", "zstd"] }
-wreq-util = "=3.0.0-rc.11"
+wreq-util = "=3.0.0-rc.14"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "process"] }
 # 错误类型
 thiserror = "2"
