@@ -75,7 +75,7 @@ flate2 = "1.0"
 # fs2-0.4.3/src/unix.rs)/ Windows 走 LockFileEx,OS 级独占。
 fs2 = "0.4"
 # CDP WebSocket 连接（Codex Plugins 解锁器）
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # futures 用于 WebSocket Stream/Sink 的 split 操作
 futures = "0.3"
 # 诊断流量查看器(MOC-169)SSE:把 trace_store 的 broadcast::Receiver 适配成 axum Sse Stream
