@@ -763,14 +763,14 @@ mod tests {
                     "name": "Xiaomi MiMo (Token Plan)",
                     "baseUrl": "https://token-plan-sgp.xiaomimimo.com/v1",
                     "isBuiltin": false,
-                    "apiFormat": "openai_chat"   // 错误值,需被覆盖回 preset 的 responses
+                    "apiFormat": "responses"   // 错误值,需被覆盖回 preset 的 openai_chat
                 }
             ]
         });
         let changed = heal_builtin_provider_fields(&mut cfg);
         assert!(changed);
         let p = &cfg["providers"][0];
-        assert_eq!(p["apiFormat"], "responses");
+        assert_eq!(p["apiFormat"], "openai_chat");
         assert_eq!(p["isBuiltin"], json!(true));
         assert_eq!(
             p["baseUrl"], "https://token-plan-sgp.xiaomimimo.com/v1",
@@ -780,15 +780,15 @@ mod tests {
 
     #[test]
     fn forces_apiformat_override_even_if_user_edited_to_bogus_value() {
-        // 用户手改把 apiFormat 改成 "responses"
+        // 关键回归(2026-05-08 MiMo 404):用户手改把 apiFormat 改成 "responses"
         // → apply 跳过代理直连上游 → 404
         // 新策略:命中 preset 即强制覆盖,不管用户改成了什么。
         let mut cfg = json!({
             "providers": [
                 {
-                    "id": "deepseek",
-                    "name": "DeepSeek",
-                    "baseUrl": "https://api.deepseek.com",
+                    "id": "xiaomi-mimo-token-plan",
+                    "name": "Xiaomi MiMo (Token Plan)",
+                    "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
                     "isBuiltin": true,
                     "apiFormat": "responses",
                     "extraHeaders": {}
@@ -799,7 +799,7 @@ mod tests {
         assert!(changed);
         assert_eq!(
             cfg["providers"][0]["apiFormat"], "openai_chat",
-            "DeepSeek apiFormat 必须被强制覆盖回 preset 的 openai_chat"
+            "MiMo apiFormat 必须被强制覆盖回 preset 的 openai_chat"
         );
     }
 
