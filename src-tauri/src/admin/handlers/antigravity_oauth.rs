@@ -8,7 +8,6 @@
 //! ## 路由
 //!
 //! - `POST /api/antigravity-oauth/login`
-//! - `POST /api/antigravity-oauth/submit-code`
 //! - `GET /api/antigravity-oauth/status`
 //! - `DELETE /api/antigravity-oauth/login/cancel`
 //! - `DELETE /api/antigravity-oauth/logout`
@@ -22,13 +21,11 @@ use axum::{
     Router,
 };
 use codex_app_transfer_gemini_oauth::{
-    antigravity_bootstrap_project, persist_token,
-    run_antigravity_oauth_flow_with_cancel_and_manual_code, FlowError, OauthFlowConfig, TokenStore,
-    ANTIGRAVITY_PROVIDER, ANTIGRAVITY_USERINFO_ENDPOINT,
+    antigravity_bootstrap_project, persist_token, run_antigravity_oauth_flow_with_cancel,
+    FlowError, OauthFlowConfig, TokenStore, ANTIGRAVITY_PROVIDER, ANTIGRAVITY_USERINFO_ENDPOINT,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 use super::super::registry_io::{with_config_write, ConfigMutation};
 use super::super::state::AdminState;
@@ -68,27 +65,6 @@ fn lock_cancel_slot() -> std::sync::MutexGuard<'static, Option<(u64, watch::Send
     lock_cancel_slot_with_poison_flag().0
 }
 
-// 手动授权码只绑定当前登录 epoch。submit-code 取走 sender 后只能投递一次；新登录会
-// 丢弃旧 sender，防止旧页面的 code 落到新会话。
-fn manual_code_slot() -> &'static Mutex<Option<(u64, oneshot::Sender<String>)>> {
-    static SLOT: OnceLock<Mutex<Option<(u64, oneshot::Sender<String>)>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-fn lock_manual_code_slot() -> std::sync::MutexGuard<'static, Option<(u64, oneshot::Sender<String>)>>
-{
-    manual_code_slot()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
-
-fn cleanup_manual_code_slot(my_epoch: u64) {
-    let mut slot = lock_manual_code_slot();
-    if matches!(slot.as_ref(), Some((epoch, _)) if *epoch == my_epoch) {
-        slot.take();
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct CancelOutcome {
     pub cancelled: bool,
@@ -99,7 +75,6 @@ pub struct CancelOutcome {
 pub fn cancel_in_flight_login() -> CancelOutcome {
     let (mut guard, slot_recovered) = lock_cancel_slot_with_poison_flag();
     let (cancelled, cancelled_epoch) = if let Some((epoch, sender)) = guard.take() {
-        cleanup_manual_code_slot(epoch);
         let _ = sender.send(true);
         (true, Some(epoch))
     } else {
@@ -184,40 +159,10 @@ pub fn routes() -> Router<AdminState> {
         .route("/api/antigravity-oauth/status", get(status_handler))
         .route("/api/antigravity-oauth/login", post(login_handler))
         .route(
-            "/api/antigravity-oauth/submit-code",
-            post(submit_code_handler),
-        )
-        .route(
             "/api/antigravity-oauth/login/cancel",
             delete(cancel_login_handler),
         )
         .route("/api/antigravity-oauth/logout", delete(logout_handler))
-}
-
-#[derive(Deserialize)]
-struct SubmitCodeBody {
-    code: String,
-}
-
-async fn submit_code_handler(Json(body): Json<SubmitCodeBody>) -> impl IntoResponse {
-    if body.code.trim().is_empty() {
-        return Json(json!({
-            "accepted": false,
-            "error": "authorization code is empty",
-        }))
-        .into_response();
-    }
-    match lock_manual_code_slot().take() {
-        Some((_, sender)) => {
-            let accepted = sender.send(body.code).is_ok();
-            Json(json!({ "accepted": accepted })).into_response()
-        }
-        None => Json(json!({
-            "accepted": false,
-            "error": "no Antigravity login is in progress",
-        }))
-        .into_response(),
-    }
 }
 
 async fn cancel_login_handler() -> impl IntoResponse {
@@ -278,8 +223,11 @@ async fn login_handler() -> impl IntoResponse {
     };
 
     let mut config = OauthFlowConfig::default();
-    config.on_auth_url = Some(Arc::new(|_url: &str| {
-        tracing::info!("antigravity OAuth auth URL 已生成 — 自动打开浏览器中");
+    config.on_auth_url = Some(Arc::new(|url: &str| {
+        tracing::info!(
+            auth_url = url,
+            "antigravity OAuth auth URL 已生成 — 自动打开浏览器中"
+        );
     }));
 
     // 注册 cancel sender + 抢占语义(同 gemini-cli 模式)
@@ -290,12 +238,6 @@ async fn login_handler() -> impl IntoResponse {
             tracing::info!("抢占 in-flight antigravity OAuth login");
             let _ = prev_sender.send(true);
         }
-    }
-
-    let (manual_code_tx, manual_code_rx) = oneshot::channel::<String>();
-    {
-        let mut slot = lock_manual_code_slot();
-        *slot = Some((my_epoch, manual_code_tx));
     }
 
     // 跑 OAuth flow (cancel-aware)
@@ -322,13 +264,8 @@ async fn login_handler() -> impl IntoResponse {
         }
     }
 
-    let flow_result = run_antigravity_oauth_flow_with_cancel_and_manual_code(
-        http,
-        &config,
-        Some(cancel_rx.clone()),
-        Some(manual_code_rx),
-    )
-    .await;
+    let flow_result =
+        run_antigravity_oauth_flow_with_cancel(http, &config, Some(cancel_rx.clone())).await;
     let token = match flow_result {
         Ok(t) => t,
         Err(FlowError::Cancelled) => {
@@ -496,8 +433,6 @@ fn cleanup_slot(my_epoch: u64) {
     if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
         slot.take();
     }
-    drop(slot);
-    cleanup_manual_code_slot(my_epoch);
 }
 
 /// userinfo 抓取结果 — 区分"成功但无 email"(`error=None, email=None`,200
@@ -651,7 +586,6 @@ mod tests {
     fn cancel_with_no_in_flight_returns_false() {
         // 清空残留(其他 test 留下的)
         let _ = lock_cancel_slot().take();
-        let _ = lock_manual_code_slot().take();
         let outcome = cancel_in_flight_login();
         assert!(!outcome.cancelled);
     }
