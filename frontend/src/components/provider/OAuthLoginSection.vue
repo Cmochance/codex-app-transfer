@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// OAuth 账号登录区(替代 API Key):未登录显示登录/授权入口(POST 开浏览器授权,长阻塞),
-// 登录中可取消;支持手动 code 的 provider 可唤醒等待中的 login;成功后显示账号 + 登出。
+// OAuth 账号登录区(替代 API Key):未登录显示「登录」(POST 开浏览器授权,长阻塞),
+// 登录中显示「登录中…+取消」,已登录显示邮箱 + 「登出」。状态变化 emit 给父表单。
 import { onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
@@ -25,7 +25,7 @@ const { show: toast } = useToast()
 const status = ref<OAuthStatus | null>(null)
 const logging = ref(false)
 let cancelled = false
-// 手动 code 只保存在组件内存中,提交后清空,绝不写入 provider form.apiKey。
+// [MOC-300] 仅 grokBuild:xAI 授权页显示 code 让用户粘回(不跳 loopback),登录中态提供输入框。
 const manualCode = ref('')
 const submittingCode = ref(false)
 
@@ -61,7 +61,6 @@ async function onLogin() {
   } catch (e) {
     if (!cancelled) toast(errMsg(e) || t('oauth.loginFailed'), 'error')
   } finally {
-    manualCode.value = ''
     logging.value = false
   }
 }
@@ -76,7 +75,7 @@ async function onCancel() {
 // grokBuild 手动粘 code:送到后端等待中的 login,由它换 token(login 随即返回并 refresh)。
 async function onSubmitCode() {
   const code = manualCode.value.trim()
-  if (!logging.value || !code || submittingCode.value) return
+  if (!code || submittingCode.value) return
   submittingCode.value = true
   try {
     const res = await oauthSubmitCode(props.kind, code)
@@ -103,26 +102,14 @@ async function onLogout() {
 
 <template>
   <div class="oauth">
-    <template v-if="kind === 'antigravity'">
-      <template v-if="status?.loggedIn">
-        <span class="oauth__msg oauth__msg--ok">{{
-          status.email ? tFmt('oauth.loggedInAs', { email: status.email }) : t('oauth.loggedIn')
-        }}</span>
-        <AppButton size="sm" variant="secondary" :label="t('oauth.logout')" @click="onLogout" />
-      </template>
-      <template v-else>
-        <AppButton
-          size="sm"
-          variant="secondary"
-          :label="logging ? t('oauth.authorizing') : t('oauth.authorize')"
-          :disabled="logging"
-          @click="onLogin"
-        />
+    <template v-if="logging">
+      <span class="oauth__msg">{{ t('oauth.loggingIn') }}</span>
+      <AppButton size="sm" variant="secondary" :label="t('common.cancel')" @click="onCancel" />
+      <template v-if="kind === 'grokBuild'">
         <input
           v-model="manualCode"
           class="oauth__code-input"
-          :placeholder="t('oauth.pasteCodeOrCallbackPlaceholder')"
-          :disabled="!logging || submittingCode"
+          :placeholder="t('oauth.pasteCodePlaceholder')"
           spellcheck="false"
           autocomplete="off"
           @keyup.enter="onSubmitCode"
@@ -131,52 +118,21 @@ async function onLogout() {
           size="sm"
           variant="primary"
           :label="t('oauth.submitCode')"
-          :disabled="!logging || !manualCode.trim() || submittingCode"
+          :disabled="!manualCode.trim() || submittingCode"
           @click="onSubmitCode"
         />
-        <AppButton
-          v-if="logging"
-          size="sm"
-          variant="ghost"
-          :label="t('common.cancel')"
-          @click="onCancel"
-        />
-        <span class="oauth__hint">{{ t('oauth.antigravityCodeHint') }}</span>
+        <span class="oauth__hint">{{ t('oauth.pasteCodeHint') }}</span>
       </template>
     </template>
+    <template v-else-if="status?.loggedIn">
+      <span class="oauth__msg oauth__msg--ok">{{
+        status.email ? tFmt('oauth.loggedInAs', { email: status.email }) : t('oauth.loggedIn')
+      }}</span>
+      <AppButton size="sm" variant="secondary" :label="t('oauth.logout')" @click="onLogout" />
+    </template>
     <template v-else>
-      <template v-if="logging">
-        <span class="oauth__msg">{{ t('oauth.loggingIn') }}</span>
-        <AppButton size="sm" variant="secondary" :label="t('common.cancel')" @click="onCancel" />
-        <template v-if="kind === 'grokBuild'">
-          <input
-            v-model="manualCode"
-            class="oauth__code-input"
-            :placeholder="t('oauth.pasteCodePlaceholder')"
-            spellcheck="false"
-            autocomplete="off"
-            @keyup.enter="onSubmitCode"
-          />
-          <AppButton
-            size="sm"
-            variant="primary"
-            :label="t('oauth.submitCode')"
-            :disabled="!manualCode.trim() || submittingCode"
-            @click="onSubmitCode"
-          />
-          <span class="oauth__hint">{{ t('oauth.pasteCodeHint') }}</span>
-        </template>
-      </template>
-      <template v-else-if="status?.loggedIn">
-        <span class="oauth__msg oauth__msg--ok">{{
-          status.email ? tFmt('oauth.loggedInAs', { email: status.email }) : t('oauth.loggedIn')
-        }}</span>
-        <AppButton size="sm" variant="secondary" :label="t('oauth.logout')" @click="onLogout" />
-      </template>
-      <template v-else>
-        <span class="oauth__msg">{{ t('oauth.notLoggedIn') }}</span>
-        <AppButton size="sm" variant="secondary" :label="t('oauth.login')" @click="onLogin" />
-      </template>
+      <span class="oauth__msg">{{ t('oauth.notLoggedIn') }}</span>
+      <AppButton size="sm" variant="secondary" :label="t('oauth.login')" @click="onLogin" />
     </template>
   </div>
 </template>
@@ -185,7 +141,6 @@ async function onLogout() {
 .oauth {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
   gap: var(--space-3);
 }
 .oauth__msg {
@@ -206,11 +161,6 @@ async function onLogout() {
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
-}
-.oauth__code-input:disabled {
-  color: var(--text-muted);
-  background: var(--surface-2);
-  cursor: not-allowed;
 }
 .oauth__hint {
   flex-basis: 100%;

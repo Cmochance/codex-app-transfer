@@ -63,8 +63,8 @@ pub use token::{OauthToken, TokenError, TokenStore};
 pub use antigravity::{
     antigravity_bootstrap_project, antigravity_static_models, fetch_antigravity_available_models,
     fetch_gemini_quota_summary, refresh_antigravity_access_token,
-    run_antigravity_oauth_flow_with_cancel, run_antigravity_oauth_flow_with_cancel_and_manual_code,
-    AntigravityClientMetadata, AntigravityModelEntry, GeminiQuota, QuotaError, QuotaWindow,
+    run_antigravity_oauth_flow_with_cancel, AntigravityClientMetadata, AntigravityModelEntry,
+    GeminiQuota, QuotaError, QuotaWindow,
 };
 
 // z.ai / bigmodel(GLM Coding Plan 账号登录)provider re-exports(parallel module,

@@ -59,7 +59,6 @@ enum CallbackResult {
         description: Option<String>,
     },
     Malformed,
-    Cancelled,
 }
 
 /// 跑完整 Antigravity OAuth code grant 流程,带 cancel signal 支持。
@@ -68,18 +67,7 @@ enum CallbackResult {
 pub async fn run_antigravity_oauth_flow_with_cancel(
     http: &reqwest::Client,
     config: &OauthFlowConfig,
-    cancel: Option<tokio::sync::watch::Receiver<bool>>,
-) -> Result<OauthToken, FlowError> {
-    run_antigravity_oauth_flow_with_cancel_and_manual_code(http, config, cancel, None).await
-}
-
-/// 跑完整 Antigravity OAuth 流程，并允许 UI 把一次性授权码或完整 callback URL
-/// 送入当前登录。自动 loopback callback 与手动 code 先到者胜。
-pub async fn run_antigravity_oauth_flow_with_cancel_and_manual_code(
-    http: &reqwest::Client,
-    config: &OauthFlowConfig,
     mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
-    mut manual_code: Option<oneshot::Receiver<String>>,
 ) -> Result<OauthToken, FlowError> {
     // 1. bind loopback — antigravity 用**固定 port** 51121
     let bind_addr: SocketAddr = format!("127.0.0.1:{ANTIGRAVITY_CALLBACK_PORT}")
@@ -164,18 +152,8 @@ pub async fn run_antigravity_oauth_flow_with_cancel_and_manual_code(
             None => std::future::pending::<()>().await,
         }
     };
-    let manual_code_fut = async {
-        match manual_code.as_mut() {
-            Some(rx) => rx.await.ok(),
-            None => std::future::pending::<Option<String>>().await,
-        }
-    };
     let callback = tokio::select! {
         result = rx => result.map_err(|_| FlowError::Timeout(config.callback_timeout))?,
-        manual = manual_code_fut => match manual {
-            Some(raw) => parse_manual_callback(&raw, &state),
-            None => CallbackResult::Cancelled,
-        },
         _ = tokio::time::sleep(config.callback_timeout) => {
             server_handle.abort();
             return Err(FlowError::Timeout(config.callback_timeout));
@@ -217,52 +195,10 @@ pub async fn run_antigravity_oauth_flow_with_cancel_and_manual_code(
                 description: Some("Google callback 既没 code 也没 error,极不正常".into()),
             });
         }
-        CallbackResult::Cancelled => return Err(FlowError::Cancelled),
     };
 
     // 8. POST /token 换 access_token
     exchange_antigravity_code_for_token(http, &code, &redirect_uri).await
-}
-
-/// 手动路径支持裸 code、完整 callback URL 或 query 串。完整 URL 若带 state，仍走
-/// 常规 state 校验；裸 code 只会从当前 epoch 的 oneshot receiver 到达，因此绑定本次登录。
-fn parse_manual_callback(raw: &str, expected_state: &str) -> CallbackResult {
-    let input = raw.trim();
-    if input.is_empty() {
-        return CallbackResult::Malformed;
-    }
-    let looks_like_callback = input.starts_with("http://")
-        || input.starts_with("https://")
-        || input.starts_with("code=")
-        || input.starts_with("state=")
-        || input.contains("&code=")
-        || input.contains("&state=");
-    if looks_like_callback {
-        let parsed = url::Url::parse(input)
-            .or_else(|_| url::Url::parse(&format!("http://localhost/?{input}")))
-            .ok();
-        if let Some(url) = parsed {
-            let code = url
-                .query_pairs()
-                .find(|(key, _)| key == "code")
-                .map(|(_, value)| value.into_owned())
-                .filter(|value| !value.is_empty());
-            if let Some(code) = code {
-                let state = url
-                    .query_pairs()
-                    .find(|(key, _)| key == "state")
-                    .map(|(_, value)| value.into_owned())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| expected_state.to_owned());
-                return CallbackResult::Code { code, state };
-            }
-        }
-        return CallbackResult::Malformed;
-    }
-    CallbackResult::Code {
-        code: input.to_owned(),
-        state: expected_state.to_owned(),
-    }
 }
 
 /// 用 refresh_token 刷新 antigravity access_token。
@@ -447,46 +383,5 @@ mod tests {
     #[test]
     fn antigravity_callback_port_is_fixed_51121() {
         assert_eq!(ANTIGRAVITY_CALLBACK_PORT, 51121);
-    }
-
-    #[test]
-    fn manual_callback_accepts_bare_code_for_current_state() {
-        match parse_manual_callback("  code-123  ", "state-1") {
-            CallbackResult::Code { code, state } => {
-                assert_eq!(code, "code-123");
-                assert_eq!(state, "state-1");
-            }
-            other => panic!("unexpected callback: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn manual_callback_extracts_code_and_preserves_returned_state() {
-        match parse_manual_callback(
-            "http://localhost:51121/oauth-callback?code=ABC123&state=returned-state",
-            "expected-state",
-        ) {
-            CallbackResult::Code { code, state } => {
-                assert_eq!(code, "ABC123");
-                assert_eq!(state, "returned-state");
-            }
-            other => panic!("unexpected callback: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn manual_callback_rejects_empty_or_missing_code() {
-        assert!(matches!(
-            parse_manual_callback("   ", "state-1"),
-            CallbackResult::Malformed
-        ));
-        assert!(matches!(
-            parse_manual_callback("state=state-1", "state-1"),
-            CallbackResult::Malformed
-        ));
-        assert!(matches!(
-            parse_manual_callback("http://localhost/callback?code=", "state-1"),
-            CallbackResult::Malformed
-        ));
     }
 }
