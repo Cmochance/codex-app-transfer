@@ -137,6 +137,16 @@ struct OpenReasoning {
     text_acc: String,
 }
 
+/// Gemini thought parts 的 Responses 输出形态。
+///
+/// 默认维持既有 reasoning summary wire；Antigravity 单独使用 commentary message，
+/// 让 Codex 原生 Working 区域持久显示思考过程，而不影响 gemini_native / gemini_cli。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningOutputMode {
+    ReasoningSummary,
+    CommentaryMessage,
+}
+
 struct ClosedFunctionCall {
     item_id: String,
     output_index: u32,
@@ -196,6 +206,10 @@ pub struct GeminiToResponsesConverter {
     next_output_index: u32,
     open_message: Option<OpenMessage>,
     open_reasoning: Option<OpenReasoning>,
+    reasoning_output_mode: ReasoningOutputMode,
+    /// Antigravity commentary 模式下，一旦已输出普通回答，后到的 thought part 丢弃，
+    /// 避免 Working 内容穿插到 final answer 之后。
+    has_seen_normal_text: bool,
     /// 已 close 的 function_call(完整 envelope output[] 用)
     closed_function_calls: Vec<ClosedFunctionCall>,
     /// 已 close 的 message items(H3 修复:Gemini 多轮 text→fc→text 序列会让
@@ -271,6 +285,18 @@ impl GeminiToResponsesConverter {
         original_request: Option<Value>,
         response_session: Option<ResponseSessionPlan>,
     ) -> Self {
+        Self::new_with_reasoning_output_mode(
+            original_request,
+            response_session,
+            ReasoningOutputMode::ReasoningSummary,
+        )
+    }
+
+    pub(crate) fn new_with_reasoning_output_mode(
+        original_request: Option<Value>,
+        response_session: Option<ResponseSessionPlan>,
+        reasoning_output_mode: ReasoningOutputMode,
+    ) -> Self {
         let response_id = response_session
             .as_ref()
             .map(|s| s.response_id.clone())
@@ -299,6 +325,8 @@ impl GeminiToResponsesConverter {
             next_output_index: 0,
             open_message: None,
             open_reasoning: None,
+            reasoning_output_mode,
+            has_seen_normal_text: false,
             closed_function_calls: Vec::new(),
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
@@ -509,6 +537,15 @@ impl GeminiToResponsesConverter {
         for item in output_items {
             match item.get("type").and_then(|v| v.as_str()) {
                 Some("message") => {
+                    if item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| id.starts_with("msg_thought_"))
+                    {
+                        // Antigravity 的可见思考只属于当轮 Working transcript；不把它
+                        // 写进上游会话历史，避免下一轮把思考当 assistant 正文重放。
+                        continue;
+                    }
                     if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
                         for part in content {
                             if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
@@ -798,6 +835,13 @@ impl GeminiToResponsesConverter {
                             // 空 item 既渲染空白行,又打断 Codex 按「连续 tool item」
                             // 分组的工具折叠(对齐 chat 路径 emit_text_delta 空守卫)。
                         } else if part.thought == Some(true) {
+                            if self.reasoning_output_mode == ReasoningOutputMode::CommentaryMessage
+                                && self.has_seen_normal_text
+                            {
+                                // Antigravity 偶尔在正常回答后补发 thought；Working transcript
+                                // 不应穿插到 final answer 后面，按官方参考实现丢弃。
+                                continue;
+                            }
                             // reasoning text:必要时关 message + 开 reasoning
                             if self.open_message.is_some() {
                                 self.close_message(out);
@@ -807,6 +851,7 @@ impl GeminiToResponsesConverter {
                             }
                             self.emit_reasoning_delta(out, text);
                         } else {
+                            self.has_seen_normal_text = true;
                             // 文本 text:必要时关 reasoning + 开 message
                             if self.open_reasoning.is_some() {
                                 self.close_reasoning(out);
@@ -1352,36 +1397,74 @@ impl GeminiToResponsesConverter {
     // ───── reasoning item ─────
 
     fn open_reasoning(&mut self, out: &mut Vec<u8>) {
-        let item_id = format!("rs_{}", synthesize_id());
+        let item_id = match self.reasoning_output_mode {
+            ReasoningOutputMode::ReasoningSummary => format!("rs_{}", synthesize_id()),
+            ReasoningOutputMode::CommentaryMessage => format!("msg_thought_{}", synthesize_id()),
+        };
         let output_index = self.next_output_index;
         self.next_output_index += 1;
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.output_item.added",
-            json!({
-                "type": "response.output_item.added",
-                "output_index": output_index,
-                "item": {
-                    "type": "reasoning",
-                    "status": "in_progress",
-                    "id": item_id,
-                    "summary": [],
-                },
-            }),
-        );
-        emit_event(
-            out,
-            &mut self.sequence_number,
-            "response.reasoning_summary_part.added",
-            json!({
-                "type": "response.reasoning_summary_part.added",
-                "item_id": item_id,
-                "output_index": output_index,
-                "summary_index": 0,
-                "part": { "type": "summary_text", "text": "" },
-            }),
-        );
+        match self.reasoning_output_mode {
+            ReasoningOutputMode::ReasoningSummary => {
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "reasoning",
+                            "status": "in_progress",
+                            "id": item_id,
+                            "summary": [],
+                        },
+                    }),
+                );
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "part": { "type": "summary_text", "text": "" },
+                    }),
+                );
+            }
+            ReasoningOutputMode::CommentaryMessage => {
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "message",
+                            "phase": "commentary",
+                            "status": "in_progress",
+                            "id": item_id,
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }),
+                );
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.content_part.added",
+                    json!({
+                        "type": "response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": { "type": "output_text", "text": "", "annotations": [] },
+                    }),
+                );
+            }
+        }
         self.open_reasoning = Some(OpenReasoning {
             item_id,
             output_index,
@@ -1397,6 +1480,21 @@ impl GeminiToResponsesConverter {
             }
             None => return,
         };
+        if self.reasoning_output_mode == ReasoningOutputMode::CommentaryMessage {
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": delta,
+                }),
+            );
+            return;
+        }
         // [单发 summary 通道] 实测官方 gpt-5.5(v26.623)reasoning 只发
         // `reasoning_summary_text.delta`(不发 content 通道 `reasoning_text.delta`),
         // 思考照常显示——当前 Codex 靠 summary 通道渲染。原双发(额外 content 通道)
@@ -1420,6 +1518,57 @@ impl GeminiToResponsesConverter {
         let Some(rs) = self.open_reasoning.take() else {
             return;
         };
+        if self.reasoning_output_mode == ReasoningOutputMode::CommentaryMessage {
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": rs.item_id,
+                    "output_index": rs.output_index,
+                    "content_index": 0,
+                    "text": rs.text_acc,
+                }),
+            );
+            let part = json!({
+                "type": "output_text",
+                "text": rs.text_acc,
+                "annotations": [],
+            });
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.content_part.done",
+                json!({
+                    "type": "response.content_part.done",
+                    "item_id": rs.item_id,
+                    "output_index": rs.output_index,
+                    "content_index": 0,
+                    "part": part,
+                }),
+            );
+            let item = json!({
+                "type": "message",
+                "phase": "commentary",
+                "status": "completed",
+                "id": rs.item_id,
+                "role": "assistant",
+                "content": [part],
+            });
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": rs.output_index,
+                    "item": item.clone(),
+                }),
+            );
+            self.closed_reasonings.push((rs.output_index, item));
+            return;
+        }
         emit_event(
             out,
             &mut self.sequence_number,
@@ -2330,6 +2479,20 @@ pub fn convert_gemini_to_responses_stream(
     original_request: Option<Value>,
     response_session: Option<ResponseSessionPlan>,
 ) -> ByteStream {
+    convert_gemini_to_responses_stream_with_mode(
+        input,
+        original_request,
+        response_session,
+        ReasoningOutputMode::ReasoningSummary,
+    )
+}
+
+pub(crate) fn convert_gemini_to_responses_stream_with_mode(
+    input: ByteStream,
+    original_request: Option<Value>,
+    response_session: Option<ResponseSessionPlan>,
+    reasoning_output_mode: ReasoningOutputMode,
+) -> ByteStream {
     struct State {
         input: ByteStream,
         conv: GeminiToResponsesConverter,
@@ -2337,7 +2500,11 @@ pub fn convert_gemini_to_responses_stream(
     }
     let init = State {
         input,
-        conv: GeminiToResponsesConverter::new(original_request, response_session),
+        conv: GeminiToResponsesConverter::new_with_reasoning_output_mode(
+            original_request,
+            response_session,
+            reasoning_output_mode,
+        ),
         finished: false,
     };
     let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
@@ -2922,6 +3089,129 @@ mod tests {
             .find(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "reasoning")
             .unwrap();
         assert!(item_added.1["item"].get("content").is_none());
+    }
+
+    #[test]
+    fn antigravity_thought_emits_commentary_message_and_keeps_signature_on_tool_call() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"text":"inspect the repository","thought":true},{"functionCall":{"name":"search","args":{"q":"wire format"}},"thoughtSignature":"AG_TEST_SIGNATURE"}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new_with_reasoning_output_mode(
+            None,
+            None,
+            ReasoningOutputMode::CommentaryMessage,
+        );
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        let names: Vec<&str> = parsed.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(names.contains(&"response.content_part.added"));
+        assert!(names.contains(&"response.output_text.delta"));
+        assert!(names.contains(&"response.output_text.done"));
+        assert!(names.contains(&"response.content_part.done"));
+        assert!(!names.contains(&"response.reasoning_summary_part.added"));
+        assert!(!names.contains(&"response.reasoning_summary_text.delta"));
+
+        let commentary_added = parsed
+            .iter()
+            .find(|(name, data)| {
+                name == "response.output_item.added"
+                    && data["item"]["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("msg_thought_"))
+            })
+            .expect("Antigravity thought should open a commentary message");
+        assert_eq!(commentary_added.1["item"]["type"], "message");
+        assert_eq!(commentary_added.1["item"]["phase"], "commentary");
+        assert_eq!(commentary_added.1["item"]["role"], "assistant");
+
+        let completed = parsed
+            .iter()
+            .find(|(name, _)| name == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        let commentary = output
+            .iter()
+            .find(|item| item["phase"] == "commentary")
+            .expect("completed.output should retain the commentary item");
+        assert_eq!(commentary["content"][0]["text"], "inspect the repository");
+        assert!(!commentary["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("**Thinking**"));
+
+        let function_call = output
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function call should follow commentary");
+        let call_id = function_call["call_id"].as_str().unwrap();
+        assert!(!call_id.contains("AG_TEST_SIGNATURE"));
+        let cached = crate::responses::global_tool_call_cache()
+            .get(call_id)
+            .expect("thoughtSignature should be cached for tool roundtrip");
+        assert_eq!(
+            cached.thought_signature.as_deref(),
+            Some("AG_TEST_SIGNATURE")
+        );
+    }
+
+    #[test]
+    fn antigravity_drops_late_thought_after_normal_text() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"text":"final answer"},{"text":"late internal note","thought":true}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new_with_reasoning_output_mode(
+            None,
+            None,
+            ReasoningOutputMode::CommentaryMessage,
+        );
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let completed = events
+            .iter()
+            .map(|event| parse_event(event))
+            .find(|(name, _)| name == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["content"][0]["text"], "final answer");
+        assert!(output.iter().all(|item| item["phase"] != "commentary"));
+    }
+
+    #[test]
+    fn antigravity_commentary_is_not_saved_as_session_assistant_content() {
+        let output = vec![
+            json!({
+                "type": "message",
+                "id": "msg_thought_test",
+                "phase": "commentary",
+                "role": "assistant",
+                "content": [{"type":"output_text","text":"private working"}]
+            }),
+            json!({
+                "type": "message",
+                "phase": "final_answer",
+                "role": "assistant",
+                "content": [{"type":"output_text","text":"public answer"}]
+            }),
+        ];
+        let message = GeminiToResponsesConverter::build_assistant_message_for_session(&output)
+            .expect("final answer should produce a session message");
+        assert_eq!(message["content"], "public answer");
+        assert!(!message.to_string().contains("private working"));
+    }
+
+    #[test]
+    fn ordinary_commentary_message_remains_in_session_history() {
+        let output = vec![json!({
+            "type": "message",
+            "id": "msg_tool_preamble",
+            "phase": "commentary",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"I will inspect the file."}]
+        })];
+        let message = GeminiToResponsesConverter::build_assistant_message_for_session(&output)
+            .expect("non-thought commentary is a real assistant preamble");
+        assert_eq!(message["content"], "I will inspect the file.");
     }
 
     /// MOC-203 折叠修复锁定:gemini functionCall 后常发 `{"text":""}` 空 part,

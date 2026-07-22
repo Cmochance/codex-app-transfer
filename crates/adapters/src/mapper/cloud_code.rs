@@ -21,6 +21,8 @@ pub(crate) enum CloudCodeApiFlavor {
     Antigravity,
 }
 
+const ANTIGRAVITY_COMMENTARY_METADATA_KEY: &str = "antigravity_commentary_thoughts";
+
 impl CloudCodeApiFlavor {
     pub(crate) fn from_api_format(api_format: &str) -> Self {
         if matches!(
@@ -424,7 +426,7 @@ pub(crate) fn prepare_cloud_code_request(
         });
     }
 
-    let parsed: Value = serde_json::from_slice(&body)?;
+    let mut parsed: Value = serde_json::from_slice(&body)?;
     let stream = parsed
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -437,6 +439,10 @@ pub(crate) fn prepare_cloud_code_request(
 
     let flavor = CloudCodeApiFlavor::from_api_format(&provider.api_format);
     let project_id = resolve_cloud_code_project_id(provider)?;
+
+    if flavor.is_antigravity() {
+        filter_antigravity_transcript_only_commentary(&mut parsed);
+    }
 
     // **task 25 / silent-failure-hunter PR #145 HIGH-2 修(2026-05-13)**:旧
     // 实现调 `responses_body_to_gemini_request`(无 _with_session 版本),完全
@@ -482,12 +488,56 @@ pub(crate) fn prepare_cloud_code_request(
         response_session: Some(conversion.response_session),
         // [MOC-232] context_breakdown 不再经 adapter_metadata 透传 —— 改由 responses::request
         // 内 spawn_blocking 后台算并按对话 uuid 落盘(搬离转发关键路径,见 context_breakdown.rs)。
-        // 本路径无其它 metadata。
-        adapter_metadata: None,
+        // 仅 Antigravity 响应把 thought 映射为 Codex 原生 commentary message；
+        // Gemini CLI 仍保持既有 reasoning_summary wire。
+        adapter_metadata: flavor
+            .is_antigravity()
+            .then(|| json!({ "antigravity_commentary_thoughts": true })),
         is_compact: false,
         compact_v2: false,
         original_responses_request: Some(parsed),
     })
+}
+
+/// 只在 Antigravity 归一化前移除 Codex 本地 transcript 里的 Working 消息。
+/// 这些内容已在上一轮展示，不应作为 assistant 正文再次发给 Gemini。
+fn filter_antigravity_transcript_only_commentary(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    items.retain(|item| !is_codex_transcript_only_commentary(item));
+}
+
+fn is_codex_transcript_only_commentary(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return false;
+    }
+    if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+        return true;
+    }
+    if item
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("msg_thought_"))
+    {
+        return true;
+    }
+    message_texts(item).any(|text| text.trim_start().starts_with("**Thinking**"))
+}
+
+fn message_texts(item: &Value) -> impl Iterator<Item = &str> {
+    item.get("content")
+        .into_iter()
+        .flat_map(|content| match content {
+            Value::String(text) => vec![text.as_str()],
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect(),
+            _ => Vec::new(),
+        })
 }
 
 // ─────────────────── [MOC-210] antigravity 出图(image_gen 履约)───────────────────
@@ -676,16 +726,34 @@ pub(crate) fn transform_cloud_code_response_stream(
         });
     }
     let unwrapped = crate::gemini_cli::response::unwrap_cloud_code_sse_envelope(upstream_stream);
-    let stream = crate::gemini_native::response::convert_gemini_to_responses_stream(
+    let reasoning_output_mode = cloud_code_reasoning_output_mode(request_plan);
+    let stream = crate::gemini_native::response::convert_gemini_to_responses_stream_with_mode(
         unwrapped,
         request_plan.original_responses_request.clone(),
         request_plan.response_session.clone(),
+        reasoning_output_mode,
     );
     Ok(ResponsePlan {
         status: upstream_status,
         headers: upstream_headers,
         stream,
     })
+}
+
+fn cloud_code_reasoning_output_mode(
+    request_plan: &RequestPlan,
+) -> crate::gemini_native::response::ReasoningOutputMode {
+    if request_plan
+        .adapter_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(ANTIGRAVITY_COMMENTARY_METADATA_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        crate::gemini_native::response::ReasoningOutputMode::CommentaryMessage
+    } else {
+        crate::gemini_native::response::ReasoningOutputMode::ReasoningSummary
+    }
 }
 
 /// cloudcode-pa 不识别 `toolConfig.includeServerSideToolInvocations`(camel/snake)。
@@ -789,7 +857,21 @@ impl ResponseMapper for CloudCodeMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{stream, StreamExt};
     use serde_json::json;
+
+    fn test_request_plan(adapter_metadata: Option<Value>) -> RequestPlan {
+        RequestPlan {
+            upstream_path: String::new(),
+            body: bytes::Bytes::new(),
+            upstream_headers: HeaderMap::new(),
+            response_session: None,
+            adapter_metadata,
+            is_compact: false,
+            compact_v2: false,
+            original_responses_request: None,
+        }
+    }
 
     #[test]
     fn uuid_v4_format_matches_rfc_4122() {
@@ -887,6 +969,82 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    #[test]
+    fn antigravity_filters_only_transcript_thought_messages() {
+        let mut body = json!({
+            "input": [
+                {"type":"message","id":"msg_thought_1","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"new working"}]},
+                {"type":"message","id":"msg_old","role":"assistant","content":[{"type":"output_text","text":"**Thinking**\n\nlegacy working"}]},
+                {"type":"message","id":"msg_preamble","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I will inspect it."}]},
+                {"type":"message","id":"msg_final","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"answer"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+            ]
+        });
+        filter_antigravity_transcript_only_commentary(&mut body);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item["id"] == "msg_final"));
+        assert!(items.iter().any(|item| item["role"] == "user"));
+        assert!(!items.iter().any(|item| item["id"] == "msg_thought_1"));
+        assert!(!items.iter().any(|item| item["id"] == "msg_old"));
+        assert!(!items.iter().any(|item| item["id"] == "msg_preamble"));
+    }
+
+    #[test]
+    fn cloud_code_reasoning_mode_is_enabled_only_by_antigravity_metadata() {
+        let base = test_request_plan(None);
+        assert_eq!(
+            cloud_code_reasoning_output_mode(&base),
+            crate::gemini_native::response::ReasoningOutputMode::ReasoningSummary,
+            "Gemini CLI/no metadata must keep reasoning_summary"
+        );
+        let mut antigravity = base.clone();
+        antigravity.adapter_metadata = Some(json!({
+            "antigravity_commentary_thoughts": true
+        }));
+        assert_eq!(
+            cloud_code_reasoning_output_mode(&antigravity),
+            crate::gemini_native::response::ReasoningOutputMode::CommentaryMessage
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_code_stream_uses_commentary_only_for_antigravity_plan() {
+        const RAW: &[u8] = br#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"working","thought":true}]},"finishReason":"STOP"}]}}
+
+"#;
+        async fn convert(plan: RequestPlan) -> String {
+            let upstream: ByteStream =
+                Box::pin(stream::iter(vec![Ok(bytes::Bytes::from_static(RAW))]));
+            let response = transform_cloud_code_response_stream(
+                StatusCode::OK,
+                HeaderMap::new(),
+                upstream,
+                &plan,
+            )
+            .unwrap();
+            let chunks: Vec<_> = response.stream.collect().await;
+            let bytes = chunks
+                .into_iter()
+                .flat_map(|chunk| chunk.unwrap().to_vec())
+                .collect::<Vec<_>>();
+            String::from_utf8(bytes).unwrap()
+        }
+
+        let gemini_cli = convert(test_request_plan(None)).await;
+        assert!(gemini_cli.contains("response.reasoning_summary_text.delta"));
+        assert!(!gemini_cli.contains("msg_thought_"));
+
+        let antigravity = convert(test_request_plan(Some(json!({
+            "antigravity_commentary_thoughts": true
+        }))))
+        .await;
+        assert!(antigravity.contains("response.output_text.delta"));
+        assert!(antigravity.contains("\"phase\":\"commentary\""));
+        assert!(antigravity.contains("msg_thought_"));
+        assert!(!antigravity.contains("response.reasoning_summary_text.delta"));
     }
 
     #[test]
