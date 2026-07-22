@@ -30,7 +30,7 @@ const MACOS_BUNDLE_ID: &str = "com.openai.codex";
 // 后接空格非 `.app`,正则 `Codex\.app` 不命中)与 `ChatGPT Classic.app`(同理 `ChatGPT` 后接空格)。
 const MACOS_MAIN_PROCESS_MATCH: &str = r"(Codex|ChatGPT)\.app/Contents/MacOS/";
 const MACOS_APP_PROCESS_MATCH: &str = r"(Codex|ChatGPT)\.app/Contents/";
-const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
+const WINDOWS_PROCESS_NAMES: [&str; 2] = ["ChatGPT.exe", "Codex.exe"];
 /// OpenAI 官方 Windows Store 包 ID,与 codex-account-switch 保持一致;
 /// 用户若装的是非 Store 版本,resolve 失败时 explorer.exe 会报错,前端会
 /// 看到 INTERNAL_SERVER_ERROR,比静默假成功好。
@@ -124,14 +124,10 @@ fn running_check_command(platform: &str) -> Vec<String> {
         // [`macos_pid_classes`],调用方 [`is_codex_app_running`] 在进入本函数前分流。
         // 返回空 Vec = 调用方安全 no-op(防误用)。
         "macos" => Vec::new(),
-        "windows" => vec![
-            "tasklist".into(),
-            "/FI".into(),
-            format!("IMAGENAME eq {WINDOWS_PROCESS_NAME}"),
-            "/FO".into(),
-            "CSV".into(),
-            "/NH".into(),
-        ],
+        // Windows 主路径用 windows_msix 的 Toolhelp + 完整镜像路径归属校验。
+        // tasklist 仅在原生快照失败时保守兜底;不加 /FI 才能同时覆盖新
+        // ChatGPT.exe 与旧 Codex.exe。兜底只做「仍在跑」判断,绝不据此发信号。
+        "windows" => vec!["tasklist".into(), "/FO".into(), "CSV".into(), "/NH".into()],
         _ => vec!["pgrep".into(), "-x".into(), LINUX_BIN_NAME.into()],
     }
 }
@@ -143,31 +139,10 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
         // ChatGPT.app):必须逐 PID 归属校验后 kill,见 [`run_quit_command`] 的 macos
         // 分支。返回空 Vec = 调用方安全 no-op(防误用)。
         ("macos", _) => Vec::new(),
-        // follow-up #33 P2-b:从 `taskkill /IM` 切到 PowerShell CIM 路径。
-        //
-        // taskkill 在 Codex Desktop 这种 MSIX packaged Store app 上经常报
-        // access-denied(packaged app 进程隔离机制),失败时本项目 quit_codex_
-        // app_with_retries 走 KILL 路径仍是 taskkill,**两层 fallback 都失败**
-        // → Codex 永远关不掉 → "重启 Codex" 实际只 ActivateApplication
-        // 把现有进程带到前台,config.toml 不重读。
-        //
-        // PowerShell `Get-CimInstance Win32_Process` 走 WMI 拿到 process ID
-        // 后 `Stop-Process -Id` 优雅清理,绕过 MSIX 进程隔离的 taskkill 限制。
-        // 借鉴 BigPizzaV3/CodexPlusPlus `codex_session_delete/launcher.py:
-        // 434-451`(MIT)实证可用。`hide_console_window` (line 192-202) 已加
-        // CREATE_NO_WINDOW flag 给 powershell,不弹 console。
-        ("windows", false) => vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe' OR Name='codex.exe'\" | ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }".into(),
-        ],
-        ("windows", true) => vec![
-            "powershell".into(),
-            "-NoProfile".into(),
-            "-Command".into(),
-            "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe' OR Name='codex.exe'\" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }".into(),
-        ],
+        // Windows 必须先按 OpenAI.Codex 包路径确认 PID 归属,再发 WM_CLOSE /
+        // TerminateProcess;静态命令无法安全表达这层身份校验。实现见
+        // windows_msix::{graceful_close_codex,force_terminate_codex}。
+        ("windows", _) => Vec::new(),
         (_, false) => vec![
             "pkill".into(),
             "-TERM".into(),
@@ -376,13 +351,18 @@ pub fn is_codex_app_running(platform: &str) -> bool {
         return false;
     };
     if platform == "windows" {
-        // tasklist 即使没匹配也 exit 0,要看 stdout 里有没有 process 名
+        // tasklist 即使没匹配也 exit 0,要看 stdout 里有没有候选进程名。
+        // 这是 Toolhelp 快照失败时的保守兜底:宁可随后报「请手动关闭」,也不
+        // 误判未运行后再叠开一个实例。真正退出仍只使用路径验明归属的 PID。
         let mut command = Command::new(program);
         command.args(args);
         match hide_console_window(&mut command).output() {
-            Ok(out) => String::from_utf8_lossy(&out.stdout)
-                .to_ascii_lowercase()
-                .contains(&WINDOWS_PROCESS_NAME.to_ascii_lowercase()),
+            Ok(out) => {
+                let output = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+                WINDOWS_PROCESS_NAMES
+                    .iter()
+                    .any(|name| output.contains(&name.to_ascii_lowercase()))
+            }
             Err(_) => false,
         }
     } else {
@@ -398,15 +378,17 @@ pub fn is_codex_app_running(platform: &str) -> bool {
 }
 
 fn run_quit_command(platform: &str, force: bool) {
-    // MOC-95:Windows 优雅退出(非 force / TERM 阶段)优先用原生 PostMessage(WM_CLOSE),
-    // 替 PowerShell `Get-CimInstance Win32_Process | Stop-Process`(WMI 冷启动 ~1s,
-    // MOC-93 实测重启路径大头)。两者同为 WM_CLOSE / CloseMainWindow 机制,native 省掉
-    // PowerShell + WMI 开销。找到并投递了 ≥1 个 Codex 窗口即返回;0 个窗口(罕见:Codex
-    // 无可见顶层窗口 / 快照失败)才 fall through 到下面 PowerShell graceful 兜底。force
-    // (KILL 阶段)保持 PowerShell `Stop-Process -Force` 不动(原生 TerminateProcess 在
-    // MSIX 上 access-denied,见 quit_command 注释)。
+    // Windows 26.715+ GUI 已改名 ChatGPT.exe,且本机 Win32_Process/CIM 可能不可用。
+    // windows_msix 统一走 Toolhelp 枚举 + QueryFullProcessImageName 路径归属校验:
+    // TERM 阶段只向 OpenAI.Codex 包窗口发 WM_CLOSE;KILL 阶段只强杀同一批可信 PID。
+    // 不再依赖 CIM,也不会误杀消费级 ChatGPT 或包内 resources/codex.exe CLI。
     #[cfg(target_os = "windows")]
-    if platform == "windows" && !force && crate::windows_msix::graceful_close_codex() > 0 {
+    if platform == "windows" {
+        if force {
+            let _ = crate::windows_msix::force_terminate_codex();
+        } else {
+            let _ = crate::windows_msix::graceful_close_codex();
+        }
         return;
     }
     // [改名适配] macOS:候选逐 PID 归属校验,**只对 Ours 发信号**(Unknown 绝不杀)。
@@ -1231,7 +1213,8 @@ mod tests {
         assert!(running_check_command("macos").is_empty());
         let windows = running_check_command("windows");
         assert_eq!(windows[0], "tasklist");
-        assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
+        assert!(!windows.iter().any(|a| a == "/FI"));
+        assert_eq!(WINDOWS_PROCESS_NAMES, ["ChatGPT.exe", "Codex.exe"]);
         assert_eq!(running_check_command("linux"), vec!["pgrep", "-x", "codex"]);
     }
 
@@ -1324,22 +1307,10 @@ mod tests {
         assert!(quit_command("macos", false).is_empty());
         assert!(quit_command("macos", true).is_empty());
 
-        let win_graceful = quit_command("windows", false);
-        assert_eq!(win_graceful[0], "powershell");
-        assert_eq!(win_graceful[1], "-NoProfile");
-        assert_eq!(win_graceful[2], "-Command");
-        assert!(win_graceful[3].contains("Get-CimInstance Win32_Process"));
-        assert!(win_graceful[3].contains("Codex.exe"));
-        assert!(win_graceful[3].contains("Stop-Process"));
-        assert!(
-            !win_graceful[3].contains("-Force"),
-            "graceful 不应该有 -Force"
-        );
-
-        let win_force = quit_command("windows", true);
-        assert_eq!(win_force[0], "powershell");
-        assert!(win_force[3].contains("Stop-Process"));
-        assert!(win_force[3].contains("-Force"), "force 必须有 -Force");
+        // Windows 按完整镜像路径验 OpenAI.Codex 包归属后走原生 WM_CLOSE /
+        // TerminateProcess,不再生成依赖 CIM 的静态 PowerShell 命令。
+        assert!(quit_command("windows", false).is_empty());
+        assert!(quit_command("windows", true).is_empty());
 
         assert_eq!(
             quit_command("linux", false),

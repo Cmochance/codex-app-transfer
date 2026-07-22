@@ -98,6 +98,9 @@ windows = { version = "0.62", features = [
     # MOC-94:原生进程枚举(替 spawn tasklist)判断 Codex 是否在运行
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
+    # Windows 26.715+ Codex GUI 改名 ChatGPT.exe:按完整镜像路径确认 OpenAI.Codex
+    # 包归属,并在 WM_CLOSE 超时后原生强制清理已确认归属的进程。
+    "Win32_System_Threading",
     # MOC-95:原生优雅关闭(PostMessage WM_CLOSE)替 PowerShell Get-CimInstance WMI
     "Win32_UI_WindowsAndMessaging",
 ] }
