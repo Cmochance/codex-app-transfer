@@ -468,7 +468,6 @@
   },
   {
     "id": "antigravity-oauth",
-    "gray": true,
     "name": "Antigravity",
     "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
     "baseUrlOptions": [

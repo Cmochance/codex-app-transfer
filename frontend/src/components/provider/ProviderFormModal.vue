@@ -172,6 +172,7 @@ const OAUTH_KIND_BY_AUTH: Record<string, OAuthKind> = {
   grok_build_oauth: 'grokBuild',
 }
 const oauthKind = computed<OAuthKind | null>(() => OAUTH_KIND_BY_AUTH[form.authScheme] ?? null)
+const isAntigravity = computed(() => oauthKind.value === 'antigravity')
 // grok-web 不是 OAuth, 走粘贴 grok.com SSO cookie。
 const isGrokWeb = computed(
   () => form.authScheme === 'grok_cookie' || form.apiFormat === 'grok_web',
@@ -427,6 +428,10 @@ const formatOptions = [
   { value: 'anthropic_messages', label: 'Claude' },
   { value: 'gemini_native', label: 'Gemini' },
 ]
+// Antigravity 复用 Gemini 协议转换,但必须保留独立 apiFormat 才会进入 OAuth/Cloud Code 通道。
+const visibleFormatOptions = computed(() =>
+  isAntigravity.value ? [{ value: 'antigravity_oauth', label: 'Gemini' }] : formatOptions,
+)
 const authOptions = [
   { value: 'bearer', label: 'Bearer' },
   { value: 'x-api-key', label: 'x-api-key' },
@@ -571,7 +576,10 @@ async function save() {
         />
         <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
-      <SettingsRow v-if="oauthKind" :title="t('providerForm.account')">
+      <SettingsRow
+        v-if="oauthKind"
+        :title="isAntigravity ? t('providerForm.apiKey') : t('providerForm.account')"
+      >
         <!-- WorkBuddy / QoderWork:单 provider 账号池(多账号 + 额度守护自动切换),非单账号登录区 -->
         <AccountPoolSection
           v-if="oauthKind === 'workbuddy' || oauthKind === 'qoder'"
@@ -613,7 +621,7 @@ async function save() {
         </div>
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
-        <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
+        <SegmentedControl v-model="form.apiFormat" :options="visibleFormatOptions" />
       </SettingsRow>
       <SettingsRow v-if="isCustomProvider" :title="t('providerForm.authScheme')">
         <SegmentedControl v-model="form.authScheme" :options="authOptions" />
