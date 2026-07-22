@@ -30,13 +30,17 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use windows::core::{BOOL, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -120,20 +124,87 @@ pub fn resolve_codex_aumid() -> Option<String> {
     Some(resolved)
 }
 
+/// Windows 26.715+ 的 Codex Desktop 安装包仍叫 `OpenAI.Codex`,GUI 可执行文件却已从
+/// `Codex.exe` 改名成 `ChatGPT.exe`。不能只按进程名判断:
+/// - 只认 `Codex.exe` 会漏掉新版 GUI,导致「重启 Codex」只激活原窗口;
+/// - 把 `ChatGPT.exe` 全算进去会误杀消费级 ChatGPT;
+/// - 包内 `app\\resources\\codex.exe` 是 CLI,也不能当 GUI 杀掉。
+///
+/// 因此先按新旧进程名枚举候选,再用完整镜像路径确认它直属 WindowsApps 下的
+/// `OpenAI.Codex_*\\app\\{ChatGPT|Codex}.exe`。路径读不到的候选按 Unknown 处理:
+/// 计作「仍在运行」防止叠开实例,但绝不发送关闭/强杀信号。
+const WINDOWS_PROCESS_NAMES: [&str; 2] = ["ChatGPT.exe", "Codex.exe"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsPidClass {
+    Ours,
+    Other,
+    Unknown,
+}
+
+fn is_windows_process_candidate(name: &str) -> bool {
+    WINDOWS_PROCESS_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn classify_windows_process(name: &str, image_path: Option<&str>) -> WindowsPidClass {
+    if !is_windows_process_candidate(name) {
+        return WindowsPidClass::Other;
+    }
+    let Some(image_path) = image_path else {
+        return WindowsPidClass::Unknown;
+    };
+    let path = image_path.replace('/', "\\").to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let expected_suffix = format!("\\app\\{name}");
+    if path.contains("\\windowsapps\\openai.codex_") && path.ends_with(&expected_suffix) {
+        WindowsPidClass::Ours
+    } else {
+        WindowsPidClass::Other
+    }
+}
+
+fn query_process_image_path(pid: u32) -> Option<String> {
+    // PROCESS_QUERY_LIMITED_INFORMATION 足够读镜像路径,不要求管理员权限。
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+    let path = query_process_image_path_from_handle(handle);
+    let _ = unsafe { CloseHandle(handle) };
+    path
+}
+
+fn query_process_image_path_from_handle(handle: HANDLE) -> Option<String> {
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    result.ok()?;
+    String::from_utf16(&buffer[..len as usize]).ok()
+}
+
 /// 用原生 `CreateToolhelp32Snapshot` 进程枚举判断 Codex Desktop 是否在运行
 /// (MOC-94,替代 spawn `tasklist` —— quit 轮询里高频调用,每次 spawn 进程
-/// 在 Windows 上 ~50–200ms)。比较 `Codex.exe`(大小写不敏感)。
+/// 在 Windows 上 ~50–200ms)。
 ///
 /// 返回:
 /// - `Some(true)` / `Some(false)`:确切判定。
 /// - `None`:快照创建失败,无法判定 → caller 应 fallback 到 tasklist。
 pub fn is_codex_running() -> Option<bool> {
-    enum_codex_pids().map(|pids| !pids.is_empty())
+    enum_codex_pid_classes().map(|pids| {
+        pids.iter()
+            .any(|(_, class)| *class != WindowsPidClass::Other)
+    })
 }
 
-/// 原生枚举所有 Codex 进程 PID(MOC-94/95 共用 —— is_codex_running 判存在、
-/// graceful_close_codex 据此匹配窗口)。返回 `None` = 快照创建失败(caller fallback)。
-fn enum_codex_pids() -> Option<Vec<u32>> {
+/// 原生枚举所有新旧名字的候选 PID 并确认包归属。返回 `None` = 快照创建失败
+/// (caller fallback);返回 Some 时 Unknown 会阻止叠开实例,但不会进入信号目标列表。
+fn enum_codex_pid_classes() -> Option<Vec<(u32, WindowsPidClass)>> {
     // SAFETY:Toolhelp32 API 全程在 unsafe 块内按文档用法调用 —— snapshot 句柄
     // 创建成功后保证 CloseHandle;PROCESSENTRY32W 按 dwSize 初始化;遍历到 NULL
     // 终止符截断进程名。所有原始指针来自栈上 entry,无悬垂。
@@ -152,8 +223,12 @@ fn enum_codex_pids() -> Option<Vec<u32>> {
                     .position(|&c| c == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                if name.eq_ignore_ascii_case(WINDOWS_PROCESS_NAME) {
-                    pids.push(entry.th32ProcessID);
+                if is_windows_process_candidate(&name) {
+                    let class = classify_windows_process(
+                        &name,
+                        query_process_image_path(entry.th32ProcessID).as_deref(),
+                    );
+                    pids.push((entry.th32ProcessID, class));
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
@@ -165,17 +240,24 @@ fn enum_codex_pids() -> Option<Vec<u32>> {
     }
 }
 
+fn owned_codex_pids() -> Option<Vec<u32>> {
+    enum_codex_pid_classes().map(|pids| {
+        pids.into_iter()
+            .filter_map(|(pid, class)| (class == WindowsPidClass::Ours).then_some(pid))
+            .collect()
+    })
+}
+
 /// MOC-95:原生优雅关闭 Codex —— 给所有 Codex 进程的顶层窗口 `PostMessage(WM_CLOSE)`。
 ///
-/// 跟 PowerShell `Stop-Process`(非 `-Force`)的 `CloseMainWindow` 是**同一机制**
-/// (都向窗口投 WM_CLOSE),但省掉 PowerShell 进程启动 + `Get-CimInstance` WMI 冷
-/// 初始化的 ~1s 开销(MOC-93 实测大头)。MSIX 允许向窗口投 WM_CLOSE(不像
-/// taskkill/TerminateProcess 那样 access-denied)。
+/// 跟 PowerShell/.NET `Process.CloseMainWindow()` 是**同一机制**(都向窗口投
+/// WM_CLOSE),但省掉 PowerShell 进程启动 + WMI 冷初始化的 ~1s 开销(MOC-93
+/// 实测大头)。MSIX 允许向窗口投 WM_CLOSE。
 ///
 /// 返回 PostMessage 成功的窗口数;`0` = 没找到 Codex 窗口(快照失败 / 进程无可见
-/// 顶层窗口 / 投递失败)→ caller 应 fallback 到 PowerShell graceful 兜底。
+/// 顶层窗口 / 投递失败)→ caller 轮询超时后走路径验明归属的强制退出兜底。
 pub fn graceful_close_codex() -> usize {
-    let pids = match enum_codex_pids() {
+    let pids = match owned_codex_pids() {
         Some(p) if !p.is_empty() => p,
         _ => return 0,
     };
@@ -189,6 +271,38 @@ pub fn graceful_close_codex() -> usize {
         let _ = EnumWindows(Some(enum_close_proc), LPARAM(&mut ctx as *mut _ as isize));
     }
     ctx.posted
+}
+
+/// WM_CLOSE 超时后的强制兜底。PID 枚举时验一次归属,打开终止句柄后再用**同一句柄**
+/// 验一次完整镜像路径,消除进程退出后 PID 被复用的极端竞态;不会波及消费级 ChatGPT
+/// 或 Codex 包内 CLI。返回成功发出 TerminateProcess 的进程数。
+pub fn force_terminate_codex() -> usize {
+    let Some(pids) = owned_codex_pids() else {
+        return 0;
+    };
+    pids.into_iter()
+        .filter(|pid| {
+            let Ok(handle) = (unsafe {
+                OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    false,
+                    *pid,
+                )
+            }) else {
+                return false;
+            };
+            let still_ours = query_process_image_path_from_handle(handle)
+                .as_deref()
+                .map(|path| {
+                    let name = path.rsplit('\\').next().unwrap_or(path);
+                    classify_windows_process(name, Some(path)) == WindowsPidClass::Ours
+                })
+                .unwrap_or(false);
+            let result = still_ours && unsafe { TerminateProcess(handle, 1) }.is_ok();
+            let _ = unsafe { CloseHandle(handle) };
+            result
+        })
+        .count()
 }
 
 struct CloseCtx<'a> {
@@ -209,9 +323,6 @@ unsafe extern "system" fn enum_close_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
     BOOL(1)
 }
-
-/// Codex Desktop 的 Windows 进程名(与 `process.rs::WINDOWS_PROCESS_NAME` 一致)。
-const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
 
 /// 用 PowerShell `Get-AppxPackage -Name "OpenAI.Codex"` 反推 Codex Desktop
 /// 的 AUMID。
@@ -354,6 +465,54 @@ fn escape_cmdline(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_classifier_accepts_new_and_legacy_codex_gui() {
+        assert_eq!(
+            classify_windows_process(
+                "ChatGPT.exe",
+                Some(
+                    r"C:\Program Files\WindowsApps\OpenAI.Codex_26.715.9757.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+                )
+            ),
+            WindowsPidClass::Ours
+        );
+        assert_eq!(
+            classify_windows_process(
+                "Codex.exe",
+                Some(
+                    r"C:\Program Files\WindowsApps\OpenAI.Codex_26.623.1014.0_x64__2p2nqsd0c76g0\app\Codex.exe"
+                )
+            ),
+            WindowsPidClass::Ours
+        );
+    }
+
+    #[test]
+    fn process_classifier_rejects_cli_and_consumer_chatgpt() {
+        assert_eq!(
+            classify_windows_process(
+                "codex.exe",
+                Some(
+                    r"C:\Program Files\WindowsApps\OpenAI.Codex_26.715.9757.0_x64__2p2nqsd0c76g0\app\resources\codex.exe"
+                )
+            ),
+            WindowsPidClass::Other
+        );
+        assert_eq!(
+            classify_windows_process(
+                "ChatGPT.exe",
+                Some(
+                    r"C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__abc\app\ChatGPT.exe"
+                )
+            ),
+            WindowsPidClass::Other
+        );
+        assert_eq!(
+            classify_windows_process("ChatGPT.exe", None),
+            WindowsPidClass::Unknown
+        );
+    }
 
     #[test]
     fn escape_cmdline_simple_arg_returns_as_is() {

@@ -156,7 +156,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 1. 启动 Codex App Transfer,弹出桌面窗口
 2. 在仪表盘点右上角加号 → 选择 preset 或自定义供应商,填入 API Base URL、API Key、获取模型、添加模型映射
 3. 点击页面底部的 应用 按钮即可写入配置（toast 提示已同步;如果已配置好提供商，直接点击主页面提供商卡片上的 应用 按钮即可）
-4. 让 Codex Desktop 生效:点击右上角 ↻ **重启 Codex** 按钮(#281 起从强制 modal 解耦,避免误触杀进程丢上下文)
+4. 让 Codex Desktop 生效:点击右上角 ↻ **重启 Codex** 按钮(#281 起从强制 modal 解耦,避免误触杀进程丢上下文)。Windows 26.715+ 即使 GUI 已改名为 `ChatGPT.exe`,仍按 `OpenAI.Codex` 包路径确认归属后安全重启,不会误杀消费级 ChatGPT 或包内 `codex.exe` CLI
 
 ## 供应商兼容矩阵
 
