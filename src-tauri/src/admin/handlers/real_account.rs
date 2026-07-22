@@ -7,6 +7,7 @@
 //! - POST /api/desktop/real-account/pin-current   → 持久保留当前真实账号(登录成功后前端自动调)
 
 use axum::{
+    extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -74,14 +75,33 @@ pub async fn pin_current_handler() -> impl IntoResponse {
     // flag:**只在 provider 支持 relay**(有 active provider + 走 proxy)时开;direct(不代理)**或无
     // provider**(默认 activeProvider null,没法 apply relay)→ 只 save 镜像不开 mode,避免「flag on 但
     // 无法 relay、plugins locked」。同 startup reconcile 的收敛,纠正 runtime 切走后 flag 残留。
-    let supports_relay =
-        crate::admin::services::desktop::snapshot::active_provider_supports_relay();
+    let supports_relay = crate::admin::services::desktop::snapshot::provider_routing_is_active()
+        && crate::admin::services::desktop::snapshot::active_provider_supports_relay();
     let _ = super::settings::set_real_account_mode_enabled(supports_relay);
     // [MOC-178 codex P2] 返回 enabled = 是否真开了 relay(supports_relay)。前端 auto-pin 据它决定
     // 是否清 force CDP 档 —— direct/无 provider 下 pin 只 save 镜像、relay 没开,force 可能是唯一
     // unlock path,不能因 pin succeed 就清。
     Json(json!({ "success": true, "enabled": supports_relay, "message": "已钉住当前真实账号(持久保留)" }))
         .into_response()
+}
+
+/// POST /api/desktop/real-account/activate-official
+///
+/// 还原 Transfer 管理的第三方配置并激活保留的官方账号。路由模式在全部文件操作
+/// 成功后才落盘；失败时服务层会尽力回到切换前的第三方 Provider。
+pub async fn activate_official_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    match crate::admin::services::desktop::snapshot::switch_to_official_mode(&state).await {
+        Ok(result) => Json(result).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "needsLogin": !codex_real_account::real_account_usable(),
+                "message": message,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::real_account::routes())` 挂载。
@@ -96,5 +116,9 @@ pub fn routes() -> Router<AdminState> {
         .route(
             "/api/desktop/real-account/pin-current",
             post(pin_current_handler),
+        )
+        .route(
+            "/api/desktop/real-account/activate-official",
+            post(activate_official_handler),
         )
 }

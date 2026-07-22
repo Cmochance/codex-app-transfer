@@ -22,6 +22,7 @@ pub fn load() -> Result<RawConfig, String> {
                 "adminPort": 18081,
                 "autoStart": false,
                 "autoApplyOnStart": true,
+                "codexRoutingMode": "official",
                 "exposeAllProviderModels": false,
                 "restoreCodexOnExit": true,
                 "mcpCredentialsPortableStore": true,

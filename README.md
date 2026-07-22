@@ -91,6 +91,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 ## 能做什么
 
+- **官方优先、第三方共存**:提供商页顶部固定显示「Codex 官方」入口,新配置默认官方直连；官方账号未登录时可直接调起 `codex login`,登录成功自动启用。点击任一第三方 Provider 即切到 proxy,官方 ChatGPT 凭据会被保留；额度不足时可手动切第三方,之后一键切回官方且无需重复登录。旧版本已有活动 Provider 的配置升级后继续沿用当前第三方,避免静默改路由。本功能不做自动额度探测/自动故障转移,切换时机由用户决定。
 - 管理多套供应商,按 OpenAI 模型名(`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`)映射到供应商真实模型 ID
 - 把 Codex APP 的 Responses API 流式 / 非流式请求转换为上游协议:Chat Completions、Gemini Native(`:streamGenerateContent`)、Gemini CLI OAuth(Cloud Code Assist)、Anthropic Messages(`/v1/messages`)、Grok Web(`/rest/app-chat/conversations/new`)、Responses 透传等
 - 多轮工具对话上下文 + `previous_response_id` 历史回放 + autocompact 展开 + thinking / reasoning_content 注入全部对齐 OpenAI Responses API 协议;remote compact 新旧协议双轨支持:旧版 `/responses/compact` 端点 + 新版 remote compaction v2(普通流式 `/responses` 带 `compaction_trigger` 标记,响应回单个 compaction item 的 SSE 流)——新版 Codex 触发自动压缩时此前会报 `expected exactly one compaction output item` 已修(MOC-198)

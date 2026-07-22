@@ -2,9 +2,11 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { Provider } from '@/api/types'
 import * as providersApi from '@/api/providers'
+import type { CodexRoutingMode } from '@/api/providers'
 
 export const useProvidersStore = defineStore('providers', () => {
   const list = ref<Provider[]>([])
+  const routingMode = ref<CodexRoutingMode>('official')
   const loading = ref(false)
   const error = ref('')
 
@@ -12,7 +14,9 @@ export const useProvidersStore = defineStore('providers', () => {
     loading.value = true
     error.value = ''
     try {
-      list.value = await providersApi.getProviders()
+      const result = await providersApi.getProviders()
+      list.value = result.providers
+      routingMode.value = result.routingMode
     } catch (e) {
       error.value = (e as Error).message || '加载失败'
     } finally {
@@ -22,6 +26,11 @@ export const useProvidersStore = defineStore('providers', () => {
 
   async function setDefault(id: string) {
     await providersApi.setDefaultProvider(id)
+    await load()
+  }
+
+  async function activateOfficial() {
+    await providersApi.activateOfficialCodex()
     await load()
   }
 
@@ -41,5 +50,5 @@ export const useProvidersStore = defineStore('providers', () => {
     }
   }
 
-  return { list, loading, error, load, setDefault, remove, reorder }
+  return { list, routingMode, loading, error, load, setDefault, activateOfficial, remove, reorder }
 })
