@@ -20,6 +20,78 @@ use crate::admin::registry_io::{load as load_registry, with_config_write, Config
 use crate::admin::state::AdminState;
 use crate::proxy_runner::ProxyManager;
 
+pub const CODEX_ROUTING_MODE_SETTING: &str = "codexRoutingMode";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexRoutingMode {
+    Official,
+    Provider,
+}
+
+impl CodexRoutingMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Official => "official",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// 当前 Codex 模型请求走向。新配置会显式写 `official`；升级自旧版本且已有活动
+/// provider 的配置缺键时沿用第三方，避免升级后停掉 proxy 却留下已应用的第三方配置。
+/// `activeProvider` 只记住上次选中的第三方，不代表它当前正在生效。
+pub fn codex_routing_mode(cfg: &RawConfig) -> CodexRoutingMode {
+    match cfg
+        .get("settings")
+        .and_then(|s| s.get(CODEX_ROUTING_MODE_SETTING))
+        .and_then(Value::as_str)
+    {
+        Some("provider") => CodexRoutingMode::Provider,
+        Some("official") => CodexRoutingMode::Official,
+        _ if cfg.get("activeProvider").and_then(Value::as_str).is_some() => {
+            CodexRoutingMode::Provider
+        }
+        _ => CodexRoutingMode::Official,
+    }
+}
+
+pub fn provider_routing_is_active() -> bool {
+    load_registry()
+        .map(|cfg| codex_routing_mode(&cfg) == CodexRoutingMode::Provider)
+        .unwrap_or(false)
+}
+
+fn set_codex_routing_mode_in_config(cfg: &mut RawConfig, mode: CodexRoutingMode) -> bool {
+    let obj = cfg
+        .as_object_mut()
+        .expect("registry config must be an object");
+    let settings = obj
+        .entry("settings")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !settings.is_object() {
+        *settings = Value::Object(serde_json::Map::new());
+    }
+    let settings = settings
+        .as_object_mut()
+        .expect("settings was normalized to an object");
+    let next = Value::String(mode.as_str().to_owned());
+    if settings.get(CODEX_ROUTING_MODE_SETTING) == Some(&next) {
+        return false;
+    }
+    settings.insert(CODEX_ROUTING_MODE_SETTING.to_owned(), next);
+    true
+}
+
+fn persist_codex_routing_mode(mode: CodexRoutingMode) -> Result<(), String> {
+    with_config_write(|cfg| {
+        Ok(if set_codex_routing_mode_in_config(cfg, mode) {
+            ConfigMutation::Modified(())
+        } else {
+            ConfigMutation::Unchanged(())
+        })
+    })
+}
+
 pub struct DesktopConfigTarget {
     pub base_url: String,
     pub api_key: String,
@@ -286,6 +358,20 @@ fn apply_desktop_target_impl(
 }
 
 pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": false, "success": false, "message": e});
+        }
+    };
+    if codex_routing_mode(&cfg) == CodexRoutingMode::Official {
+        return json!({
+            "attempted": false,
+            "success": true,
+            "routingMode": CodexRoutingMode::Official.as_str(),
+            "message": "official routing mode; provider sync skipped",
+        });
+    }
     let result = sync_desktop_for_active_provider_impl(state, false).await;
     // [MOC-257 review] OFF 不变量维护:apply_provider 会重建一份 apikey auth.json,撤销 OFF 的「无
     // auth.json」。任何 sync 路径(重启 Codex / 切 provider)apply 之后,若**持久模式仍是 off** 则
@@ -548,7 +634,11 @@ async fn ensure_relay_applied(state: &AdminState) -> Result<(), String> {
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if ok && crate::codex_real_account::active_is_real_chatgpt_now() {
+    let attempted = synced
+        .get("attempted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if ok && attempted && crate::codex_real_account::active_is_real_chatgpt_now() {
         Ok(())
     } else {
         Err("apply relay 未生效(系统代理未起 / 无可用 provider?),请检查后重试".to_owned())
@@ -658,6 +748,49 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
             return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": format!("failed: {e}")})
         }
     };
+    if codex_routing_mode(&cfg) == CodexRoutingMode::Official {
+        let paths = match CodexPaths::from_home_env() {
+            Ok(paths) => paths,
+            Err(e) => {
+                return json!({
+                    "applied": false,
+                    "success": false,
+                    "routingMode": CodexRoutingMode::Official.as_str(),
+                    "message": format!("解析 Codex home 失败: {e}"),
+                });
+            }
+        };
+        let restored = if has_snapshot(&paths) || has_stale_active_snapshot(&paths) {
+            match restore_codex_state(&paths) {
+                Ok(restored) => restored,
+                Err(e) => {
+                    return json!({
+                        "applied": false,
+                        "success": false,
+                        "routingMode": CodexRoutingMode::Official.as_str(),
+                        "message": format!("官方模式启动自愈失败: {e}"),
+                    });
+                }
+            }
+        } else {
+            false
+        };
+        proxy_manager.stop_silent();
+        crate::codex_real_account::reset_applied_mode();
+        codex_app_transfer_proxy::set_fake_account_mode(false);
+        if let Err(e) = crate::admin::services::superpowers::uninstall() {
+            tracing::warn!("官方模式启动卸载受管 superpowers 失败: {e}");
+        }
+        return json!({
+            "applied": false,
+            "success": true,
+            "requiresProxy": false,
+            "proxyStarted": false,
+            "routingMode": CodexRoutingMode::Official.as_str(),
+            "restored": restored,
+            "message": "official routing mode; provider auto-apply skipped",
+        });
+    }
     if !read_setting_bool(&cfg, "autoApplyOnStart", true) {
         // [MOC-257 review] autoApplyOnStart=false 跳过 apply,但若盘上是**保留的 relay 态**(restoreCodexOnExit=
         // false 把 auth + config.toml 的 chatgpt_base_url/openai_base_url→本地 proxy 留下、上次退出停了 proxy),
@@ -767,10 +900,112 @@ pub fn restore_codex_if_enabled(reason: &str) -> Value {
     }
 }
 
+async fn rollback_official_switch_to_provider(
+    state: &AdminState,
+    previous_mode: CodexRoutingMode,
+    message: String,
+) -> String {
+    if previous_mode != CodexRoutingMode::Provider {
+        return message;
+    }
+    let rollback = sync_desktop_for_active_provider_impl(state, false).await;
+    if rollback.get("success").and_then(Value::as_bool) == Some(true) {
+        format!("{message}; 已回退到切换前的第三方 Provider")
+    } else {
+        let detail = rollback
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown rollback error");
+        format!("{message}; 且第三方 Provider 回退失败: {detail}")
+    }
+}
+
+fn rollback_failed_provider_switch_to_official(state: &AdminState) -> Result<(), String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 Codex home 失败: {e}"))?;
+    if has_snapshot(&paths) || has_stale_active_snapshot(&paths) {
+        restore_codex_state(&paths).map_err(|e| format!("还原官方配置失败: {e}"))?;
+    }
+    persist_codex_routing_mode(CodexRoutingMode::Official)?;
+    state.proxy_manager.stop_silent();
+    crate::codex_real_account::reset_applied_mode();
+    codex_app_transfer_proxy::set_fake_account_mode(false);
+    Ok(())
+}
+
+/// 显式切回官方 Codex：还原 Transfer 管理的 config/auth 字段、恢复并激活真实
+/// ChatGPT 账号，最后才持久化路由模式。官方凭据镜像保留，之后切第三方无需重登。
+pub async fn switch_to_official_mode(state: &AdminState) -> Result<Value, String> {
+    if !crate::codex_real_account::real_account_usable() {
+        return Err("未检测到可用的 ChatGPT 官方账号;请先完成官方登录".to_owned());
+    }
+
+    // 用户可能刚在第三方模式下完成 `codex login`。先把这份最新活动凭据钉到镜像，
+    // 再还原 provider 前快照，避免快照中的旧 auth.json 把新登录覆盖掉。
+    if crate::codex_real_account::active_is_real_chatgpt_now() {
+        crate::codex_real_account::pin_current_account()
+            .await
+            .map_err(|e| format!("保存刚登录的官方账号失败: {e}"))?;
+    }
+
+    let previous_mode = load_registry()
+        .map(|cfg| codex_routing_mode(&cfg))
+        .map_err(|e| format!("读取当前路由模式失败: {e}"))?;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 Codex home 失败: {e}"))?;
+    let restored = if has_snapshot(&paths) || has_stale_active_snapshot(&paths) {
+        restore_codex_state(&paths).map_err(|e| format!("还原 Codex 官方配置失败: {e}"))?
+    } else {
+        false
+    };
+
+    if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
+        let message = format!("还原官方账号失败: {e}");
+        return Err(rollback_official_switch_to_provider(state, previous_mode, message).await);
+    }
+    match crate::codex_real_account::activate_real_account().await {
+        Ok(true) => {}
+        Ok(false) => {
+            let message = "官方账号已不存在或已失效;请重新登录".to_owned();
+            return Err(rollback_official_switch_to_provider(state, previous_mode, message).await);
+        }
+        Err(e) => {
+            let message = format!("激活官方账号失败: {e}");
+            return Err(rollback_official_switch_to_provider(state, previous_mode, message).await);
+        }
+    }
+
+    if let Err(e) = persist_codex_routing_mode(CodexRoutingMode::Official) {
+        let message = format!("保存官方路由模式失败: {e}");
+        return Err(rollback_official_switch_to_provider(state, previous_mode, message).await);
+    }
+
+    state.proxy_manager.stop_silent();
+    crate::codex_real_account::reset_applied_mode();
+    codex_app_transfer_proxy::set_fake_account_mode(false);
+    if let Err(e) = crate::admin::services::superpowers::uninstall() {
+        tracing::warn!("切回官方 Codex 后卸载受管 superpowers 失败: {e}");
+    }
+
+    Ok(json!({
+        "success": true,
+        "routingMode": CodexRoutingMode::Official.as_str(),
+        "restored": restored,
+        "loggedIn": true,
+    }))
+}
+
 pub async fn switch_provider_and_sync(
     proxy_manager: Arc<ProxyManager>,
     provider_id: String,
 ) -> Value {
+    let previous_cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => return json!({"success": false, "message": e}),
+    };
+    let previous_mode = codex_routing_mode(&previous_cfg);
+    let previous_provider = previous_cfg
+        .get("activeProvider")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let result = with_config_write(|cfg| {
         if provider_index(cfg, &provider_id).is_none() {
             return Err("provider not found".into());
@@ -788,13 +1023,95 @@ pub async fn switch_provider_and_sync(
         proxy_manager,
         trace_viewer_manager: Arc::new(crate::trace_viewer::TraceViewerManager::new()),
     };
-    let desktop_sync = sync_desktop_for_active_provider(&state).await;
+    // 路由模式最后再提交；否则 apply 失败时 UI 会显示第三方已启用，而 Codex 仍处于半应用状态。
+    let desktop_sync = sync_desktop_for_active_provider_impl(&state, false).await;
+    if desktop_sync.get("success").and_then(Value::as_bool) != Some(true) {
+        let _ = with_config_write(|cfg| {
+            let obj = cfg
+                .as_object_mut()
+                .expect("registry config must be an object");
+            match previous_provider.as_deref() {
+                Some(id) => {
+                    obj.insert("activeProvider".into(), Value::String(id.to_owned()));
+                }
+                None => {
+                    obj.insert("activeProvider".into(), Value::Null);
+                }
+            }
+            set_codex_routing_mode_in_config(cfg, previous_mode);
+            Ok(ConfigMutation::Modified(()))
+        });
+        let rollback = if previous_mode == CodexRoutingMode::Official {
+            rollback_failed_provider_switch_to_official(&state)
+        } else {
+            sync_desktop_for_active_provider_impl(&state, false)
+                .await
+                .get("success")
+                .and_then(Value::as_bool)
+                .filter(|ok| *ok)
+                .map(|_| ())
+                .ok_or_else(|| "重新应用原第三方 Provider 失败".to_owned())
+        };
+        let message = desktop_sync
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("desktop sync failed");
+        return json!({
+            "success": false,
+            "message": if let Err(rollback_error) = rollback {
+                format!("{message}; 回滚失败: {rollback_error}")
+            } else {
+                message.to_owned()
+            },
+            "desktopSync": desktop_sync,
+        });
+    }
+    if let Err(e) = persist_codex_routing_mode(CodexRoutingMode::Provider) {
+        let rollback = if previous_mode == CodexRoutingMode::Official {
+            rollback_failed_provider_switch_to_official(&state)
+        } else {
+            let restored_registry = with_config_write(|cfg| {
+                let obj = cfg
+                    .as_object_mut()
+                    .expect("registry config must be an object");
+                match previous_provider.as_deref() {
+                    Some(id) => {
+                        obj.insert("activeProvider".into(), Value::String(id.to_owned()));
+                    }
+                    None => {
+                        obj.insert("activeProvider".into(), Value::Null);
+                    }
+                }
+                Ok(ConfigMutation::Modified(()))
+            });
+            match restored_registry {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    let result = sync_desktop_for_active_provider_impl(&state, false).await;
+                    if result.get("success").and_then(Value::as_bool) == Some(true) {
+                        Ok(())
+                    } else {
+                        Err("重新应用原第三方 Provider 失败".to_owned())
+                    }
+                }
+            }
+        };
+        return json!({
+            "success": false,
+            "message": if let Err(rollback_error) = rollback {
+                format!("保存第三方路由模式失败: {e}; 回滚失败: {rollback_error}")
+            } else {
+                format!("保存第三方路由模式失败: {e}")
+            },
+        });
+    }
     // MOC-62:切换后做一次 MCP 凭据镜像同步(镜像跟随 live 捕获新授权 + 传播登出删除,
     // 绝不写 live;只动两个凭据文件,不碰 config.toml)。
     mcp_credentials_capture_after_switch();
     json!({
         "success": true,
         "message": "default provider updated",
+        "routingMode": CodexRoutingMode::Provider.as_str(),
         "desktopSync": desktop_sync,
     })
 }
@@ -924,11 +1241,39 @@ mod tests {
                 "adminPort": 18081,
                 "autoStart": false,
                 "autoApplyOnStart": true,
+                "codexRoutingMode": "provider",
                 "exposeAllProviderModels": false,
                 "restoreCodexOnExit": true,
                 "updateUrl": DEFAULT_UPDATE_URL
             }
         })
+    }
+
+    #[test]
+    fn routing_mode_defaults_safely_for_new_and_legacy_configs() {
+        let new_config = json!({
+            "activeProvider": null,
+            "settings": {"codexRoutingMode": "official"}
+        });
+        assert_eq!(codex_routing_mode(&new_config), CodexRoutingMode::Official);
+
+        let legacy_with_provider = json!({
+            "activeProvider": "p1",
+            "settings": {}
+        });
+        assert_eq!(
+            codex_routing_mode(&legacy_with_provider),
+            CodexRoutingMode::Provider
+        );
+
+        let explicit_official_with_remembered_provider = json!({
+            "activeProvider": "p1",
+            "settings": {"codexRoutingMode": "official"}
+        });
+        assert_eq!(
+            codex_routing_mode(&explicit_official_with_remembered_provider),
+            CodexRoutingMode::Official
+        );
     }
 
     fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: Value) {
@@ -1317,6 +1662,82 @@ mod tests {
     }
 
     #[test]
+    fn startup_official_mode_never_applies_provider_or_starts_proxy() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["settings"][CODEX_ROUTING_MODE_SETTING] = json!("official");
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                let config_toml = codex_dir.join("config.toml");
+                fs::write(&config_toml, "approval_policy = \"on-request\"\n").unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(false));
+                assert_eq!(result["routingMode"], json!("official"));
+                assert!(!manager.status().running);
+                let restored_config = fs::read_to_string(&config_toml).unwrap();
+                assert_eq!(
+                    restored_config.trim_start(),
+                    "approval_policy = \"on-request\"\n"
+                );
+                assert!(!restored_config.contains("openai_base_url"));
+                assert!(!has_snapshot(&CodexPaths::from_home_env().unwrap()));
+            });
+        });
+    }
+
+    #[test]
+    fn startup_official_mode_recovers_interrupted_provider_switch() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["settings"]["proxyPort"] = json!(0);
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                let config_toml = codex_dir.join("config.toml");
+                fs::write(&config_toml, "approval_policy = \"on-request\"\n").unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let applied = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(applied["applied"], json!(true));
+                assert!(has_snapshot(&CodexPaths::from_home_env().unwrap()));
+
+                let mut interrupted = load_registry().unwrap();
+                interrupted["settings"][CODEX_ROUTING_MODE_SETTING] = json!("official");
+                save_registry(&interrupted).unwrap();
+
+                let recovered = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(recovered["success"], json!(true));
+                assert_eq!(recovered["restored"], json!(true));
+                assert!(!manager.status().running);
+                let restored_config = fs::read_to_string(&config_toml).unwrap();
+                assert_eq!(
+                    restored_config.trim_start(),
+                    "approval_policy = \"on-request\"\n"
+                );
+                assert!(!restored_config.contains("openai_base_url"));
+                assert!(!has_snapshot(&CodexPaths::from_home_env().unwrap()));
+            });
+        });
+    }
+
+    #[test]
     fn provider_switch_syncs_responses_via_local_proxy() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1326,6 +1747,7 @@ mod tests {
         with_isolated_home(|home| {
             runtime.block_on(async {
                 let mut cfg = config_with_secret();
+                cfg["settings"][CODEX_ROUTING_MODE_SETTING] = json!("official");
                 cfg["settings"]["proxyPort"] = json!(0);
                 cfg["providers"] = json!([
                     cfg["providers"][0].clone(),
@@ -1350,6 +1772,10 @@ mod tests {
                 // 上游 apiKey 不写进 auth.json(由代理按 provider 注入)。
                 assert_eq!(result["success"], json!(true));
                 assert_eq!(result["desktopSync"]["success"], json!(true));
+                assert_eq!(
+                    codex_routing_mode(&load_registry().unwrap()),
+                    CodexRoutingMode::Provider
+                );
                 assert_eq!(result["desktopSync"]["mode"], json!("local_proxy"));
                 assert_eq!(result["desktopSync"]["requiresProxy"], json!(true));
                 assert!(

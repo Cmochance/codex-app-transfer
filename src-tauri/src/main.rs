@@ -313,6 +313,7 @@ fn main() {
             // 开伪造,旧 / 残留 Codex config 指向本 proxy 的 /backend-api 会被伪造(尽管解锁档没真应用)。
             let will_apply_synthetic = crate::codex_real_account::resolve_plugin_unlock_mode()
                 == crate::codex_real_account::PluginUnlockMode::Synthetic
+                && admin::services::desktop::snapshot::provider_routing_is_active()
                 && handlers::settings::load_registry_for_startup_language_sync()
                     .ok()
                     .and_then(|cfg| {
@@ -327,7 +328,9 @@ fn main() {
             // 也要保持伪造开,否则 /backend-api 经现存 relay 透传假 token 撞 401。非合成态(active 不是合成
             // 且不 apply synthetic)则关,避免残留 config 误伪造。
             codex_app_transfer_proxy::set_fake_account_mode(
-                will_apply_synthetic || crate::codex_real_account::active_is_synthetic(),
+                admin::services::desktop::snapshot::provider_routing_is_active()
+                    && (will_apply_synthetic
+                        || crate::codex_real_account::active_is_synthetic()),
             );
 
             // #MOC-54:保留 JoinHandle,让下面的残留扫描能 await auto_apply
@@ -463,12 +466,18 @@ fn main() {
                                 .and_then(|v| v.as_bool())
                         })
                         .unwrap_or(true);
+                    let provider_routing =
+                        admin::services::desktop::snapshot::provider_routing_is_active();
                     // synthetic/real 需 relay(chatgpt_base_url→proxy)才自洽;无 active provider 时 relay
                     // 起不来,若仍写合成/真 auth.json,Codex 会直连 chatgpt.com(合成 token 全 401、真账号也
                     // 绕过 proxy)。无 provider → 跳过 apply(对齐 set 端点 provider gate)。
                     let relay_ok =
                         admin::services::desktop::snapshot::active_provider_supports_relay();
-                    if !auto_apply_on {
+                    if !provider_routing {
+                        tracing::info!(
+                            "[PluginUnlock] 启动跳过 unlock apply:当前使用官方 Codex"
+                        );
+                    } else if !auto_apply_on {
                         tracing::info!(
                             "[PluginUnlock] 启动跳过 unlock apply:autoApplyOnStart=false(尊重「启动不自动应用」)"
                         );
@@ -576,10 +585,10 @@ fn main() {
             // 不会与托盘菜单正在呈现重叠),避开 Windows 呈现中热替换雷区(见上 on_tray_icon_event 注释)。
             let watch_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let mut last = current_active_provider();
+                let mut last = current_active_route();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                    let cur = current_active_provider();
+                    let cur = current_active_route();
                     if cur != last {
                         last = cur;
                         refresh_tray_menu(&watch_handle);
@@ -865,14 +874,16 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 .inner()
                 .clone();
             tauri::async_runtime::spawn(async move {
-                let _ =
+                let switched =
                     handlers::desktop::switch_provider_and_sync(proxy_manager.clone(), provider_id)
                         .await;
                 // [MOC-257 review] 托盘切 provider 走 switch_provider_and_sync 直调(绕过 set_default/
                 // add_provider handler 的 re-apply)→ 这里补上:切 provider 后 relay 可用,重 apply 当前
                 // 生效三态(非 off),否则无 provider 时启动跳过的 synthetic/real unlock 仍不生效。
                 let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
-                if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
+                if switched.get("success").and_then(|v| v.as_bool()) == Some(true)
+                    && !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off)
+                {
                     let st = AdminState {
                         proxy_manager,
                         trace_viewer_manager,
@@ -885,6 +896,14 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
                             "[PluginUnlock] 托盘切 provider 后 apply {mode:?} 失败: {e}"
                         );
                     }
+                } else if switched.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                    tracing::warn!(
+                        "[tray] 切换 provider 失败: {}",
+                        switched
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error")
+                    );
                 }
                 refresh_tray_menu(&app_handle);
             });
@@ -998,12 +1017,21 @@ fn refresh_tray_menu(app: &AppHandle) {
     }
 }
 
-/// [MOC-271] 读当前活动 provider id(`activeProvider`),供 tray watcher 检测变化用。
-fn current_active_provider() -> Option<String> {
-    admin::registry_io::load().ok().and_then(|cfg| {
-        cfg.get("activeProvider")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
+/// [MOC-271] 读当前实际路由，供 tray watcher 同时检测官方/第三方切换与 provider 变化。
+fn current_active_route() -> Option<String> {
+    admin::registry_io::load().ok().map(|cfg| {
+        if admin::services::desktop::snapshot::codex_routing_mode(&cfg)
+            == admin::services::desktop::snapshot::CodexRoutingMode::Official
+        {
+            "official".to_owned()
+        } else {
+            format!(
+                "provider:{}",
+                cfg.get("activeProvider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            )
+        }
     })
 }
 
@@ -1017,7 +1045,13 @@ fn tray_provider_entries() -> Vec<TrayProviderEntry> {
     let Ok(cfg) = admin::registry_io::load() else {
         return Vec::new();
     };
-    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let active_id = if admin::services::desktop::snapshot::codex_routing_mode(&cfg)
+        == admin::services::desktop::snapshot::CodexRoutingMode::Provider
+    {
+        cfg.get("activeProvider").and_then(|v| v.as_str())
+    } else {
+        None
+    };
     cfg.get("providers")
         .and_then(|v| v.as_array())
         .map(|providers| {

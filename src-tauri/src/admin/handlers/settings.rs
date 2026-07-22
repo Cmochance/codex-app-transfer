@@ -55,6 +55,7 @@ pub(super) fn default_config_value() -> Value {
             "adminPort": 18081,
            "autoStart": false,
            "autoApplyOnStart": true,
+           "codexRoutingMode": "official",
            "exposeAllProviderModels": false,
            "showGrayProviders": false,
            "restoreCodexOnExit": true,
@@ -230,6 +231,15 @@ pub(super) fn normalize_imported_config(data: &Value) -> Result<Value, String> {
             .cloned()
             .unwrap_or(Value::Null)
     };
+    // 旧备份没有路由键时沿用其活动 provider；新配置的默认 official 只用于真正的新建，
+    // 避免导入旧备份后静默停止第三方代理。
+    let imported_has_routing_mode = source_obj
+        .get("settings")
+        .and_then(|v| v.get("codexRoutingMode"))
+        .is_some();
+    if !imported_has_routing_mode && normalized["activeProvider"].is_string() {
+        normalized["settings"]["codexRoutingMode"] = Value::String("provider".to_owned());
+    }
     if let Some(key) = source_obj.get("gatewayApiKey").filter(|v| !v.is_null()) {
         normalized["gatewayApiKey"] = key.clone();
     }
@@ -699,6 +709,20 @@ mod tests {
                 "updateUrl": DEFAULT_UPDATE_URL
             }
         })
+    }
+
+    #[test]
+    fn imported_routing_mode_preserves_legacy_provider_and_explicit_official() {
+        let legacy = normalize_imported_config(&config_with_secret()).unwrap();
+        assert_eq!(legacy["settings"]["codexRoutingMode"], json!("provider"));
+
+        let mut explicit_official = config_with_secret();
+        explicit_official["settings"]["codexRoutingMode"] = json!("official");
+        let normalized = normalize_imported_config(&explicit_official).unwrap();
+        assert_eq!(
+            normalized["settings"]["codexRoutingMode"],
+            json!("official")
+        );
     }
 
     #[test]

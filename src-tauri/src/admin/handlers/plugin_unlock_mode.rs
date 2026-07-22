@@ -67,8 +67,10 @@ pub async fn set_handler(
             .into_response();
         }
     };
+    let provider_routing = crate::admin::services::desktop::snapshot::provider_routing_is_active();
     // synthetic / real 需要有 active provider 才能把 chatgpt_base_url 引到 proxy(否则 relay 起不来)。
-    if matches!(mode, PluginUnlockMode::Synthetic | PluginUnlockMode::Real)
+    if provider_routing
+        && matches!(mode, PluginUnlockMode::Synthetic | PluginUnlockMode::Real)
         && !crate::admin::services::desktop::snapshot::active_provider_supports_relay()
     {
         return err(
@@ -100,6 +102,21 @@ pub async fn set_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             "写入插件解锁模式失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned(),
         )
+        .into_response();
+    }
+    // 官方路由下只记录第三方模式偏好，等用户下一次启用 Provider 时再应用。这里尤其不能
+    // 执行 off（会清掉官方 auth.json）或 synthetic/real（会把官方请求重新指回 proxy）。
+    if !provider_routing {
+        return Json(json!({
+            "success": true,
+            "mode": req.mode,
+            "effective": null,
+            "deferred": true,
+            "message": "当前使用官方 Codex；插件解锁设置已保存，将在启用第三方 Provider 后生效",
+            "hasRealAccount": codex_real_account::has_real_account(),
+            "realAccountUsable": codex_real_account::real_account_usable(),
+            "activeIsSynthetic": codex_real_account::active_is_synthetic(),
+        }))
         .into_response();
     }
     // effective 直接由请求模式 + 账号可用性算(real 失效 → 降级 synthetic)。

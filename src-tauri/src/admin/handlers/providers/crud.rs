@@ -120,13 +120,19 @@ pub async fn list_providers() -> impl IntoResponse {
         .iter()
         .map(public_provider)
         .collect();
-    let active_id = cfg
-        .get("activeProvider")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
+    let routing_mode = crate::admin::services::desktop::snapshot::codex_routing_mode(&cfg);
+    let active_id =
+        if routing_mode == crate::admin::services::desktop::snapshot::CodexRoutingMode::Provider {
+            cfg.get("activeProvider")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+        } else {
+            None
+        };
     Json(json!({
         "providers": providers,
         "activeId": active_id,
+        "routingMode": routing_mode.as_str(),
     }))
     .into_response()
 }
@@ -338,7 +344,9 @@ pub async fn add_provider(
     // [MOC-257 review] 加的是**首个** provider(自动成 active)→ relay 刚变可用,补 apply 当前生效三态
     // (同 set_default_provider):否则无 provider 时启动跳过的 synthetic/real unlock 永不生效。add 走的
     // 不是 /default 路径,故这里单独补。off 不依赖 provider、无需。idempotent + best-effort。
-    if became_first_active.get() {
+    if became_first_active.get()
+        && crate::admin::services::desktop::snapshot::provider_routing_is_active()
+    {
         let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
         if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
             if let Err(e) =
