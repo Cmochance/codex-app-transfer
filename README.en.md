@@ -74,6 +74,8 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 
 Injects a standalone "Usage" section at the bottom of Codex Desktop's "Toggle pinned summary" popup: 5-hour / weekly / monthly plan quota bars (whitelisted providers: antigravity gemini series + GLM Coding Plan + Xiaomi MiMo Token Plan + **OpenCode Go** + **Kimi Code**), balance / usage numeric entries (DeepSeek / Kimi Moonshot / anyrouter), context usage, real-time token rate + cumulative total, and cache hit rate. The **Context** row expands into a Claude-style by-source breakdown dropdown (classified by what is sent upstream: tool calls & output / reasoning / developer instructions / conversation messages / tool definitions / system prompt), persisted per conversation for instant load. See "What it does" below.
 
+> Codex 26.715 compatibility: the context-ring accessibility label follows the UI language, so the current implementation recognizes English and Simplified Chinese and falls back to the percentage SVG-ring structure. The pinned-summary transition can also keep an off-screen hidden copy alongside the visible copy; the mount logic now selects the on-screen visible container so the complete Usage node cannot land in the hidden copy while the UI shows only Outputs / Sources.
+
 ![Usage panel inside Codex](img/codex-usage-breakdown.jpg)
 
 </details>
@@ -91,6 +93,7 @@ Stash/restore buttons next to the composer + a "Stash" list below the Usage pane
 
 ## What it does
 
+- **Official-first with third-party coexistence**: the Providers page keeps an Official Codex entry at the top, and new configurations default to direct official access. If no official account is present, it launches `codex login` and enables official mode after sign-in. Selecting any third-party provider switches model traffic to the proxy while preserving the ChatGPT credentials; you can switch back to official without signing in again. Existing upgrades with an active provider keep their current third-party route to avoid a silent behavior change. Quota detection and automatic failover are intentionally not performed—the user decides when to switch.
 - Manage multiple providers; map OpenAI model names (`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`) to the provider's real model IDs
 - Translate Codex App's Responses API streaming / non-streaming requests into upstream protocols: Chat Completions, Gemini Native (`:streamGenerateContent`), Gemini CLI OAuth (Cloud Code Assist), Anthropic Messages (`/v1/messages`), Grok Web (`/rest/app-chat/conversations/new`), Responses passthrough, etc.
 - Multi-turn tool conversation context + `previous_response_id` history replay + autocompact expansion + thinking / reasoning_content injection — all aligned with the OpenAI Responses API protocol; remote compact supported on both protocol generations: the legacy `/responses/compact` endpoint plus remote compaction v2 (a regular streaming `/responses` request carrying a `compaction_trigger` marker, answered with an SSE stream containing a single compaction item) — newer Codex builds previously failed autocompact with `expected exactly one compaction output item`, now fixed (MOC-198)
@@ -156,7 +159,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 1. Launch Codex App Transfer; the desktop window opens
 2. On the dashboard, click the top-right "+" → pick a preset or add a custom provider; fill in API Base URL, API Key, then "Fetch models" and add model mappings
 3. Click the **Apply** button at the bottom — config is written and a toast confirms sync (if a provider is already configured, just click **Apply** on its card on the home page)
-4. To make Codex Desktop pick up the new config, click the ↻ **Restart Codex** button at the top-right (decoupled from Apply since #281 to avoid losing in-flight context on misclicks)
+4. To make Codex Desktop pick up the new config, click the ↻ **Restart Codex** button at the top-right (decoupled from Apply since #281 to avoid losing in-flight context on misclicks). On Windows 26.715+, where the GUI executable is now `ChatGPT.exe`, restart still verifies ownership through the `OpenAI.Codex` package path and will not terminate the consumer ChatGPT client or the bundled `codex.exe` CLI
 
 ## Provider compatibility matrix
 

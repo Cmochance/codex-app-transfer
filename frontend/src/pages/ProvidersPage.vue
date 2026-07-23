@@ -1,10 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useProvidersStore } from '@/stores/providers'
 import { t } from '@/i18n'
 import { restartCodexApp } from '@/api/desktop'
+import {
+  cancelRealAccountLogin,
+  getRealAccountStatus,
+  startRealAccountLogin,
+} from '@/api/desktop'
 import { useToast } from '@/composables/useToast'
 import ProviderCard from '@/components/provider/ProviderCard.vue'
+import OfficialCodexCard from '@/components/provider/OfficialCodexCard.vue'
 import ProviderFormModal from '@/components/provider/ProviderFormModal.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import IconPlus from '~icons/lucide/plus'
@@ -14,7 +20,86 @@ const store = useProvidersStore()
 const { show: toast } = useToast()
 const formOpen = ref(false)
 const formEditId = ref<string | null>(null)
-onMounted(() => store.load())
+const officialLoggedIn = ref(false)
+const officialLoginRunning = ref(false)
+const officialBusy = ref(false)
+let officialLoginPoll: number | undefined
+
+async function refreshOfficialStatus() {
+  const status = await getRealAccountStatus()
+  officialLoggedIn.value = status.loggedIn
+  officialLoginRunning.value = status.loginState === 'running'
+  return status
+}
+
+function stopOfficialLoginPoll() {
+  if (officialLoginPoll !== undefined) {
+    window.clearInterval(officialLoginPoll)
+    officialLoginPoll = undefined
+  }
+}
+
+async function activateOfficial() {
+  officialBusy.value = true
+  try {
+    await store.activateOfficial()
+    await refreshOfficialStatus()
+    toast(t('providers.officialSwitchSuccess'))
+  } catch (e) {
+    toast((e as Error).message || t('providers.officialSwitchFailed'), 'error')
+  } finally {
+    officialBusy.value = false
+  }
+}
+
+async function pollOfficialLoginOnce() {
+  try {
+    const status = await refreshOfficialStatus()
+    if (status.loginState === 'succeeded') {
+      stopOfficialLoginPoll()
+      await activateOfficial()
+    } else if (status.loginState === 'failed' || status.loginState === 'cancelled') {
+      stopOfficialLoginPoll()
+      toast(status.loginMessage || t('providers.officialLoginFailed'), 'error')
+    }
+  } catch {
+    // 登录窗口仍可能正常进行；短暂状态读取失败时继续轮询。
+  }
+}
+
+function startOfficialLoginPoll() {
+  stopOfficialLoginPoll()
+  officialLoginPoll = window.setInterval(() => void pollOfficialLoginOnce(), 2000)
+}
+
+async function onOfficialLogin() {
+  officialBusy.value = true
+  try {
+    await startRealAccountLogin()
+    officialLoginRunning.value = true
+    startOfficialLoginPoll()
+  } catch (e) {
+    toast((e as Error).message || t('providers.officialLoginFailed'), 'error')
+  } finally {
+    officialBusy.value = false
+  }
+}
+
+async function onOfficialCancelLogin() {
+  stopOfficialLoginPoll()
+  officialLoginRunning.value = false
+  try {
+    await cancelRealAccountLogin()
+  } catch (e) {
+    toast((e as Error).message || t('providers.officialLoginFailed'), 'error')
+  }
+}
+
+onMounted(async () => {
+  await Promise.all([store.load(), refreshOfficialStatus().catch(() => undefined)])
+  if (officialLoginRunning.value) startOfficialLoginPoll()
+})
+onUnmounted(stopOfficialLoginPoll)
 
 function openAdd() {
   formEditId.value = null
@@ -68,6 +153,7 @@ async function onRestartCodexApp() {
 async function onEnable(id: string) {
   try {
     await store.setDefault(id)
+    toast(t('providers.providerSwitchSuccess'))
   } catch (e) {
     toast((e as Error).message || t('providers.enableFailed'), 'error')
   }
@@ -102,9 +188,17 @@ function onRemove(id: string) {
 
     <div v-if="store.loading" class="providers__hint">{{ t('providers.loading') }}</div>
     <div v-else-if="store.error" class="providers__hint providers__hint--err">{{ store.error }}</div>
-    <div v-else-if="!store.list.length" class="providers__hint">{{ t('providers.empty') }}</div>
-
     <div v-else class="providers__list">
+      <OfficialCodexCard
+        :active="store.routingMode === 'official'"
+        :logged-in="officialLoggedIn"
+        :login-running="officialLoginRunning"
+        :busy="officialBusy"
+        @enable="activateOfficial"
+        @login="onOfficialLogin"
+        @cancel="onOfficialCancelLogin"
+      />
+      <div v-if="!store.list.length" class="providers__hint">{{ t('providers.empty') }}</div>
       <div
         v-for="p in displayList"
         :key="p.id"

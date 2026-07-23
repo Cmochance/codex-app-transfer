@@ -3,6 +3,13 @@ import type { Provider, Preset, ProviderPayload } from './types'
 
 type IconSpec = { logo?: string; icon?: string }
 
+export type CodexRoutingMode = 'official' | 'provider'
+
+export interface ProvidersResult {
+  providers: Provider[]
+  routingMode: CodexRoutingMode
+}
+
 // ── 逐字移植 api.js ICON_MAP ──
 // 子串匹配 + insertion 顺序敏感: 特定 OAuth/品牌规则必须放在通用规则前(见各行注释)。
 const ICON_MAP: Record<string, IconSpec> = {
@@ -123,15 +130,22 @@ export function providerBody(payload: ProviderPayload, includeModels = true): Re
 }
 
 // ── 端点(路径/请求 shape 保持与后端契约一致) ──
-export async function getProviders(): Promise<Provider[]> {
+export async function getProviders(): Promise<ProvidersResult> {
   // 后端 list_providers 返回的 key 是 `activeId`(非 activeProviderId);读错即导致
   // 没有 provider 被标记 default → 「已启用」徽章/置顶不生效。
-  const data = await api<{ providers?: Record<string, any>[]; activeId?: string | null }>(
+  const data = await api<{
+    providers?: Record<string, any>[]
+    activeId?: string | null
+    routingMode?: CodexRoutingMode
+  }>(
     'GET',
     '/api/providers',
   )
   const activeId = data.activeId ?? null
-  return (data.providers || []).map((p) => mapProvider(p, activeId))
+  return {
+    providers: (data.providers || []).map((p) => mapProvider(p, activeId)),
+    routingMode: data.routingMode === 'provider' ? 'provider' : 'official',
+  }
 }
 
 export async function getPresets(): Promise<Preset[]> {
@@ -148,6 +162,11 @@ export const reorderProviders = (providerIds: string[]) =>
   api('PUT', '/api/providers/reorder', { providerIds })
 export const setDefaultProvider = (id: string) => api('PUT', `/api/providers/${id}/default`)
 export const activateProvider = (id: string) => api('POST', `/api/providers/${id}/activate`)
+export const activateOfficialCodex = () =>
+  api<{ success: boolean; routingMode?: CodexRoutingMode }>(
+    'POST',
+    '/api/desktop/real-account/activate-official',
+  )
 export const getProviderSecret = (id: string) =>
   api<{ apiKey?: string }>('GET', `/api/providers/${id}/secret`)
 

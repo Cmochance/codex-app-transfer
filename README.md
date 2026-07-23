@@ -74,6 +74,8 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 在 Codex Desktop 顶栏「Toggle pinned summary」弹窗底部注入独立「Usage」分区:5 小时 / 每周 / 月度套餐额度(白名单 provider:antigravity gemini 系 + GLM Coding Plan + 小米 MiMo Token Plan + **OpenCode Go** + **Kimi Code**)、余额 / 已用额度数值(DeepSeek / Kimi 月之暗面 / anyrouter)、上下文用量、实时 Tokens 速率与累计、缓存命中率。其中**上下文**行可展开 Claude 风格的 by-source 明细下拉(按发往上游的内容分类:工具调用与输出 / 推理 / 开发者指令 / 对话消息 / 工具定义 / 系统提示),数据按对话持久化、启动即用。详见下方「能做什么」。
 
+> Codex 26.715 兼容：上下文环的辅助标签会随界面语言本地化，当前版本同时识别英文、简体中文，并以百分比 SVG 圆环结构兜底；此外，摘要弹窗动画期间会并存一个离屏隐藏副本和一个可见副本，挂载器会筛选屏幕内可见容器，避免完整的 Usage 节点被注入隐藏副本而界面只剩「输出 / 来源」。
+
 ![Codex 内用量显示](img/codex-usage-breakdown.jpg)
 
 </details>
@@ -91,6 +93,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 ## 能做什么
 
+- **官方优先、第三方共存**:提供商页顶部固定显示「Codex 官方」入口,新配置默认官方直连；官方账号未登录时可直接调起 `codex login`,登录成功自动启用。点击任一第三方 Provider 即切到 proxy,官方 ChatGPT 凭据会被保留；额度不足时可手动切第三方,之后一键切回官方且无需重复登录。旧版本已有活动 Provider 的配置升级后继续沿用当前第三方,避免静默改路由。本功能不做自动额度探测/自动故障转移,切换时机由用户决定。
 - 管理多套供应商,按 OpenAI 模型名(`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`)映射到供应商真实模型 ID
 - 把 Codex APP 的 Responses API 流式 / 非流式请求转换为上游协议:Chat Completions、Gemini Native(`:streamGenerateContent`)、Gemini CLI OAuth(Cloud Code Assist)、Anthropic Messages(`/v1/messages`)、Grok Web(`/rest/app-chat/conversations/new`)、Responses 透传等
 - 多轮工具对话上下文 + `previous_response_id` 历史回放 + autocompact 展开 + thinking / reasoning_content 注入全部对齐 OpenAI Responses API 协议;remote compact 新旧协议双轨支持:旧版 `/responses/compact` 端点 + 新版 remote compaction v2(普通流式 `/responses` 带 `compaction_trigger` 标记,响应回单个 compaction item 的 SSE 流)——新版 Codex 触发自动压缩时此前会报 `expected exactly one compaction output item` 已修(MOC-198)
@@ -155,7 +158,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 1. 启动 Codex App Transfer,弹出桌面窗口
 2. 在仪表盘点右上角加号 → 选择 preset 或自定义供应商,填入 API Base URL、API Key、获取模型、添加模型映射
 3. 点击页面底部的 应用 按钮即可写入配置（toast 提示已同步;如果已配置好提供商，直接点击主页面提供商卡片上的 应用 按钮即可）
-4. 让 Codex Desktop 生效:点击右上角 ↻ **重启 Codex** 按钮(#281 起从强制 modal 解耦,避免误触杀进程丢上下文)
+4. 让 Codex Desktop 生效:点击右上角 ↻ **重启 Codex** 按钮(#281 起从强制 modal 解耦,避免误触杀进程丢上下文)。Windows 26.715+ 即使 GUI 已改名为 `ChatGPT.exe`,仍按 `OpenAI.Codex` 包路径确认归属后安全重启,不会误杀消费级 ChatGPT 或包内 `codex.exe` CLI
 
 ## 供应商兼容矩阵
 
