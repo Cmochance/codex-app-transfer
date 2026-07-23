@@ -74,6 +74,8 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 在 Codex Desktop 顶栏「Toggle pinned summary」弹窗底部注入独立「Usage」分区:5 小时 / 每周 / 月度套餐额度(白名单 provider:antigravity gemini 系 + GLM Coding Plan + 小米 MiMo Token Plan + **OpenCode Go** + **Kimi Code**)、余额 / 已用额度数值(DeepSeek / Kimi 月之暗面 / anyrouter)、上下文用量、实时 Tokens 速率与累计、缓存命中率。其中**上下文**行可展开 Claude 风格的 by-source 明细下拉(按发往上游的内容分类:工具调用与输出 / 推理 / 开发者指令 / 对话消息 / 工具定义 / 系统提示),数据按对话持久化、启动即用。详见下方「能做什么」。
 
+> Codex 26.715 兼容：上下文环的辅助标签会随界面语言本地化，当前版本同时识别英文、简体中文，并以百分比 SVG 圆环结构兜底；此外，摘要弹窗动画期间会并存一个离屏隐藏副本和一个可见副本，挂载器会筛选屏幕内可见容器，避免完整的 Usage 节点被注入隐藏副本而界面只剩「输出 / 来源」。
+
 ![Codex 内用量显示](img/codex-usage-breakdown.jpg)
 
 </details>

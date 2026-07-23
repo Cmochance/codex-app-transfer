@@ -56,7 +56,7 @@ const INSTALL_SCRIPT: &str = r##"
   // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
   // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
   // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
-  var VERSION = 7; // bump:缓存命中趋势浮层去掉左侧竖排标题(仅留 y 刻度 + 折线)→ 升级后免重启 Codex 即覆盖旧注入
+  var VERSION = 9; // bump:Codex 26.715 pinned-summary 过渡副本可见性筛选 → 升级后免重启 Codex 即覆盖旧注入
   if (window.__catQuotaInstalled) {
     if (window.__catQuotaVersion === VERSION) return;
     try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
@@ -148,10 +148,33 @@ const INSTALL_SCRIPT: &str = r##"
     // pinned summary 弹窗里带 section-toggle header 的 section 们(Environment /
     // Sources …),它们的父容器(scroller)是注入挂载点。class 用属性包含匹配,
     // 避免 "group/section-toggle" 里的斜杠转义问题。
+    //
+    // Codex 26.715 打开/关闭弹窗时会让「离屏隐藏旧副本」与「屏幕内可见新副本」
+    // 短暂并存。querySelectorAll 的第一个命中常是旧副本；若直接 return,Usage 会
+    // 完整渲染到视口外而用户只能看到 Outputs / Sources。只接受可见且与视口相交
+    // 的 scroller；弹窗完全关闭时返回 null,由 observer 在可见副本出现后重新挂载。
+    function isVisibleScroller(scroller) {
+      if (!scroller || !scroller.isConnected) return false;
+      var r = scroller.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0 ||
+          r.right <= 0 || r.bottom <= 0 ||
+          r.left >= window.innerWidth || r.top >= window.innerHeight) return false;
+      // opacity 不继承到子节点的 computed style,故向上检查动画/portal 容器。
+      for (var p = scroller; p && p !== document.documentElement; p = p.parentElement) {
+        var cs = window.getComputedStyle(p);
+        if (cs.display === 'none' || cs.visibility === 'hidden' ||
+            parseFloat(cs.opacity || '1') === 0) return false;
+      }
+      return true;
+    }
     var btns = document.querySelectorAll('section header button[class~="group/section-toggle"]');
+    var seen = [];
     for (var i = 0; i < btns.length; i++) {
       var sec = btns[i].closest('section');
-      if (sec && sec.parentElement) return sec.parentElement;
+      var scroller = sec && sec.parentElement;
+      if (!scroller || seen.indexOf(scroller) !== -1) continue;
+      seen.push(scroller);
+      if (isVisibleScroller(scroller)) return scroller;
     }
     return null;
   }
@@ -182,11 +205,27 @@ const INSTALL_SCRIPT: &str = r##"
     return h;
   }
 
-  // Codex 自己的上下文 %:composer 旁环图标的 aria-label(CDP 实测「Context usage: 32%」
-  // 挂在 aria-label,非 title),常驻 DOM、不需 hover/对话触发;title 作兜底。绝对值
-  // 「62k / 190k」只在 hover tooltip(平时不在 DOM),故只读 %。
+  // 找 composer 旁的上下文环。Codex 26.715 开始 aria-label 跟随 UI 语言本地化:
+  // 英文「Context usage: 32%」、简中「上下文用量：32%」。先匹配已知语义标签,
+  // 再用「带百分比标签 + SVG 圆环 stroke-dasharray」作语言无关兜底,避免其它语言再次失效。
+  function findContextRing() {
+    var nodes = document.querySelectorAll('[aria-label*="%"], [title*="%"]');
+    var shapeFallback = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var e = nodes[i];
+      var label = e.getAttribute('aria-label') || e.getAttribute('title') || '';
+      if (/^(?:Context\s+usage\s*:|上下文用量\s*[：:])/i.test(label)) return e;
+      if (!shapeFallback && e.querySelector &&
+          e.querySelector('svg circle[stroke-dasharray]')) {
+        shapeFallback = e;
+      }
+    }
+    return shapeFallback;
+  }
+  // Codex 自己的上下文 %:上下文环常驻 DOM、不需 hover/对话触发。绝对值
+  // 「62k / 190k」只在 hover tooltip(平时不在 DOM),故这里只从 label 读 %。
   function readCtxPct() {
-    var e = document.querySelector('[aria-label^="Context usage:"], [title^="Context usage:"]');
+    var e = findContextRing();
     if (!e) return null;
     var s = e.getAttribute('aria-label') || e.getAttribute('title') || '';
     var m = s.match(/(\d+(?:\.\d+)?)\s*%/);
@@ -208,12 +247,12 @@ const INSTALL_SCRIPT: &str = r##"
     return Math.round(n / 1e3) + 'k';
   }
   // 从 Codex 的 React fiber 直接读「已有对话」的上下文用量,重启/恢复即有值、不需发
-  // 新对话(CDP 实证 v26.609:从环元素向上爬 fiber,memoizedProps 里有 contextUsage =
+  // 新对话(CDP 实证 v26.609 / v26.715:从环元素向上爬 fiber,memoizedProps 里有 contextUsage =
   // {percent, usedTokens, contextWindow, remainingTokens})。键名变了就 return null 退回
   // aria %(优雅降级,不抛)。
   function readCtxUsage() {
     try {
-      var ring = document.querySelector('[aria-label^="Context usage:"]');
+      var ring = findContextRing();
       if (!ring) return null;
       var fkey = null;
       for (var k in ring) { if (k.indexOf('__reactFiber$') === 0) { fkey = k; break; } }
@@ -270,7 +309,7 @@ const INSTALL_SCRIPT: &str = r##"
     try {
       var ctxSection = document.querySelector('#cat-quota-entry');
       var anchors = [
-        document.querySelector('[aria-label^="Context usage:"]'),
+        findContextRing(),
         findScroller(),
         ctxSection ? ctxSection.previousElementSibling : null,
       ];
@@ -2352,9 +2391,15 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("r.kind === 'ctx'"));
         assert!(INSTALL_SCRIPT.contains("data.rows"));
         // ctx 直接读 Codex 自己的上下文:优先 React fiber 的 contextUsage(已有对话即有值、
-        // 不需新对话),退回 aria-label「Context usage: N%」
-        assert!(INSTALL_SCRIPT.contains("Context usage:"));
-        assert!(INSTALL_SCRIPT.contains("aria-label^="));
+        // 不需新对话),退回上下文环 aria-label/title 的 N%。
+        assert!(INSTALL_SCRIPT.contains("function findContextRing"));
+        assert!(INSTALL_SCRIPT.contains("Context\\s+usage"));
+        assert!(INSTALL_SCRIPT.contains("上下文用量"));
+        assert!(INSTALL_SCRIPT.contains("circle[stroke-dasharray]"));
+        assert!(
+            INSTALL_SCRIPT.matches("findContextRing()").count() >= 3,
+            "readCtxPct/readCtxUsage/readConvId 必须复用多语言上下文环定位"
+        );
         assert!(INSTALL_SCRIPT.contains("refreshContext"));
         assert!(INSTALL_SCRIPT.contains("__reactFiber$"));
         assert!(INSTALL_SCRIPT.contains("usedTokens") && INSTALL_SCRIPT.contains("contextWindow"));
@@ -2429,7 +2474,19 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
                                                      // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
         assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
-        assert!(INSTALL_SCRIPT.contains("var VERSION = 7")); // bump:缓存命中趋势浮层去掉左侧竖排标题
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 9")); // bump:Codex 26.715 摘要过渡副本可见性
+    }
+
+    #[test]
+    fn pinned_summary_mount_ignores_hidden_transition_copy() {
+        assert!(INSTALL_SCRIPT.contains("function isVisibleScroller"));
+        assert!(INSTALL_SCRIPT.contains("getBoundingClientRect"));
+        assert!(INSTALL_SCRIPT.contains("window.innerWidth"));
+        assert!(INSTALL_SCRIPT.contains("window.getComputedStyle"));
+        assert!(INSTALL_SCRIPT.contains("cs.visibility === 'hidden'"));
+        assert!(INSTALL_SCRIPT.contains("parseFloat(cs.opacity || '1') === 0"));
+        assert!(INSTALL_SCRIPT.contains("seen.indexOf(scroller)"));
+        assert!(!INSTALL_SCRIPT.contains("if (sec && sec.parentElement) return sec.parentElement"));
     }
 
     #[test]

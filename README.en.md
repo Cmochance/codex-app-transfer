@@ -74,6 +74,8 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 
 Injects a standalone "Usage" section at the bottom of Codex Desktop's "Toggle pinned summary" popup: 5-hour / weekly / monthly plan quota bars (whitelisted providers: antigravity gemini series + GLM Coding Plan + Xiaomi MiMo Token Plan + **OpenCode Go** + **Kimi Code**), balance / usage numeric entries (DeepSeek / Kimi Moonshot / anyrouter), context usage, real-time token rate + cumulative total, and cache hit rate. The **Context** row expands into a Claude-style by-source breakdown dropdown (classified by what is sent upstream: tool calls & output / reasoning / developer instructions / conversation messages / tool definitions / system prompt), persisted per conversation for instant load. See "What it does" below.
 
+> Codex 26.715 compatibility: the context-ring accessibility label follows the UI language, so the current implementation recognizes English and Simplified Chinese and falls back to the percentage SVG-ring structure. The pinned-summary transition can also keep an off-screen hidden copy alongside the visible copy; the mount logic now selects the on-screen visible container so the complete Usage node cannot land in the hidden copy while the UI shows only Outputs / Sources.
+
 ![Usage panel inside Codex](img/codex-usage-breakdown.jpg)
 
 </details>
