@@ -35,7 +35,7 @@ const INSTALL_SCRIPT: &str = r##"
 (function() {
   // 版本化幂等 guard(对齐 quota injector):同版本仅补一次 ensure 后返回;版本变(应用升级
   // 后本脚本改了)→ 先拆旧 observer + 注入节点再重装,新逻辑免重启 Codex 即覆盖旧注入。
-  var VERSION = 10; // review r7:不支持附件(文件/非 data: 图)统一拦 push/restore/send + 配额溢出整体中止
+  var VERSION = 11; // Codex 26.715 pinned-summary 过渡副本可见性筛选
   if (window.__catStashInstalled) {
     if (window.__catStashVersion === VERSION) { try { window.__catStashEnsure && window.__catStashEnsure(); } catch (e) {} return; }
     try { if (window.__catStashObserver) window.__catStashObserver.disconnect(); } catch (e) {}
@@ -441,8 +441,30 @@ const INSTALL_SCRIPT: &str = r##"
   // 升级改 section header 标记即失效)。**改这里务必同步改 codex_quota_injector 的同名函数**,否则
   // 升级后会出现「Usage 面板正常、Stash 面板 + 按钮静默消失」的半坏态。
   function findScroller() {
+    // Codex 26.715 的退出动画会保留一个离屏/透明旧副本,同时创建可见新副本。
+    // 不能再取第一个 selector 命中,否则 Stash 与 Usage 都会挂到隐藏副本。
+    function isVisibleScroller(scroller) {
+      if (!scroller || !scroller.isConnected) return false;
+      var r = scroller.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0 ||
+          r.right <= 0 || r.bottom <= 0 ||
+          r.left >= window.innerWidth || r.top >= window.innerHeight) return false;
+      for (var p = scroller; p && p !== document.documentElement; p = p.parentElement) {
+        var cs = window.getComputedStyle(p);
+        if (cs.display === 'none' || cs.visibility === 'hidden' ||
+            parseFloat(cs.opacity || '1') === 0) return false;
+      }
+      return true;
+    }
     var btns = document.querySelectorAll('section header button[class~="group/section-toggle"]');
-    for (var i = 0; i < btns.length; i++) { var sec = btns[i].closest('section'); if (sec && sec.parentElement) return sec.parentElement; }
+    var seen = [];
+    for (var i = 0; i < btns.length; i++) {
+      var sec = btns[i].closest('section');
+      var scroller = sec && sec.parentElement;
+      if (!scroller || seen.indexOf(scroller) !== -1) continue;
+      seen.push(scroller);
+      if (isVisibleScroller(scroller)) return scroller;
+    }
     return null;
   }
   var CHEV = '<svg class="cschev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
@@ -678,6 +700,18 @@ mod tests {
     fn install_script_has_idempotent_guard() {
         assert!(INSTALL_SCRIPT.contains("window.__catStashInstalled"));
         assert!(INSTALL_SCRIPT.contains("var VERSION ="));
+    }
+
+    #[test]
+    fn pinned_summary_mount_ignores_hidden_transition_copy() {
+        assert!(INSTALL_SCRIPT.contains("function isVisibleScroller"));
+        assert!(INSTALL_SCRIPT.contains("getBoundingClientRect"));
+        assert!(INSTALL_SCRIPT.contains("window.innerWidth"));
+        assert!(INSTALL_SCRIPT.contains("window.getComputedStyle"));
+        assert!(INSTALL_SCRIPT.contains("cs.visibility === 'hidden'"));
+        assert!(INSTALL_SCRIPT.contains("parseFloat(cs.opacity || '1') === 0"));
+        assert!(INSTALL_SCRIPT.contains("seen.indexOf(scroller)"));
+        assert!(!INSTALL_SCRIPT.contains("if (sec && sec.parentElement) return sec.parentElement"));
     }
 
     #[test]
