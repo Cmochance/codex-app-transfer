@@ -39,9 +39,9 @@ Current version **v2.4.5** (see [Changelog](documents/CHANGELOG.md) and [Release
 
 | Dashboard | Providers |
 |---|---|
-| ![Board](img/Board.png) | ![Providers](img/Providers.png) |
+| ![Board](documents/img/Board.png) | ![Providers](documents/img/Providers.png) |
 | **Settings** | **Logs** |
-| ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
+| ![Settings](documents/img/Settings.png) | ![Logs](documents/img/Logs.png) |
 
 </details>
 
@@ -50,7 +50,7 @@ Current version **v2.4.5** (see [Changelog](documents/CHANGELOG.md) and [Release
 
 With any provider enabled, Codex App's model picker shows `<provider> / <real-model>`-style real model names. Tool loops / `previous_response_id` history replay / thinking-mode reasoning_content injection are all handled transparently by the local proxy:
 
-![Codex App real conversation](img/codex-cli-real-chat.png)
+![Codex App real conversation](documents/img/codex-cli-real-chat.png)
 
 </details>
 
@@ -61,9 +61,9 @@ Inject background image + frosted-glass panel CSS into Codex Desktop (the Electr
 
 | Changli | Azur Lane |
 |---|---|
-| ![Changli](img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](img/codex-theme/codex-theme-azurlane.jpg) |
+| ![Changli](documents/img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](documents/img/codex-theme/codex-theme-azurlane.jpg) |
 | **Nailin** | **Zani** |
-| ![Nailin](img/codex-theme/codex-theme-nailin.jpg) | ![Zani](img/codex-theme/codex-theme-zani.jpg) |
+| ![Nailin](documents/img/codex-theme/codex-theme-nailin.jpg) | ![Zani](documents/img/codex-theme/codex-theme-zani.jpg) |
 
 A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts to the cursor. **Custom backgrounds**: Theme page → "+ Add custom" → pick a JPG/PNG → 16:9 crop modal (drag + scroll to zoom) → apply. If the toggle is on at Codex launch, the selected theme auto-injects — no manual step needed.
 
@@ -74,7 +74,7 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 
 Injects a standalone "Usage" section at the bottom of Codex Desktop's "Toggle pinned summary" popup: 5-hour / weekly / monthly plan quota bars (whitelisted providers: antigravity gemini series + GLM Coding Plan + Xiaomi MiMo Token Plan + **OpenCode Go** + **Kimi Code**), balance / usage numeric entries (DeepSeek / Kimi Moonshot / anyrouter), context usage, real-time token rate + cumulative total, and cache hit rate. The **Context** row expands into a Claude-style by-source breakdown dropdown (classified by what is sent upstream: tool calls & output / reasoning / developer instructions / conversation messages / tool definitions / system prompt), persisted per conversation for instant load. See "What it does" below.
 
-![Usage panel inside Codex](img/codex-usage-breakdown.jpg)
+![Usage panel inside Codex](documents/img/codex-usage-breakdown.jpg)
 
 </details>
 
@@ -85,7 +85,7 @@ Stash/restore buttons next to the composer + a "Stash" list below the Usage pane
 
 | Stash panel (with images) | Quick-restore dropdown |
 |---|---|
-| ![Stash panel](img/codex-stash-panel.png) | ![Quick-restore dropdown](img/codex-stash-dropdown.png) |
+| ![Stash panel](documents/img/codex-stash-panel.png) | ![Quick-restore dropdown](documents/img/codex-stash-dropdown.png) |
 
 </details>
 

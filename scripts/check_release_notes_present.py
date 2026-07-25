@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NOTES_DIR = ROOT / "release-notes"
+NOTES_DIR = ROOT / "documents" / "release-notes"
 
 
 def github_error(message: str) -> None:
@@ -30,7 +30,7 @@ def normalize_expected_version(version: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Fail release builds when release-notes/v<version>.md is missing "
+            "Fail release builds when documents/release-notes/v<version>.md is missing "
             "or empty, so the repo copy of every release body stays committed."
         )
     )

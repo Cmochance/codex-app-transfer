@@ -39,9 +39,9 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 | 仪表盘 | 供应商 |
 |---|---|
-| ![Board](img/Board.png) | ![Providers](img/Providers.png) |
+| ![Board](documents/img/Board.png) | ![Providers](documents/img/Providers.png) |
 | **设置** | **日志** |
-| ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
+| ![Settings](documents/img/Settings.png) | ![Logs](documents/img/Logs.png) |
 
 </details>
 
@@ -50,7 +50,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 启用任意供应商后,Codex APP 模型选择器会显示「<provider> / <real-model>」形式的真实模型名,对话过程中工具循环 / `previous_response_id` 历史回放 / thinking 模式 reasoning_content 注入全部由本地代理透明处理:
 
-![Codex APP 实际对话](img/codex-cli-real-chat.png)
+![Codex APP 实际对话](documents/img/codex-cli-real-chat.png)
 
 </details>
 
@@ -61,9 +61,9 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 | 长离 (Changli) | 碧蓝航线 (Azur Lane) |
 |---|---|
-| ![Changli](img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](img/codex-theme/codex-theme-azurlane.jpg) |
+| ![Changli](documents/img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](documents/img/codex-theme/codex-theme-azurlane.jpg) |
 | **乃琳 (Nailin)** | **赞妮 (Zani)** |
-| ![Nailin](img/codex-theme/codex-theme-nailin.jpg) | ![Zani](img/codex-theme/codex-theme-zani.jpg) |
+| ![Nailin](documents/img/codex-theme/codex-theme-nailin.jpg) | ![Zani](documents/img/codex-theme/codex-theme-zani.jpg) |
 
 第 6 套 Carton 自带右下角漂浮立绘(随鼠标动)。**自定义背景**:Theme 页 → "+ 添加自定义" → 选 JPG/PNG → 16:9 crop 弹窗自由选截取区域(拖拽 + 滚轮缩放)→ 应用。Codex 启动时如已开启 toggle 会自动注入已选主题,不需手动操作。
 
@@ -74,7 +74,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 在 Codex Desktop 顶栏「Toggle pinned summary」弹窗底部注入独立「Usage」分区:5 小时 / 每周 / 月度套餐额度(白名单 provider:antigravity gemini 系 + GLM Coding Plan + 小米 MiMo Token Plan + **OpenCode Go** + **Kimi Code**)、余额 / 已用额度数值(DeepSeek / Kimi 月之暗面 / anyrouter)、上下文用量、实时 Tokens 速率与累计、缓存命中率。其中**上下文**行可展开 Claude 风格的 by-source 明细下拉(按发往上游的内容分类:工具调用与输出 / 推理 / 开发者指令 / 对话消息 / 工具定义 / 系统提示),数据按对话持久化、启动即用。详见下方「能做什么」。
 
-![Codex 内用量显示](img/codex-usage-breakdown.jpg)
+![Codex 内用量显示](documents/img/codex-usage-breakdown.jpg)
 
 </details>
 
@@ -85,7 +85,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 | Stash 面板(支持图片) | 快捷恢复下拉 |
 |---|---|
-| ![Stash 面板](img/codex-stash-panel.png) | ![快捷恢复下拉](img/codex-stash-dropdown.png) |
+| ![Stash 面板](documents/img/codex-stash-panel.png) | ![快捷恢复下拉](documents/img/codex-stash-dropdown.png) |
 
 </details>
 

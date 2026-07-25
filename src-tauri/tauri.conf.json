@@ -43,7 +43,7 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "entitlements": "../macos/entitlements.plist"
+      "entitlements": "entitlements.plist"
     },
     "linux": {
       "deb": {
