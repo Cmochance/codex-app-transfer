@@ -59,11 +59,6 @@ Codex-App-Transfer-Setup-*.exe
 # Claude Code harness state
 .claude/
 
-# Generated macOS icon assets (rebuilt by macos/prepare-icon.py)
-macos/assets/app-icon.icns
-macos/assets/app-icon.iconset/
-macos/assets/app-icon-prepared.png
-
 # === Local-only docs ===
 # 整个 docs/ 不入仓库(2026-05-24 决定 — Linear 跟踪 followup,GitHub release notes
 # 替代 docs/release-notes/,公开文档 = 根目录 README* +
