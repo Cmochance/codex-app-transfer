@@ -12,7 +12,7 @@
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
-  <a href="CHANGELOG.md">Changelog</a> |
+  <a href="documents/CHANGELOG.md">Changelog</a> |
   <a href="https://cmochance.github.io/codex-app-transfer/graph/">Code Graph</a>
 </p>
 
@@ -28,7 +28,7 @@ Codex App Transfer is a lightweight desktop config + forwarding tool for the **O
 
 After starting forwarding, Codex App talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
 
-Current version **v2.4.5** (see [Changelog](CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
+Current version **v2.4.5** (see [Changelog](documents/CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
 
 ## Preview
 
@@ -381,7 +381,7 @@ Some experimental providers (Grok Web / Grok Build / Gemini CLI OAuth / Antigrav
 
 ## Acknowledgements
 
-> Overview list below. For the full **borrowing form / itemized list / corresponding file:line in this codebase**, see [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md).
+> Overview list below. For the full **borrowing form / itemized list / corresponding file:line in this codebase**, see [ACKNOWLEDGEMENTS.md](./documents/ACKNOWLEDGEMENTS.md).
 
 <!-- Acknowledgements overview rule: each entry's description (after " — ") is a terse tag, ≤ 40 chars; full borrowing form / license / file:line goes in ACKNOWLEDGEMENTS.md. Enforced in CI by scripts/check_acknowledgements.py — over budget fails the build. -->
 

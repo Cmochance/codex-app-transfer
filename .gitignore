@@ -66,8 +66,8 @@ macos/assets/app-icon-prepared.png
 
 # === Local-only docs ===
 # 整个 docs/ 不入仓库(2026-05-24 决定 — Linear 跟踪 followup,GitHub release notes
-# 替代 docs/release-notes/,根目录 README + CHANGELOG + ACKNOWLEDGEMENTS + AGENTS +
-# ONBOARDING + ARCHITECTURE_PROTOCOL_GUIDE 6 文件足够公开文档)。
+# 替代 docs/release-notes/,公开文档 = 根目录 README* + AGENTS +
+# documents/ 下 CHANGELOG / ACKNOWLEDGEMENTS / ONBOARDING / ARCHITECTURE_PROTOCOL_GUIDE)。
 # 维护者本地可在 docs/ 放任意调研 / 历史归档 / 上游 reference / agent review 报告 /
 # wire dumps / 反馈分析 — 都不会进 remote。
 docs/
@@ -108,3 +108,6 @@ img/codex-theme/
 _site/
 .playwright-mcp/
 rate_drift_report.md
+
+# Codex CLI 项目级本机配置(含本机绝对路径, 不入仓)
+.codex/

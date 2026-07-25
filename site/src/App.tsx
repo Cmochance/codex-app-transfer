@@ -498,10 +498,10 @@ export default function App() {
               <a href={RELEASES} className="transition-colors hover:text-orange-400">
                 Releases
               </a>
-              <a href={`${REPO}/blob/main/CHANGELOG.md`} className="transition-colors hover:text-orange-400">
+              <a href={`${REPO}/blob/main/documents/CHANGELOG.md`} className="transition-colors hover:text-orange-400">
                 Changelog
               </a>
-              <a href={`${REPO}/blob/main/ACKNOWLEDGEMENTS.md`} className="transition-colors hover:text-orange-400">
+              <a href={`${REPO}/blob/main/documents/ACKNOWLEDGEMENTS.md`} className="transition-colors hover:text-orange-400">
                 Acknowledgements
               </a>
             </div>

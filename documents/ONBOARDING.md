@@ -11,7 +11,7 @@
 > - Followup 制度 → Linear workspace `Mochance`(team `Mochance`,label `Improvement`)
 > - 上游借鉴致谢 → `ACKNOWLEDGEMENTS.md`
 >
-> **关于 `docs/`**:整目录已 gitignored(2026-05-24)— 维护者本地放调研 / RFC / refactor / archive / 上游 reference / agent review / wire dump / 反馈分析,**不入 remote**。只有 `README*.md` / `CHANGELOG.md` / `AGENTS.md` / `ACKNOWLEDGEMENTS.md` / `ARCHITECTURE_PROTOCOL_GUIDE.md` / `ONBOARDING.md` 6 文件 + `release-notes/` + `img/` 在 git。
+> **关于 `docs/`**:整目录已 gitignored(2026-05-24)— 维护者本地放调研 / RFC / refactor / archive / 上游 reference / agent review / wire dump / 反馈分析,**不入 remote**。公开文档只有根目录 `README*.md` / `AGENTS.md` + `documents/` 下 `CHANGELOG.md` / `ACKNOWLEDGEMENTS.md` / `ARCHITECTURE_PROTOCOL_GUIDE.md` / `ONBOARDING.md` + `release-notes/` + `img/` 在 git。
 
 ---
 
@@ -122,12 +122,14 @@ codex-app-transfer/
 ├── docs/                       # ★ gitignored — 维护者本地放调研 / RFC / archive,不入 remote
 ├── release-notes/              # 每版 GitHub release body 模板(tracked,user-facing)
 ├── img/                        # README 截图(tracked,user-facing)
-├── CHANGELOG.md                # 用户面向 release notes 索引(tracked,user-facing)
+├── documents/                  # 非根目录强制的公开文档(tracked)
+│   ├── CHANGELOG.md            # 用户面向 release notes 索引
+│   ├── ARCHITECTURE_PROTOCOL_GUIDE.md  # ★ 架构纪律 (新协议必读)
+│   ├── ACKNOWLEDGEMENTS.md     # 上游借鉴致谢 (23KB, 法律安全网)
+│   └── ONBOARDING.md           # 本文档
 │
 ├── tests/replay/fixtures/      # 反向 diff fixture (xtask gen-fixtures 产生)
-├── ARCHITECTURE_PROTOCOL_GUIDE.md  # ★ 架构纪律 (新协议必读)
 ├── AGENTS.md                   # AI agent 工作规范
-├── ACKNOWLEDGEMENTS.md         # 上游借鉴致谢 (23KB, 法律安全网)
 └── README.md / README.en.md    # 用户文档
 ```
 
@@ -539,7 +541,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 
 ### 15.1 主要贡献者
 
-- **Cmochance** / **Xinlong Wu**(同一人,`.mailmap` 合并 alias)— ~98% commit
+- **Cmochance** / **Xinlong Wu**(同一人)— ~98% commit
 - Will Chen / cloudcollector — 个位数 commit
 - 一些 PR 描述风格表明大量 AI 协作(Claude / Codex CLI / ChatGPT auto-review)
 

@@ -12,7 +12,7 @@
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
-  <a href="CHANGELOG.md">Changelog</a> |
+  <a href="documents/CHANGELOG.md">Changelog</a> |
   <a href="https://cmochance.github.io/codex-app-transfer/graph/">Code Graph</a>
 </p>
 
@@ -28,7 +28,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 启动转发后,Codex APP 通过本机 `127.0.0.1:18080` 与本工具通信。关闭窗口会缩到系统托盘继续运行,右键托盘"退出"才完全退出。
 
-当前版本 **v2.4.5**(详见 [Changelog](CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
+当前版本 **v2.4.5**(详见 [Changelog](documents/CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
 
 ## 界面预览
 
@@ -382,7 +382,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 ## 致谢
 
-> 以下列表为概览。**完整借鉴形式 / 借鉴清单 / 本项目对应 file:line** 见 [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md)。
+> 以下列表为概览。**完整借鉴形式 / 借鉴清单 / 本项目对应 file:line** 见 [ACKNOWLEDGEMENTS.md](./documents/ACKNOWLEDGEMENTS.md)。
 
 <!-- 致谢概览规则:每条 " — " 之后的描述 ≤ 20 字(极简标签,只写"借鉴了什么");完整借鉴形式 / license / file:line 一律进 ACKNOWLEDGEMENTS.md。长度由 scripts/check_acknowledgements.py 在 CI 强制,超标即 fail。 -->
 
