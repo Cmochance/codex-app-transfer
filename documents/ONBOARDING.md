@@ -11,7 +11,7 @@
 > - Followup 制度 → Linear workspace `Mochance`(team `Mochance`,label `Improvement`)
 > - 上游借鉴致谢 → `ACKNOWLEDGEMENTS.md`
 >
-> **关于 `docs/`**:整目录已 gitignored(2026-05-24)— 维护者本地放调研 / RFC / refactor / archive / 上游 reference / agent review / wire dump / 反馈分析,**不入 remote**。公开文档只有根目录 `README*.md` / `AGENTS.md` + `documents/` 下 `CHANGELOG.md` / `ACKNOWLEDGEMENTS.md` / `ARCHITECTURE_PROTOCOL_GUIDE.md` / `ONBOARDING.md` + `release-notes/` + `img/` 在 git。
+> **关于 `docs/`**:整目录已 gitignored(2026-05-24)— 维护者本地放调研 / RFC / refactor / archive / 上游 reference / agent review / wire dump / 反馈分析,**不入 remote**。公开文档只有根目录 `README*.md` + `documents/` 下 `CHANGELOG.md` / `ACKNOWLEDGEMENTS.md` / `ARCHITECTURE_PROTOCOL_GUIDE.md` / `ONBOARDING.md` + `release-notes/` + `img/` 在 git(`AGENTS.md` 为维护者本地文件,gitignored)。
 
 ---
 
@@ -129,7 +129,7 @@ codex-app-transfer/
 │   └── ONBOARDING.md           # 本文档
 │
 ├── tests/replay/fixtures/      # 反向 diff fixture (xtask gen-fixtures 产生)
-├── AGENTS.md                   # AI agent 工作规范
+├── AGENTS.md                   # AI agent 工作规范(gitignored,维护者本地)
 └── README.md / README.en.md    # 用户文档
 ```
 
@@ -437,7 +437,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 - `BigPizzaV3/CodexPlusPlus`(MIT)— Windows MSIX COM activation
 - `router-for-me/CLIProxyAPI`(Go, MIT)— Gemini CLI OAuth wire
 - `farion1231/cc-switch` — UI 借鉴
-- `BerriAI/litellm` — 协议参考(`litellm/` 目录是只读参考目录,**禁修改**,见 `AGENTS.md`)
+- `BerriAI/litellm` — 协议参考(`litellm/` 目录是只读参考目录,**禁修改**,见维护者本地 `AGENTS.md`)
 
 ---
 
@@ -562,7 +562,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 1. `ARCHITECTURE_PROTOCOL_GUIDE.md`(架构纪律)
 2. `CHANGELOG.md`(版本演进概览)
 3. `ACKNOWLEDGEMENTS.md`(法律 / 上游借鉴)
-4. `AGENTS.md`(AI 协作规范)
+4. `AGENTS.md`(AI 协作规范,维护者本地 gitignored)
 5. `README.md` + `README.en.md`(用户视角)
 6. 本文档
 7. Linear workspace `Mochance`(未决 followup 全景 — Todo / Backlog)
