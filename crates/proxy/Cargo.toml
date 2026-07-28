@@ -39,7 +39,7 @@ reqwest-websocket = "0.6"
 # TLS / 握手全自管(TLS 走 tokio-rustls,见 ws_passthrough.rs),不用 tokio-tungstenite 自带 TLS,
 # 故无需 TLS feature。remote-control 仍用 reqwest-websocket。[followup MOC-239] 该 relay 默认禁用
 # (上游 ALB WS 实证不可达),保留待验证。
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 # [MOC-234] 经 VPN 代理建上游 WS 隧道走 SOCKS5(proxy 端解析域名,绕开客户端 fake-ip)。
 tokio-socks = "0.5"
 # [MOC-234] rustls 0.23 进程级 CryptoProvider:依赖树有多个 backend 候选时无法自动选,做 TLS
@@ -57,7 +57,7 @@ base64 = "0.22"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 indexmap = "2"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 tempfile = "3"
 # [MOC-195] 集成测试 main 前隔离 home(tests/common/mod.rs),版本跟 lock 内既有传递依赖一致
 ctor = "1.0"
