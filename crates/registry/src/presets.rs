@@ -124,6 +124,34 @@ mod tests {
             minimax["modelCapabilities"][default_model]["context_window"].is_number(),
             "default model {default_model} 必须在 modelCapabilities 配 context_window"
         );
+        // [parameter-refresh] MiniMax 提供 global (api.minimax.io) 与 China (api.minimaxi.com)
+        // 两套 OpenAI 兼容端点;默认走 China,global 作为 baseUrlOptions 备选暴露。
+        let option_values: Vec<&str> = minimax["baseUrlOptions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            option_values.contains(&"https://api.minimax.io/v1"),
+            "MiniMax preset 必须在 baseUrlOptions 暴露 global OpenAI 兼容端点 api.minimax.io/v1"
+        );
+        assert!(
+            option_values.contains(&"https://api.minimaxi.com/v1"),
+            "MiniMax preset 必须在 baseUrlOptions 暴露 China OpenAI 兼容端点 api.minimaxi.com/v1"
+        );
+        // [parameter-refresh] MiniMax-M3 接受 text/image/video 输入(原生多模态),
+        // 故显式标 supports_vision=true;M2.7 仅 text → false。
+        assert_eq!(
+            minimax["modelCapabilities"]["MiniMax-M3"]["supports_vision"],
+            serde_json::Value::Bool(true),
+            "MiniMax-M3 支持 image/video 输入,modelCapabilities 必须显式 supports_vision=true"
+        );
+        assert_eq!(
+            minimax["modelCapabilities"]["MiniMax-M2.7"]["supports_vision"],
+            serde_json::Value::Bool(false),
+            "MiniMax-M2.7 仅文本,modelCapabilities 必须显式 supports_vision=false"
+        );
     }
 
     #[test]

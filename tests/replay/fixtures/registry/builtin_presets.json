@@ -340,15 +340,27 @@
     "docsUrl": "https://platform.minimaxi.com/docs/api-reference/text/chat-completion",
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
+    "baseUrlOptions": [
+      {
+        "label": "Global (api.minimax.io)",
+        "value": "https://api.minimax.io/v1"
+      },
+      {
+        "label": "China (api.minimaxi.com)",
+        "value": "https://api.minimaxi.com/v1"
+      }
+    ],
     "models": {
       "default": "MiniMax-M3"
     },
     "modelCapabilities": {
       "MiniMax-M3": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": true
       },
       "MiniMax-M2.7": {
-        "context_window": 204800
+        "context_window": 204800,
+        "supports_vision": false
       }
     },
     "notices": [
@@ -359,6 +371,10 @@
       {
         "type": "info",
         "text": "MiniMax chat completions API 当前不支持原生 web_search 工具(文档实证 2026-05-09)。如需联网搜索,推荐配 mcp_servers 使用 MCP 路径(参考 P5 namespace MCP 修复)。"
+      },
+      {
+        "type": "info",
+        "text": "MiniMax 提供全球 (api.minimax.io) 与中国 (api.minimaxi.com) 两套 OpenAI 兼容端点,默认使用中国端点;需用全球端点时在 baseUrlOptions 切换。MiniMax-M3 支持 text/image/video 输入(supports_vision=true),MiniMax-M2.7 仅 text。"
       }
     ],
     "requestOptions": {},
