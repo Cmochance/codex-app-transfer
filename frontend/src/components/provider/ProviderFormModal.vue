@@ -19,6 +19,8 @@ import AccountPoolSection from '@/components/provider/AccountPoolSection.vue'
 import { oauthClaimPending, type OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
 
+const PROMPT_INJECTION_KEY = 'promptInjection'
+
 // editId 为空 = 添加;非空 = 编辑(从 store 取数据 + 拉 secret 回填)
 const props = defineProps<{ editId?: string | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
@@ -29,6 +31,11 @@ const { show: toast } = useToast()
 // JSON 对象 → 缩进字符串(空对象/缺失返空), 供回填高级字段(编辑 / 选预设共用)
 function stringifyIfAny(o: Record<string, unknown> | undefined): string {
   return o && Object.keys(o).length ? JSON.stringify(o, null, 2) : ''
+}
+
+function promptInjectionFromRequestOptions(o: Record<string, unknown> | undefined): string {
+  const value = o?.[PROMPT_INJECTION_KEY]
+  return typeof value === 'string' ? value : ''
 }
 
 // 模型下拉选项:value=原始 model id(发往上游), label=显示名(如 Gemini displayName)。
@@ -113,6 +120,7 @@ const form = reactive({
   extraHeaders: '',
   modelCapabilities: '',
   requestOptions: '',
+  promptInjection: '',
   grokSso: '',
 })
 const saving = ref(false)
@@ -156,6 +164,11 @@ const isCustomProvider = computed(() => !isBuiltin.value && !matchedPreset.value
 // 编辑内置/预设 provider 时 baseUrl 不可改:后端 update_provider 对 builtin 跳过 baseUrl,
 // 改了会被静默丢弃(含小米多集群切换)→ 设为只读, 如实反映后端行为(添加时仍可选集群)。
 const baseUrlReadonly = computed(() => isEdit.value && !isCustomProvider.value)
+const isAntigravity = computed(() =>
+  ['antigravity_oauth', 'antigravity', 'google_oauth_antigravity'].includes(
+    form.apiFormat.trim().toLowerCase().replace(/-/g, '_'),
+  ),
+)
 
 // OAuth 账号登录类 provider(按 authScheme 判定, 添加经 preset 预填 / 编辑从后端回填均适用):
 // 这些用浏览器授权登录, 用登录区取代 API Key 输入。
@@ -308,6 +321,7 @@ function resetToCustom() {
   form.extraHeaders = ''
   form.modelCapabilities = ''
   form.requestOptions = ''
+  form.promptInjection = ''
   availableModels.value = []
 }
 
@@ -342,6 +356,9 @@ function applyPreset(p: Preset) {
   form.extraHeaders = stringifyIfAny(p.extraHeaders)
   form.modelCapabilities = stringifyIfAny(p.modelCapabilities)
   form.requestOptions = stringifyIfAny(p.requestOptions as Record<string, unknown> | undefined)
+  form.promptInjection = promptInjectionFromRequestOptions(
+    p.requestOptions as Record<string, unknown> | undefined,
+  )
   // 该上游若之前抓过模型, 带出缓存清单, 否则清空待用户「获取模型」
   availableModels.value = []
   loadCachedModels(form.baseUrl)
@@ -466,6 +483,7 @@ onMounted(async () => {
   form.extraHeaders = stringifyIfAny(p.extraHeaders)
   form.modelCapabilities = stringifyIfAny(p.modelCapabilities)
   form.requestOptions = stringifyIfAny(p.requestOptions)
+  form.promptInjection = promptInjectionFromRequestOptions(p.requestOptions)
   // 该上游之前抓过模型 → 带出本地缓存清单, 无需重新「获取模型」即可切换映射
   loadCachedModels(form.baseUrl)
   loadMsgFiltered(form.baseUrl)
@@ -507,6 +525,12 @@ async function save() {
   } catch (e) {
     error.value = (e as Error).message
     return
+  }
+  if (isAntigravity.value && form.promptInjection.trim()) {
+    requestOptions ??= {}
+    requestOptions[PROMPT_INJECTION_KEY] = form.promptInjection
+  } else if (requestOptions) {
+    delete requestOptions[PROMPT_INJECTION_KEY]
   }
   // 全部 6 槽都发(空发 ""),对齐旧 normalized 行为,支持清空某槽回落默认
   const models: Record<string, string> = {}
@@ -644,6 +668,17 @@ async function save() {
       <SettingsRow :title="t('providerForm.reviewModelSlot')">
         <AppInput v-model="form.reviewModelSlot" placeholder="default" />
       </SettingsRow>
+
+      <div v-if="isAntigravity" class="pf__field">
+        <label>{{ t('providerForm.promptInjection') }}</label>
+        <textarea
+          v-model="form.promptInjection"
+          class="pf__prompt-injection"
+          spellcheck="false"
+          :placeholder="t('providerForm.promptInjectionPlaceholder')"
+        ></textarea>
+        <span class="pf__hint">{{ t('providerForm.promptInjectionHint') }}</span>
+      </div>
 
       <template v-if="isCustomProvider">
         <button type="button" class="pf__adv" @click="showAdvanced = !showAdvanced">
@@ -805,6 +840,29 @@ async function save() {
 .pf__json:focus {
   outline: none;
   border-color: var(--accent);
+}
+.pf__prompt-injection {
+  width: 100%;
+  min-height: 180px;
+  padding: var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  resize: vertical;
+}
+.pf__prompt-injection:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.pf__hint {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
 }
 .pf__error {
   color: var(--danger);

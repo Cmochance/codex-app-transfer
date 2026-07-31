@@ -1,0 +1,45 @@
+# Build artifacts & target directories
+target/
+**/target/
+.cargo-target-antigravity/
+**/.cargo-target-antigravity/
+dist/
+**/dist/
+build/
+**/build/
+out/
+**/out/
+gen/
+**/gen/
+
+# Node & Web dependencies
+node_modules/
+**/node_modules/
+vendor/
+**/vendor/
+
+# Lock files & Minified assets
+*.lock
+**/*.lock
+package-lock.json
+**/package-lock.json
+pnpm-lock.yaml
+**/pnpm-lock.yaml
+*.min.js
+**/*.min.js
+*.min.css
+**/*.min.css
+*.map
+**/*.map
+*.wasm
+**/*.wasm
+
+# Cache & VCS & Data dirs
+.git/
+**/.git/
+.code-review-graph/
+**/.code-review-graph/
+.tmp/
+**/.tmp/
+tmp/
+**/tmp/

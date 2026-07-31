@@ -1,3 +1,4 @@
+use crate::gemini_native::types::{Part, RequestBody, SystemInstruction};
 use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::responses::compact::{
     build_compact_chat_request, build_compact_response_plan, build_compact_v2_response_plan,
@@ -22,6 +23,7 @@ pub(crate) enum CloudCodeApiFlavor {
 }
 
 const ANTIGRAVITY_COMMENTARY_METADATA_KEY: &str = "antigravity_commentary_thoughts";
+const ANTIGRAVITY_PROMPT_INJECTION_KEY: &str = "promptInjection";
 
 impl CloudCodeApiFlavor {
     pub(crate) fn from_api_format(api_format: &str) -> Self {
@@ -45,6 +47,35 @@ impl CloudCodeApiFlavor {
 /// 共用,避免两处各抄一份匹配列表日后漂移(MOC-210 code-review N-2)。
 pub fn is_antigravity_api_format(api_format: &str) -> bool {
     CloudCodeApiFlavor::from_api_format(api_format).is_antigravity()
+}
+
+fn apply_antigravity_prompt_injection(
+    request: &mut RequestBody,
+    provider: &Provider,
+    flavor: CloudCodeApiFlavor,
+) {
+    if !flavor.is_antigravity() {
+        return;
+    }
+    let Some(prompt) = provider
+        .request_options
+        .get(ANTIGRAVITY_PROMPT_INJECTION_KEY)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return;
+    };
+
+    let system_instruction = request
+        .system_instruction
+        .get_or_insert_with(|| SystemInstruction {
+            role: None,
+            parts: Vec::new(),
+        });
+    system_instruction.parts.push(Part {
+        text: Some(prompt.to_owned()),
+        ..Default::default()
+    });
 }
 
 /// 按 provider `api_format` 选择 token 文件名。
@@ -460,11 +491,13 @@ pub(crate) fn prepare_cloud_code_request(
     // (`core/input::response_id_for_session()`),OAuth 跟 API key 走**同一个生成器**,
     // collision domain 跟既有 gemini_native 主路径完全一致,本 PR 不引入新碰撞风险;
     // 切换用户重新 OAuth 后旧 response_id 不可能被新 session 反查到,行为天然隔离。
-    let conversion = crate::gemini_native::request::responses_body_to_gemini_request_with_session(
-        &parsed,
-        provider,
-        Some(crate::responses::session::global_response_session_cache()),
-    )?;
+    let mut conversion =
+        crate::gemini_native::request::responses_body_to_gemini_request_with_session(
+            &parsed,
+            provider,
+            Some(crate::responses::session::global_response_session_cache()),
+        )?;
+    apply_antigravity_prompt_injection(&mut conversion.request, provider, flavor);
     let mut inner_value =
         serde_json::to_value(&conversion.request).map_err(AdapterError::BodyDecode)?;
     apply_cloud_code_request_compat(&mut inner_value, flavor);
@@ -971,6 +1004,163 @@ mod tests {
         }
     }
 
+    fn prompt_injection_provider(prompt: Value) -> Provider {
+        serde_json::from_value(json!({
+            "id": "test-provider",
+            "name": "Test Provider",
+            "baseUrl": "https://example.com",
+            "apiFormat": "antigravity_oauth",
+            "cloud_code_project_id": "proj-test",
+            "requestOptions": {
+                "promptInjection": prompt
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn antigravity_prompt_injection_appends_to_existing_system_instruction() {
+        let provider = prompt_injection_provider(json!("  injected\nprompt  "));
+        let mut request = RequestBody {
+            system_instruction: Some(SystemInstruction {
+                role: None,
+                parts: vec![Part {
+                    text: Some("existing".into()),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+
+        apply_antigravity_prompt_injection(
+            &mut request,
+            &provider,
+            CloudCodeApiFlavor::Antigravity,
+        );
+
+        let parts = &request.system_instruction.as_ref().unwrap().parts;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].text.as_deref(), Some("existing"));
+        assert_eq!(parts[1].text.as_deref(), Some("  injected\nprompt  "));
+    }
+
+    #[test]
+    fn antigravity_prompt_injection_creates_system_instruction_when_missing() {
+        let provider = prompt_injection_provider(json!("injected"));
+        let mut request = RequestBody::default();
+
+        apply_antigravity_prompt_injection(
+            &mut request,
+            &provider,
+            CloudCodeApiFlavor::Antigravity,
+        );
+
+        let system_instruction = request.system_instruction.unwrap();
+        assert_eq!(system_instruction.role, None);
+        assert_eq!(system_instruction.parts.len(), 1);
+        assert_eq!(
+            system_instruction.parts[0].text.as_deref(),
+            Some("injected")
+        );
+    }
+
+    #[test]
+    fn antigravity_prompt_injection_ignores_blank_prompt() {
+        let provider = prompt_injection_provider(json!(" \n\t "));
+        let mut request = RequestBody::default();
+
+        apply_antigravity_prompt_injection(
+            &mut request,
+            &provider,
+            CloudCodeApiFlavor::Antigravity,
+        );
+
+        assert!(request.system_instruction.is_none());
+    }
+
+    #[test]
+    fn gemini_cli_does_not_apply_antigravity_prompt_injection() {
+        let provider = prompt_injection_provider(json!("injected"));
+        let mut request = RequestBody::default();
+
+        apply_antigravity_prompt_injection(&mut request, &provider, CloudCodeApiFlavor::GeminiCli);
+
+        assert!(request.system_instruction.is_none());
+    }
+
+    fn prompt_injection_responses_body() -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gemini-3-pro-low",
+                "instructions": "original instructions",
+                "input": [
+                    {"type": "message", "role": "user", "content": "hello"}
+                ],
+                "stream": true
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn system_instruction_texts(envelope: &Value) -> Vec<&str> {
+        envelope
+            .pointer("/request/systemInstruction/parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[test]
+    fn antigravity_entry_appends_prompt_injection_after_original_instructions() {
+        let provider = prompt_injection_provider(json!("injected from provider"));
+
+        let plan =
+            prepare_cloud_code_request("/responses", prompt_injection_responses_body(), &provider)
+                .unwrap();
+        let envelope: Value = serde_json::from_slice(&plan.body).unwrap();
+        let texts = system_instruction_texts(&envelope);
+
+        assert_eq!(texts.first().copied(), Some("original instructions"));
+        assert_eq!(texts.last().copied(), Some("injected from provider"));
+    }
+
+    #[test]
+    fn gemini_cli_entry_does_not_apply_antigravity_prompt_injection() {
+        let mut provider = prompt_injection_provider(json!("injected from provider"));
+        provider.api_format = "gemini_cli_oauth".into();
+
+        let plan =
+            prepare_cloud_code_request("/responses", prompt_injection_responses_body(), &provider)
+                .unwrap();
+        let envelope: Value = serde_json::from_slice(&plan.body).unwrap();
+        let texts = system_instruction_texts(&envelope);
+
+        assert_eq!(texts, vec!["original instructions"]);
+        assert!(!envelope["request"]
+            .to_string()
+            .contains("injected from provider"));
+    }
+
+    #[test]
+    fn compact_entry_does_not_apply_antigravity_prompt_injection() {
+        let provider = prompt_injection_provider(json!("injected from provider"));
+
+        let plan = prepare_cloud_code_request(
+            "/responses/compact",
+            prompt_injection_responses_body(),
+            &provider,
+        )
+        .unwrap();
+        let envelope: Value = serde_json::from_slice(&plan.body).unwrap();
+
+        assert!(plan.is_compact);
+        assert!(!envelope["request"]
+            .to_string()
+            .contains("injected from provider"));
+    }
+
     #[test]
     fn antigravity_filters_only_transcript_thought_messages() {
         let mut body = json!({
@@ -1302,7 +1492,11 @@ mod tests {
 
     #[test]
     fn prepare_image_request_builds_image_gen_envelope() {
-        let provider = antigravity_image_provider(json!({ "default": "gemini-3-flash-agent" }));
+        let mut provider = antigravity_image_provider(json!({ "default": "gemini-3-flash-agent" }));
+        provider.request_options.insert(
+            ANTIGRAVITY_PROMPT_INJECTION_KEY.into(),
+            json!("injected from provider"),
+        );
         let body = serde_json::to_vec(&json!({
             "model": "gpt-image-1",
             "prompt": "a cute orange tabby cat",
@@ -1348,6 +1542,8 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("IMAGE")
         );
+        assert!(req.get("systemInstruction").is_none());
+        assert!(!req.to_string().contains("injected from provider"));
     }
 
     #[test]
