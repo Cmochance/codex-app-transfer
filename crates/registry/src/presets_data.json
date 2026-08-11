@@ -336,8 +336,8 @@
   {
     "id": "minimax",
     "name": "MiniMax",
-    "baseUrl": "https://api.minimaxi.com/v1",
-    "docsUrl": "https://platform.minimaxi.com/docs/api-reference/text/chat-completion",
+    "baseUrl": "https://api.minimax.io/v1",
+    "docsUrl": "https://platform.minimax.io/docs/api-reference/text/chat-completion",
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "baseUrlOptions": [
@@ -356,11 +356,19 @@
     "modelCapabilities": {
       "MiniMax-M3": {
         "context_window": 1000000,
-        "supports_vision": true
+        "supports_vision": true,
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ]
       },
       "MiniMax-M2.7": {
         "context_window": 204800,
-        "supports_vision": false
+        "supports_vision": false,
+        "input_modalities": [
+          "text"
+        ]
       }
     },
     "notices": [
@@ -374,7 +382,54 @@
       },
       {
         "type": "info",
-        "text": "MiniMax 提供全球 (api.minimax.io) 与中国 (api.minimaxi.com) 两套 OpenAI 兼容端点,默认使用中国端点;需用全球端点时在 baseUrlOptions 切换。MiniMax-M3 支持 text/image/video 输入(supports_vision=true),MiniMax-M2.7 仅 text。"
+        "text": "MiniMax provides global (api.minimax.io) and China (api.minimaxi.com) OpenAI-compatible endpoints. MiniMax-M3 accepts text, image, and video input; MiniMax-M2.7 is text-only."
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "minimax-anthropic",
+    "name": "MiniMax (Anthropic)",
+    "baseUrl": "https://api.minimax.io/anthropic",
+    "docsUrl": "https://platform.minimax.io/docs/api-reference/api-overview",
+    "authScheme": "bearer",
+    "apiFormat": "anthropic_messages",
+    "baseUrlOptions": [
+      {
+        "label": "Global (api.minimax.io)",
+        "value": "https://api.minimax.io/anthropic"
+      },
+      {
+        "label": "China (api.minimaxi.com)",
+        "value": "https://api.minimaxi.com/anthropic"
+      }
+    ],
+    "models": {
+      "default": "MiniMax-M3"
+    },
+    "modelCapabilities": {
+      "MiniMax-M3": {
+        "context_window": 1000000,
+        "supports_vision": true,
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ]
+      },
+      "MiniMax-M2.7": {
+        "context_window": 204800,
+        "supports_vision": false,
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "Use the Anthropic-compatible Messages API through the global or China endpoint. MiniMax-M3 accepts text, image, and video input; MiniMax-M2.7 is text-only."
       }
     ],
     "requestOptions": {},

@@ -37,7 +37,7 @@ mod tests {
         // 当前 16 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
         // / zhipu / zhipu-coding / zai-login / bigmodel-login / bailian /
-        // bailian-token-plan / minimax / grok-web / google-ai-studio /
+        // bailian-token-plan / minimax / minimax-anthropic / grok-web / google-ai-studio /
         // gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
@@ -59,7 +59,7 @@ mod tests {
         // (2026-07-06 加 grok-build:xAI grok CLI 编码后端,authScheme grok_build_oauth;
         //  responses passthrough,OAuth2 device flow 自建登录 + 自动 refresh,上游
         //  cli-chat-proxy.grok.com/v1;models.default=grok-build 防 Codex gpt-5.x 名透传上游)
-        assert_eq!(builtin_presets().len(), 22);
+        assert_eq!(builtin_presets().len(), 23);
     }
 
     #[test]
@@ -105,53 +105,84 @@ mod tests {
     }
 
     #[test]
-    fn minimax_preset_exists_and_uses_official_minimaxi_base_url() {
-        let minimax = builtin_presets()
+    fn minimax_presets_expose_regional_endpoints_and_input_modalities() {
+        let minimax_openai = builtin_presets()
             .iter()
             .find(|p| p["id"] == "minimax")
-            .expect("MiniMax preset must exist as builtin entry");
-        assert_eq!(minimax["baseUrl"], "https://api.minimaxi.com/v1");
-        assert_eq!(minimax["apiFormat"], "openai_chat");
-        assert_eq!(minimax["isBuiltin"], true);
-        let default_model = minimax["models"]["default"].as_str().unwrap_or("");
+            .expect("MiniMax OpenAI-compatible preset must exist");
+        let minimax_anthropic = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "minimax-anthropic")
+            .expect("MiniMax Anthropic-compatible preset must exist");
+
+        assert_eq!(minimax_openai["baseUrl"], "https://api.minimax.io/v1");
+        assert_eq!(minimax_openai["apiFormat"], "openai_chat");
+        assert_eq!(minimax_openai["isBuiltin"], true);
+        assert_eq!(
+            minimax_anthropic["baseUrl"],
+            "https://api.minimax.io/anthropic"
+        );
+        assert_eq!(minimax_anthropic["apiFormat"], "anthropic_messages");
+        assert_eq!(minimax_anthropic["isBuiltin"], true);
+
+        let default_model = minimax_openai["models"]["default"].as_str().unwrap_or("");
         assert!(
             default_model.starts_with("MiniMax-M3"),
-            "default model 应为 MiniMax-M3(当前旗舰,1M 上下文),实际:{default_model}"
+            "the default model must be MiniMax-M3, got {default_model}"
         );
-        // default model 必须在 modelCapabilities 里配 context_window,否则 catalog
-        // 会回退到 documented_context_window 默认值(issue #356)。
         assert!(
-            minimax["modelCapabilities"][default_model]["context_window"].is_number(),
-            "default model {default_model} 必须在 modelCapabilities 配 context_window"
+            minimax_openai["modelCapabilities"][default_model]["context_window"].is_number(),
+            "the default model must declare context_window"
         );
-        // [parameter-refresh] MiniMax 提供 global (api.minimax.io) 与 China (api.minimaxi.com)
-        // 两套 OpenAI 兼容端点;默认走 China,global 作为 baseUrlOptions 备选暴露。
-        let option_values: Vec<&str> = minimax["baseUrlOptions"]
+
+        let openai_option_values: Vec<&str> = minimax_openai["baseUrlOptions"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
             .collect();
         assert!(
-            option_values.contains(&"https://api.minimax.io/v1"),
-            "MiniMax preset 必须在 baseUrlOptions 暴露 global OpenAI 兼容端点 api.minimax.io/v1"
+            openai_option_values.contains(&"https://api.minimax.io/v1"),
+            "the OpenAI-compatible preset must expose the global endpoint"
         );
         assert!(
-            option_values.contains(&"https://api.minimaxi.com/v1"),
-            "MiniMax preset 必须在 baseUrlOptions 暴露 China OpenAI 兼容端点 api.minimaxi.com/v1"
+            openai_option_values.contains(&"https://api.minimaxi.com/v1"),
+            "the OpenAI-compatible preset must expose the China endpoint"
         );
-        // [parameter-refresh] MiniMax-M3 接受 text/image/video 输入(原生多模态),
-        // 故显式标 supports_vision=true;M2.7 仅 text → false。
-        assert_eq!(
-            minimax["modelCapabilities"]["MiniMax-M3"]["supports_vision"],
-            serde_json::Value::Bool(true),
-            "MiniMax-M3 支持 image/video 输入,modelCapabilities 必须显式 supports_vision=true"
+
+        let anthropic_option_values: Vec<&str> = minimax_anthropic["baseUrlOptions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.get("value").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            anthropic_option_values.contains(&"https://api.minimax.io/anthropic"),
+            "the Anthropic-compatible preset must expose the global endpoint"
         );
-        assert_eq!(
-            minimax["modelCapabilities"]["MiniMax-M2.7"]["supports_vision"],
-            serde_json::Value::Bool(false),
-            "MiniMax-M2.7 仅文本,modelCapabilities 必须显式 supports_vision=false"
+        assert!(
+            anthropic_option_values.contains(&"https://api.minimaxi.com/anthropic"),
+            "the Anthropic-compatible preset must expose the China endpoint"
         );
+
+        for preset in [minimax_openai, minimax_anthropic] {
+            assert_eq!(
+                preset["modelCapabilities"]["MiniMax-M3"]["supports_vision"],
+                serde_json::Value::Bool(true)
+            );
+            assert_eq!(
+                preset["modelCapabilities"]["MiniMax-M3"]["input_modalities"],
+                serde_json::json!(["text", "image", "video"])
+            );
+            assert_eq!(
+                preset["modelCapabilities"]["MiniMax-M2.7"]["supports_vision"],
+                serde_json::Value::Bool(false)
+            );
+            assert_eq!(
+                preset["modelCapabilities"]["MiniMax-M2.7"]["input_modalities"],
+                serde_json::json!(["text"])
+            );
+        }
     }
 
     #[test]
