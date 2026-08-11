@@ -336,19 +336,39 @@
   {
     "id": "minimax",
     "name": "MiniMax",
-    "baseUrl": "https://api.minimaxi.com/v1",
-    "docsUrl": "https://platform.minimaxi.com/docs/api-reference/text/chat-completion",
+    "baseUrl": "https://api.minimax.io/v1",
+    "docsUrl": "https://platform.minimax.io/docs/api-reference/text/chat-completion",
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
+    "baseUrlOptions": [
+      {
+        "label": "Global (api.minimax.io)",
+        "value": "https://api.minimax.io/v1"
+      },
+      {
+        "label": "China (api.minimaxi.com)",
+        "value": "https://api.minimaxi.com/v1"
+      }
+    ],
     "models": {
       "default": "MiniMax-M3"
     },
     "modelCapabilities": {
       "MiniMax-M3": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": true,
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ]
       },
       "MiniMax-M2.7": {
-        "context_window": 204800
+        "context_window": 204800,
+        "supports_vision": false,
+        "input_modalities": [
+          "text"
+        ]
       }
     },
     "notices": [
@@ -359,6 +379,57 @@
       {
         "type": "info",
         "text": "MiniMax chat completions API 当前不支持原生 web_search 工具(文档实证 2026-05-09)。如需联网搜索,推荐配 mcp_servers 使用 MCP 路径(参考 P5 namespace MCP 修复)。"
+      },
+      {
+        "type": "info",
+        "text": "MiniMax provides global (api.minimax.io) and China (api.minimaxi.com) OpenAI-compatible endpoints. MiniMax-M3 accepts text, image, and video input; MiniMax-M2.7 is text-only."
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "minimax-anthropic",
+    "name": "MiniMax (Anthropic)",
+    "baseUrl": "https://api.minimax.io/anthropic",
+    "docsUrl": "https://platform.minimax.io/docs/api-reference/api-overview",
+    "authScheme": "bearer",
+    "apiFormat": "anthropic_messages",
+    "baseUrlOptions": [
+      {
+        "label": "Global (api.minimax.io)",
+        "value": "https://api.minimax.io/anthropic"
+      },
+      {
+        "label": "China (api.minimaxi.com)",
+        "value": "https://api.minimaxi.com/anthropic"
+      }
+    ],
+    "models": {
+      "default": "MiniMax-M3"
+    },
+    "modelCapabilities": {
+      "MiniMax-M3": {
+        "context_window": 1000000,
+        "supports_vision": true,
+        "input_modalities": [
+          "text",
+          "image",
+          "video"
+        ]
+      },
+      "MiniMax-M2.7": {
+        "context_window": 204800,
+        "supports_vision": false,
+        "input_modalities": [
+          "text"
+        ]
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "Use the Anthropic-compatible Messages API through the global or China endpoint. MiniMax-M3 accepts text, image, and video input; MiniMax-M2.7 is text-only."
       }
     ],
     "requestOptions": {},
